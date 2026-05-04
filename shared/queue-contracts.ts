@@ -25,12 +25,34 @@ export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
 export interface VoiceGenJobData {
   schema_version: number;
   project_id: string;
+  // The TranslationSegment id (NOT the source TranscriptSegment id).
+  // Named `segment_id` for backward compatibility with v1 — semantically it's
+  // the translation segment to render.
   segment_id: string;
   target_language: string;
   voice_id: string;
+  // Full per-segment context that generateOneSegment needs to produce
+  // identical output to the legacy inline path. The orchestrator resolves
+  // these from Speaker/voice_assignments + style_settings + neighboring
+  // translations and bakes them into the job so the worker doesn't need
+  // to re-read entities.
+  voice_settings?: Record<string, unknown>;
+  voice_mode?: 'synthesis' | 'cloning' | 'modeling';
+  is_cloned?: boolean;
+  previous_text?: string | null;
+  next_text?: string | null;
+  segment_duration_ms?: number;
+  performance_prompt?: string | null;
+  cue_stability?: number | null;
   // Tracking fields for audit + retry semantics.
   user_email: string;
   request_id: string;
+  // Scoped JWT minted by the producer (runVoiceGeneration). Worker forwards
+  // it as X-Worker-JWT when calling generateOneSegment back. The token is
+  // bound to (user_email, project_id, segment_id, 'generateOneSegment') and
+  // expires in 15 min. Replaces the legacy long-lived service token. See
+  // functions/_lib_workerJWT for the security model.
+  auth_token?: string;
   // Optional priority hint (BullMQ priority is a separate option; keep this
   // for tagging/logging only).
   priority_hint?: 'low' | 'normal' | 'high';
