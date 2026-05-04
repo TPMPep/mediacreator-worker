@@ -27,7 +27,9 @@ export const env = {
   UPSTASH_REDIS_URL: required('UPSTASH_REDIS_URL'),
   BASE44_APP_ID: required('BASE44_APP_ID'),
   BASE44_API_BASE: optional('BASE44_API_BASE', 'https://app.base44.com/api/apps'),
-  BASE44_SERVICE_TOKEN: required('BASE44_SERVICE_TOKEN'),
+  // BASE44_SERVICE_TOKEN intentionally removed — we now use scoped per-job JWTs
+  // forwarded from the producer via job.data.auth_token. See base44-client.ts
+  // and the AUTH MODEL section there for the security rationale.
 
   SENTRY_BACKEND_DSN: process.env.SENTRY_BACKEND_DSN || '',
   SENTRY_ENVIRONMENT: optional('SENTRY_ENVIRONMENT', 'production'),
