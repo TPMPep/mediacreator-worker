@@ -107,7 +107,9 @@ export async function processEnrichOrchestrator(job: Job<EnrichOrchestratorJobDa
       await orchestratorQueue().add(
         QUEUE_NAMES.ENRICH_ORCHESTRATOR,
         { ...job.data, request_id }, // same payload (incl. auth_token)
-        { ...ORCHESTRATOR_JOB_OPTIONS, delay },
+        // attempts=1: orchestrator retries cause counter drift (see
+        // enqueueEnrichSuperscript for the full rationale).
+        { ...ORCHESTRATOR_JOB_OPTIONS, attempts: 1, delay },
       );
     }
 
