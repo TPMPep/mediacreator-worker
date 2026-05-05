@@ -17,6 +17,10 @@ import { processBatchTranslate } from './processors/batch-translate.js';
 import { processBatchEnrich } from './processors/batch-enrich.js';
 import { processEnrichOrchestrator } from './processors/enrich-orchestrator.js';
 import { processEnrichChunk } from './processors/enrich-chunk.js';
+import { processTranslateOrchestrator } from './processors/translate-orchestrator.js';
+import { processTranslateChunk } from './processors/translate-chunk.js';
+import { processAdaptOrchestrator } from './processors/adapt-orchestrator.js';
+import { processAdaptChunk } from './processors/adapt-chunk.js';
 import { processSrtImport } from './processors/srt-import.js';
 
 initSentry();
@@ -41,6 +45,21 @@ const workers: Worker[] = [
   }),
   new Worker(QUEUE_NAMES.ENRICH_CHUNK, processEnrichChunk, {
     ...baseOpts, concurrency: env.CONCURRENCY_ENRICH_CHUNK,
+  }),
+  // v2 translation pipeline — producer/orchestrator/chunk model.
+  new Worker(QUEUE_NAMES.TRANSLATE_ORCHESTRATOR, processTranslateOrchestrator, {
+    ...baseOpts, concurrency: env.CONCURRENCY_TRANSLATE_ORCHESTRATOR,
+  }),
+  new Worker(QUEUE_NAMES.TRANSLATE_CHUNK, processTranslateChunk, {
+    ...baseOpts, concurrency: env.CONCURRENCY_TRANSLATE_CHUNK,
+  }),
+  // v2 adaptation pipeline — producer/orchestrator/chunk model. Single
+  // AdaptationRun entity discriminated by `kind`.
+  new Worker(QUEUE_NAMES.ADAPT_ORCHESTRATOR, processAdaptOrchestrator, {
+    ...baseOpts, concurrency: env.CONCURRENCY_ADAPT_ORCHESTRATOR,
+  }),
+  new Worker(QUEUE_NAMES.ADAPT_CHUNK, processAdaptChunk, {
+    ...baseOpts, concurrency: env.CONCURRENCY_ADAPT_CHUNK,
   }),
   new Worker(QUEUE_NAMES.SRT_IMPORT, processSrtImport, {
     ...baseOpts, concurrency: env.CONCURRENCY_SRT_IMPORT,

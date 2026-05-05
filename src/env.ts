@@ -48,6 +48,19 @@ export const env = {
   // path — bumped to 20 to satisfy the 100-concurrent-users target.
   CONCURRENCY_ENRICH_ORCHESTRATOR: intEnv('WORKER_CONCURRENCY_ENRICH_ORCHESTRATOR', 4),
   CONCURRENCY_ENRICH_CHUNK: intEnv('WORKER_CONCURRENCY_ENRICH_CHUNK', 20),
+  // v2 translation pipeline: orchestrator is serial-ish per run (low cost,
+  // serialized DB writes against the run document), chunks are the hot path
+  // — each chunk is one provider call. 20 satisfies the 100-concurrent-users
+  // target for translation.
+  CONCURRENCY_TRANSLATE_ORCHESTRATOR: intEnv('WORKER_CONCURRENCY_TRANSLATE_ORCHESTRATOR', 4),
+  CONCURRENCY_TRANSLATE_CHUNK: intEnv('WORKER_CONCURRENCY_TRANSLATE_CHUNK', 20),
+  // v2 adaptation pipeline: orchestrator is serial-ish per run (low cost,
+  // serialized DB writes against the run document), chunks are the hot path.
+  // For generate_adaptation, each chunk = up to 5 LLM calls in series, so 20
+  // concurrent chunks = up to 100 in-flight LLM calls — keep this conservative
+  // and bump as Gemini quota allows.
+  CONCURRENCY_ADAPT_ORCHESTRATOR: intEnv('WORKER_CONCURRENCY_ADAPT_ORCHESTRATOR', 4),
+  CONCURRENCY_ADAPT_CHUNK: intEnv('WORKER_CONCURRENCY_ADAPT_CHUNK', 15),
   CONCURRENCY_SRT_IMPORT: intEnv('WORKER_CONCURRENCY_SRT_IMPORT', 2),
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
