@@ -21,6 +21,19 @@ export const QUEUE_NAMES = {
   // v2 enrichment pipeline — producer/orchestrator/chunk model.
   ENRICH_ORCHESTRATOR: 'enrich-orchestrator',
   ENRICH_CHUNK: 'enrich-chunk',
+  // v2 translation pipeline — producer/orchestrator/chunk model.
+  // Same shape as enrichment: producer freezes a chunk_plan, orchestrator
+  // dispatches chunks in bounded ticks, chunk worker calls a single provider
+  // batch and writes records. Idempotent via completed_chunk_keys.
+  TRANSLATE_ORCHESTRATOR: 'translate-orchestrator',
+  TRANSLATE_CHUNK: 'translate-chunk',
+  // v2 adaptation pipeline — producer/orchestrator/chunk model.
+  // Single AdaptationRun entity carries a `kind` discriminator
+  // (base_translation / retranslate_all / generate_adaptation). Same
+  // hardening as translation: idempotent chunk skip, authoritative
+  // chunk_completed finalize gate, atomic-ish counter commits.
+  ADAPT_ORCHESTRATOR: 'adapt-orchestrator',
+  ADAPT_CHUNK: 'adapt-chunk',
   SRT_IMPORT: 'srt-import',
 } as const;
 
@@ -120,12 +133,94 @@ export interface EnrichChunkJobData {
   auth_token?: string;
 }
 
+// ─── v2 translation payloads ─────────────────────────────────────────
+//
+// Mirrors the v2 enrichment pipeline. Each job carries a scoped JWT bound to
+// the function it calls back. Worker forwards verbatim as X-Worker-JWT.
+//
+//   Producer (Base44 fn `enqueueTranslation`)
+//     → Validates auth + ownership.
+//     → Deletes any existing TranslationSegments for this language (replace
+//       semantics — matches legacy runTranslation behaviour).
+//     → Builds the frozen chunk_plan and creates the TranslationRun.
+//     → Mints a scoped JWT and enqueues ONE TranslateOrchestratorJobData job.
+//
+//   Orchestrator (worker → Base44 fn `orchestrateTranslationRun`)
+//     → Bounded ≤45s per tick. Reads run.checkpoint, advances chunk_cursor
+//       by a small batch, enqueues N TranslateChunkJobData jobs.
+//     → Re-enqueues itself with a small delay until all chunks dispatched.
+//     → Finalizes run when chunk_completed >= chunk_total.
+//
+//   Chunk (worker → Base44 fn `translateChunk`)
+//     → Bounded ≤50s per chunk. Translates ≤50 (DeepL/variant) or ≤20 (LLM)
+//       segments via a single provider call, writes TranslationSegment rows
+//       in bulk, commits counters atomically.
+//     → Idempotent via completed_chunk_keys on the run document.
+
+export interface TranslateOrchestratorJobData {
+  schema_version: number;
+  project_id: string;
+  translation_run_id: string;
+  user_email: string;
+  request_id: string;
+  /** Scoped JWT bound to (user, project, run_id, 'orchestrateTranslationRun'). 30 min TTL. */
+  auth_token?: string;
+}
+
+export interface TranslateChunkJobData {
+  schema_version: number;
+  project_id: string;
+  translation_run_id: string;
+  /** Stable id for this chunk: `chunk:${index}`. Used for idempotency. */
+  chunk_key: string;
+  chunk_index: number;
+  /** Source segment IDs to translate in this chunk. */
+  segment_ids: string[];
+  user_email: string;
+  request_id: string;
+  /** Scoped JWT bound to (user, project, chunk_key, 'translateChunk'). 30 min TTL. */
+  auth_token?: string;
+}
+
 export interface SrtImportJobData {
   schema_version: number;
   project_id: string;
   s3_key: string;
   user_email: string;
   request_id: string;
+}
+
+// ─── v2 adaptation payloads ──────────────────────────────────────────
+//
+// Mirrors the v2 translation pipeline. One AdaptationRun discriminated by
+// `kind` ('base_translation' | 'retranslate_all' | 'generate_adaptation')
+// — same producer/orchestrator/chunk shape and same idempotency model.
+
+export interface AdaptOrchestratorJobData {
+  schema_version: number;
+  project_id: string;
+  adaptation_run_id: string;
+  user_email: string;
+  request_id: string;
+  /** Scoped JWT bound to (user, project, run_id, 'orchestrateAdaptationRun'). */
+  auth_token?: string;
+}
+
+export interface AdaptChunkJobData {
+  schema_version: number;
+  project_id: string;
+  adaptation_run_id: string;
+  /** Stable id for this chunk: `chunk:${index}`. Used for idempotency. */
+  chunk_key: string;
+  chunk_index: number;
+  /** TranscriptSegment IDs (kind='base_translation'). */
+  source_segment_ids: string[];
+  /** AdaptationSegment IDs (kind='retranslate_all' or 'generate_adaptation'). */
+  adaptation_segment_ids: string[];
+  user_email: string;
+  request_id: string;
+  /** Scoped JWT bound to (user, project, chunk_key, 'adaptChunk'). */
+  auth_token?: string;
 }
 
 // Discriminated union for processors that need to handle multiple shapes.
@@ -135,6 +230,10 @@ export type AnyJobData =
   | BatchEnrichJobData
   | EnrichOrchestratorJobData
   | EnrichChunkJobData
+  | TranslateOrchestratorJobData
+  | TranslateChunkJobData
+  | AdaptOrchestratorJobData
+  | AdaptChunkJobData
   | SrtImportJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
