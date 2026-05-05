@@ -15,6 +15,8 @@ import { QUEUE_NAMES } from '../shared/queue-contracts.js';
 import { processVoiceGen } from './processors/voice-gen.js';
 import { processBatchTranslate } from './processors/batch-translate.js';
 import { processBatchEnrich } from './processors/batch-enrich.js';
+import { processEnrichOrchestrator } from './processors/enrich-orchestrator.js';
+import { processEnrichChunk } from './processors/enrich-chunk.js';
 import { processSrtImport } from './processors/srt-import.js';
 
 initSentry();
@@ -32,6 +34,13 @@ const workers: Worker[] = [
   }),
   new Worker(QUEUE_NAMES.BATCH_ENRICH, processBatchEnrich, {
     ...baseOpts, concurrency: env.CONCURRENCY_ENRICH,
+  }),
+  // v2 enrichment pipeline — producer/orchestrator/chunk model.
+  new Worker(QUEUE_NAMES.ENRICH_ORCHESTRATOR, processEnrichOrchestrator, {
+    ...baseOpts, concurrency: env.CONCURRENCY_ENRICH_ORCHESTRATOR,
+  }),
+  new Worker(QUEUE_NAMES.ENRICH_CHUNK, processEnrichChunk, {
+    ...baseOpts, concurrency: env.CONCURRENCY_ENRICH_CHUNK,
   }),
   new Worker(QUEUE_NAMES.SRT_IMPORT, processSrtImport, {
     ...baseOpts, concurrency: env.CONCURRENCY_SRT_IMPORT,

@@ -26,7 +26,10 @@ function intEnv(name: string, def: number): number {
 export const env = {
   UPSTASH_REDIS_URL: required('UPSTASH_REDIS_URL'),
   BASE44_APP_ID: required('BASE44_APP_ID'),
-  BASE44_API_BASE: optional('BASE44_API_BASE', 'https://app.base44.com/api/apps'),
+  // NOTE: must use the app subdomain (.app), not the platform domain (.com).
+  // The platform domain returns HTTP 403 "Backend functions cannot be accessed
+  // from the platform domain. Use the app's subdomain instead."
+  BASE44_API_BASE: optional('BASE44_API_BASE', 'https://app.base44.app/api/apps'),
   // BASE44_SERVICE_TOKEN intentionally removed — we now use scoped per-job JWTs
   // forwarded from the producer via job.data.auth_token. See base44-client.ts
   // and the AUTH MODEL section there for the security rationale.
@@ -37,7 +40,14 @@ export const env = {
 
   CONCURRENCY_VOICE_GEN: intEnv('WORKER_CONCURRENCY_VOICE_GEN', 5),
   CONCURRENCY_TRANSLATE: intEnv('WORKER_CONCURRENCY_TRANSLATE', 10),
+  // Legacy single-shot enrich queue. Kept low — it shouldn't be receiving
+  // new jobs once the v2 pipeline is rolled out.
   CONCURRENCY_ENRICH: intEnv('WORKER_CONCURRENCY_ENRICH', 4),
+  // v2 enrichment: the orchestrator should be SERIAL per worker (low cost,
+  // serialized DB writes against the run document) but chunks are the hot
+  // path — bumped to 20 to satisfy the 100-concurrent-users target.
+  CONCURRENCY_ENRICH_ORCHESTRATOR: intEnv('WORKER_CONCURRENCY_ENRICH_ORCHESTRATOR', 4),
+  CONCURRENCY_ENRICH_CHUNK: intEnv('WORKER_CONCURRENCY_ENRICH_CHUNK', 20),
   CONCURRENCY_SRT_IMPORT: intEnv('WORKER_CONCURRENCY_SRT_IMPORT', 2),
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
