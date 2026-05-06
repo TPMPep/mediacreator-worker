@@ -49,12 +49,15 @@ export async function invokeBase44Function<T = unknown>(opts: InvokeOpts): Promi
       'X-App-Id': env.BASE44_APP_ID,
     };
     if (opts.authToken) {
-      // Send as both headers:
-      //  - Authorization: Bearer ... satisfies the Base44 platform gateway,
-      //    which 401s any unauthenticated request before the function runs.
-      //  - X-Worker-JWT is what our function-side verifyWorkerJWT() reads
-      //    to validate the scoped claims (project_id, resource_id, fn).
-      headers['Authorization'] = `Bearer ${opts.authToken}`;
+      // Send ONLY X-Worker-JWT. We previously also sent Authorization: Bearer
+      // for the platform gateway, but that backfires intermittently: the
+      // gateway tries to validate our HS256 worker JWT as a Base44 session
+      // token, fails, and returns 403 ("You must be logged in") before our
+      // function-side verifyWorkerJWT() ever runs. The behaviour is non-
+      // deterministic (edge routing) — most calls go through, some 403.
+      // Dropping the Authorization header lets the gateway treat the call
+      // as anonymous-but-allowed; our function's verifyWorkerJWT() reads
+      // X-Worker-JWT and enforces the real auth. (Day 5 finding 2026-05-06.)
       headers['X-Worker-JWT'] = opts.authToken;
     }
     const res = await fetch(url, {
