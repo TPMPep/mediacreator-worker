@@ -49,6 +49,12 @@ export async function invokeBase44Function<T = unknown>(opts: InvokeOpts): Promi
       'X-App-Id': env.BASE44_APP_ID,
     };
     if (opts.authToken) {
+      // Send as both headers:
+      //  - Authorization: Bearer ... satisfies the Base44 platform gateway,
+      //    which 401s any unauthenticated request before the function runs.
+      //  - X-Worker-JWT is what our function-side verifyWorkerJWT() reads
+      //    to validate the scoped claims (project_id, resource_id, fn).
+      headers['Authorization'] = `Bearer ${opts.authToken}`;
       headers['X-Worker-JWT'] = opts.authToken;
     }
     const res = await fetch(url, {
