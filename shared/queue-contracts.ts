@@ -35,6 +35,15 @@ export const QUEUE_NAMES = {
   ADAPT_ORCHESTRATOR: 'adapt-orchestrator',
   ADAPT_CHUNK: 'adapt-chunk',
   SRT_IMPORT: 'srt-import',
+  // v2 HLS-to-MP4 ingest pipeline. Single-shot job (no chunks) but uses the
+  // same scoped-JWT + checkpoint-resumable pattern as the other 4 heavy
+  // pipelines. The worker steps a phase machine via `hlsIngestWorkerStep`:
+  //   queued → codecs_validated → railway_dispatched → project_patched
+  // The 'call_railway' phase is the long one (up to 15 min for a 90-min
+  // source). We make that HTTP call directly from the worker (Node has no
+  // 50s edge timeout) and re-call hlsIngestWorkerStep with `carry` so
+  // Base44 finalizes the run.
+  HLS_INGEST: 'hls-ingest',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -190,6 +199,35 @@ export interface SrtImportJobData {
   request_id: string;
 }
 
+// ─── v2 HLS ingest payload ───────────────────────────────────────────
+// Single-shot job — the worker walks the phase machine itself by calling
+// hlsIngestWorkerStep repeatedly, NOT by re-enqueueing.
+//
+//   Producer (Base44 fn `enqueueHlsIngest`)
+//     → Validates auth + ownership + concurrent-run guard.
+//     → Creates HlsIngestRun (status=queued, drm_verdict=clean).
+//     → Mints a 30-min scoped JWT bound to (user, project, run_id, fn).
+//     → Enqueues ONE HlsIngestJobData job to the hls-ingest queue.
+//
+//   Worker (this processor)
+//     → Loops: POST hlsIngestWorkerStep, follow `action` directive
+//       (call_railway → POST Railway → recall function with carry,
+//        recall_function → POST again, done → exit).
+//     → Forwards the JWT verbatim as X-Worker-JWT on every Base44 call.
+//     → On Railway dispatch, sends the api_key from the function response
+//       (NOT from worker env — single source of truth lives on Base44).
+//     → Heartbeats job lock during the long Railway call.
+
+export interface HlsIngestJobData {
+  schema_version: number;
+  project_id: string;
+  hls_ingest_run_id: string;
+  user_email: string;
+  request_id: string;
+  /** Scoped JWT bound to (user, project, run_id, 'hlsIngestWorkerStep'). 30 min TTL. */
+  auth_token?: string;
+}
+
 // ─── v2 adaptation payloads ──────────────────────────────────────────
 //
 // Mirrors the v2 translation pipeline. One AdaptationRun discriminated by
@@ -234,7 +272,8 @@ export type AnyJobData =
   | TranslateChunkJobData
   | AdaptOrchestratorJobData
   | AdaptChunkJobData
-  | SrtImportJobData;
+  | SrtImportJobData
+  | HlsIngestJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
 
