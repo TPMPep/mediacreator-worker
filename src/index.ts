@@ -22,6 +22,7 @@ import { processTranslateChunk } from './processors/translate-chunk.js';
 import { processAdaptOrchestrator } from './processors/adapt-orchestrator.js';
 import { processAdaptChunk } from './processors/adapt-chunk.js';
 import { processSrtImport } from './processors/srt-import.js';
+import { processHlsIngest } from './processors/hls-ingest.js';
 
 initSentry();
 
@@ -39,22 +40,18 @@ const workers: Worker[] = [
   new Worker(QUEUE_NAMES.BATCH_ENRICH, processBatchEnrich, {
     ...baseOpts, concurrency: env.CONCURRENCY_ENRICH,
   }),
-  // v2 enrichment pipeline — producer/orchestrator/chunk model.
   new Worker(QUEUE_NAMES.ENRICH_ORCHESTRATOR, processEnrichOrchestrator, {
     ...baseOpts, concurrency: env.CONCURRENCY_ENRICH_ORCHESTRATOR,
   }),
   new Worker(QUEUE_NAMES.ENRICH_CHUNK, processEnrichChunk, {
     ...baseOpts, concurrency: env.CONCURRENCY_ENRICH_CHUNK,
   }),
-  // v2 translation pipeline — producer/orchestrator/chunk model.
   new Worker(QUEUE_NAMES.TRANSLATE_ORCHESTRATOR, processTranslateOrchestrator, {
     ...baseOpts, concurrency: env.CONCURRENCY_TRANSLATE_ORCHESTRATOR,
   }),
   new Worker(QUEUE_NAMES.TRANSLATE_CHUNK, processTranslateChunk, {
     ...baseOpts, concurrency: env.CONCURRENCY_TRANSLATE_CHUNK,
   }),
-  // v2 adaptation pipeline — producer/orchestrator/chunk model. Single
-  // AdaptationRun entity discriminated by `kind`.
   new Worker(QUEUE_NAMES.ADAPT_ORCHESTRATOR, processAdaptOrchestrator, {
     ...baseOpts, concurrency: env.CONCURRENCY_ADAPT_ORCHESTRATOR,
   }),
@@ -63,6 +60,11 @@ const workers: Worker[] = [
   }),
   new Worker(QUEUE_NAMES.SRT_IMPORT, processSrtImport, {
     ...baseOpts, concurrency: env.CONCURRENCY_SRT_IMPORT,
+  }),
+  // v2 HLS-to-MP4 ingest pipeline. Single-shot per job; processor walks the
+  // phase machine on the Base44 side via hlsIngestWorkerStep.
+  new Worker(QUEUE_NAMES.HLS_INGEST, processHlsIngest, {
+    ...baseOpts, concurrency: env.CONCURRENCY_HLS_INGEST,
   }),
 ];
 
@@ -107,9 +109,6 @@ function getQueue(name: string): Queue {
 }
 
 // ─── HTTP endpoints for Railway ──────────────────────────────────────
-// /health  — Railway healthcheck.
-// /enqueue — Producer-side endpoint. Base44 functions POST here to push
-//            jobs into a queue. Protected by WORKER_ENQUEUE_SECRET if set.
 const server = http.createServer(async (req, res) => {
   if (req.url === '/health' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -121,8 +120,6 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.url === '/enqueue' && req.method === 'POST') {
-    // Auth: shared-secret header. If WORKER_ENQUEUE_SECRET is unset, the
-    // endpoint refuses all requests (fail-closed).
     if (!env.ENQUEUE_SECRET) {
       res.writeHead(503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'enqueue endpoint disabled (no secret configured)' }));
