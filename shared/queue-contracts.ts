@@ -13,7 +13,9 @@ export const JOB_SCHEMA_VERSION = 2;
 
 export const QUEUE_NAMES = {
   VOICE_GEN: 'voice-gen',
-  BATCH_TRANSLATE: 'batch-translate',
+  // (Legacy BATCH_TRANSLATE queue removed 2026-05-09 — translation now uses
+  // the v4 producer/orchestrator/chunk pipeline below. The old runTranslation
+  // function and batch-translate.ts processor were deleted.)
   // Legacy single-shot enrichment queue. Retained for backwards compat with
   // any in-flight v1 jobs; new producers should target the orchestrator/chunk
   // queues below instead.
@@ -34,6 +36,15 @@ export const QUEUE_NAMES = {
   // chunk_completed finalize gate, atomic-ish counter commits.
   ADAPT_ORCHESTRATOR: 'adapt-orchestrator',
   ADAPT_CHUNK: 'adapt-chunk',
+  // v2 AI rewrite pipeline (BULK shorten/expand from the Tools panel).
+  // Single AIRewriteRun entity carries a `kind` discriminator
+  // ('translation_bulk_shorten' | 'translation_bulk_expand'). Single-line
+  // shorten/expand from the editor row stays SYNCHRONOUS (no queue) —
+  // those are sub-cent ops with their own audit emission. The bulk
+  // pipeline is for the Tools-panel CPS-band scanner that may rewrite
+  // hundreds of lines in one run; cost-capped per project.
+  AIREWRITE_ORCHESTRATOR: 'airewrite-orchestrator',
+  AIREWRITE_CHUNK: 'airewrite-chunk',
   SRT_IMPORT: 'srt-import',
   // v2 HLS-to-MP4 ingest pipeline. Single-shot job (no chunks) but uses the
   // same scoped-JWT + checkpoint-resumable pattern as the other 4 heavy
@@ -68,16 +79,6 @@ export interface VoiceGenJobData {
   request_id: string;
   auth_token?: string;
   priority_hint?: 'low' | 'normal' | 'high';
-}
-
-export interface BatchTranslateJobData {
-  schema_version: number;
-  project_id: string;
-  segment_ids: string[];
-  target_language: string;
-  provider: 'deepl' | 'gemini' | 'chatgpt';
-  user_email: string;
-  request_id: string;
 }
 
 // Legacy v1 payload — still accepted by the batch-enrich queue.
@@ -183,12 +184,55 @@ export interface TranslateChunkJobData {
   /** Stable id for this chunk: `chunk:${index}`. Used for idempotency. */
   chunk_key: string;
   chunk_index: number;
-  /** Source segment IDs to translate in this chunk. */
-  segment_ids: string[];
+  /**
+   * INLINE segments. The orchestrator resolves source text and embeds it
+   * here so the chunk worker reads ZERO Base44 entities at execution time.
+   * v4-rev2 (2026-05-09): combined with run params being inlined below,
+   * the chunk function makes zero Base44 SDK calls. The orchestrator is
+   * the SOLE writer for TranslationRun / TranslationSegment / CostLog.
+   */
+  segments: Array<{ source_segment_id: string; source_text: string }>;
+  /** Inlined run params — chunk does not need to read TranslationRun. */
+  provider: 'deepl' | 'gemini' | 'chatgpt' | 'claude' | 'variant';
+  source_language_code: string;
+  target_language_code: string;
+  target_language_label: string;
+  formality: string;
+  context: string;
   user_email: string;
   request_id: string;
   /** Scoped JWT bound to (user, project, chunk_key, 'translateChunk'). 30 min TTL. */
   auth_token?: string;
+}
+
+/**
+ * v4-rev2 chunk return value. The orchestrator harvests these via
+ * /job-status on each tick, then bulk-creates TranslationSegment rows
+ * and updates TranslationRun counters in a single atomic write.
+ *
+ * ok=true  → translations carry the per-segment output. orchestrator
+ *            bulkCreates and increments counters.
+ * ok=false → terminal_error explains why; no retry will help. orchestrator
+ *            records the failure and advances.
+ *
+ * Transient errors (network, 5xx, rate-limit) are NOT represented here —
+ * they cause the chunk to throw, BullMQ retries up to 3×, and only after
+ * exhaustion does the job land in state='failed' with failedReason.
+ */
+export interface TranslateChunkResult {
+  ok: boolean;
+  chunk_key: string;
+  chunk_index: number;
+  translations: Array<{ source_segment_id: string; translated_text: string }>;
+  processed_count: number;
+  translated_count: number;
+  failed_count: number;
+  characters_processed: number;
+  cost_usd: number;
+  prompt_version?: string;
+  duration_ms: number;
+  request_id: string;
+  terminal_error: { code: string; message: string } | null;
 }
 
 export interface SrtImportJobData {
@@ -261,10 +305,68 @@ export interface AdaptChunkJobData {
   auth_token?: string;
 }
 
+// ─── v2 AI rewrite payloads (bulk shorten/expand) ────────────────────
+//
+//   Producer (Base44 fn `enqueueAIRewriteRun`)
+//     → Validates auth + ownership.
+//     → Scans the project for rewrite candidates by mode (shorten/expand)
+//       using BOTH a CPS gate and (when audio exists) a fit-compression gate,
+//       both tunable from the UI.
+//     → Performs a PRE-FLIGHT cost estimate against Project.cost_cap_per_rewrite_usd.
+//       If estimated cost > cap → refuses to start (returns 409).
+//     → Freezes a chunk_plan (≤10 translation_ids per chunk) and creates the
+//       AIRewriteRun with cost_cap_usd pinned.
+//     → Mints a scoped JWT and enqueues ONE AIRewriteOrchestratorJobData job.
+//
+//   Orchestrator (worker → Base44 fn `orchestrateAIRewriteRun`)
+//     → ≤45s per tick. Reads run.checkpoint, advances chunk_cursor, dispatches
+//       N AIRewriteChunkJobData jobs. Soft-stops dispatch when cumulative
+//       cost_usd ≥ cost_cap_usd: marks cost_cap_breached=true and stops
+//       dispatching new chunks, but lets in-flight chunks DRAIN before
+//       finalising as 'partial' on a later tick. This matches the M2 spec
+//       (auditor evidence: cap is a planning constraint AND a circuit-breaker,
+//       in-flight work isn't lost).
+//     → Re-enqueues itself with a small delay until all chunks dispatched.
+//     → Finalises run when chunks_terminal >= chunk_total.
+//
+//   Chunk (worker → Base44 fn `rewriteChunk`)
+//     → ≤50s per chunk. Rewrites N translations (one LLM call per line — these
+//       are CPS-verified per-line rewrites, not batchable like translation).
+//     → Concurrency-bounded by the worker concurrency knob; lines run serially
+//       inside the chunk to keep the per-line audit trail strict.
+//     → Each line writes its before/after to the chunk's accumulator; the
+//       chunk-level commit appends counters atomically.
+
+export interface AIRewriteOrchestratorJobData {
+  schema_version: number;
+  project_id: string;
+  rewrite_run_id: string;
+  user_email: string;
+  request_id: string;
+  /** Scoped JWT bound to (user, project, run_id, 'orchestrateAIRewriteRun'). */
+  auth_token?: string;
+}
+
+export interface AIRewriteChunkJobData {
+  schema_version: number;
+  project_id: string;
+  rewrite_run_id: string;
+  /** Stable id for this chunk: `chunk:${index}`. Used for idempotency. */
+  chunk_key: string;
+  chunk_index: number;
+  /** TranslationSegment IDs to rewrite in this chunk. ≤10 per chunk. */
+  translation_ids: string[];
+  /** Mirror of the run's mode for fast dispatch. 'shorten' | 'expand'. */
+  mode: 'shorten' | 'expand';
+  user_email: string;
+  request_id: string;
+  /** Scoped JWT bound to (user, project, chunk_key, 'rewriteChunk'). */
+  auth_token?: string;
+}
+
 // Discriminated union for processors that need to handle multiple shapes.
 export type AnyJobData =
   | VoiceGenJobData
-  | BatchTranslateJobData
   | BatchEnrichJobData
   | EnrichOrchestratorJobData
   | EnrichChunkJobData
@@ -272,6 +374,8 @@ export type AnyJobData =
   | TranslateChunkJobData
   | AdaptOrchestratorJobData
   | AdaptChunkJobData
+  | AIRewriteOrchestratorJobData
+  | AIRewriteChunkJobData
   | SrtImportJobData
   | HlsIngestJobData;
 
