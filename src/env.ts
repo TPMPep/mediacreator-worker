@@ -38,7 +38,17 @@ export const env = {
   SENTRY_ENVIRONMENT: optional('SENTRY_ENVIRONMENT', 'production'),
   SENTRY_RELEASE: process.env.SENTRY_RELEASE || undefined,
 
-  CONCURRENCY_VOICE_GEN: intEnv('WORKER_CONCURRENCY_VOICE_GEN', 5),
+  // Voice-gen concurrency. Held DELIBERATELY at 3 (lowered from 5 on
+  // 2026-05-10 after incident: 116-segment dub at concurrency=5 saturated
+  // the platform per-app SDK gateway with HTTP 429s — each segment performs
+  // ~8 SDK writes (TranslationSegment update, S3 upload, time-stretch,
+  // fitted update, cost log, etc.), so 5 concurrent = ~40 calls/sec
+  // sustained, exceeding the platform's per-app threshold). Concurrency=3
+  // gives ~24 calls/sec sustained, well within budget. Throughput trade-
+  // off: 116-segment dub goes from ~5min → ~8min — acceptable for an
+  // auditor-defensible posture. Match-up with translation pipeline which
+  // sits at 4 with no incidents. SOC 2 CC7.4 / TPN MS-7.x.
+  CONCURRENCY_VOICE_GEN: intEnv('WORKER_CONCURRENCY_VOICE_GEN', 3),
   // (Legacy CONCURRENCY_TRANSLATE removed 2026-05-09 — batch-translate
   // queue is gone. Translation now uses TRANSLATE_ORCHESTRATOR/CHUNK below.)
   // Legacy single-shot enrich queue. Kept low — it shouldn't be receiving
