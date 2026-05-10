@@ -15,6 +15,7 @@ export async function processVoiceGen(job: Job<VoiceGenJobData>) {
     previous_text, next_text, segment_duration_ms,
     performance_prompt, cue_stability,
     user_email, request_id, auth_token,
+    job_run_id,
   } = job.data;
   try {
     if (!auth_token) {
@@ -44,6 +45,10 @@ export async function processVoiceGen(job: Job<VoiceGenJobData>) {
         segment_duration_ms: segment_duration_ms ?? 0,
         performance_prompt: performance_prompt ?? null,
         cue_stability: cue_stability ?? null,
+        // Parent JobRun id — generateOneSegment ticks completion at the end
+        // when all segments in the run reach a terminal state. Closes the
+        // SOC 2 CC7.2 zombie-JobRun gap.
+        job_run_id: job_run_id ?? null,
       },
       timeoutMs: 5 * 60 * 1000,
     });
