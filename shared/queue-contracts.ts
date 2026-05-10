@@ -79,6 +79,13 @@ export interface VoiceGenJobData {
   request_id: string;
   auth_token?: string;
   priority_hint?: 'low' | 'normal' | 'high';
+  /**
+   * Parent JobRun id. generateOneSegment uses this to "tick" completion at the
+   * end of every job — when all segments in the run reach a terminal state,
+   * the JobRun is atomically marked completed/partial/failed. Closes the
+   * SOC 2 CC7.2 zombie-JobRun gap. Optional for legacy/direct callers.
+   */
+  job_run_id?: string;
 }
 
 // Legacy v1 payload — still accepted by the batch-enrich queue.
@@ -345,6 +352,41 @@ export interface AIRewriteOrchestratorJobData {
   request_id: string;
   /** Scoped JWT bound to (user, project, run_id, 'orchestrateAIRewriteRun'). */
   auth_token?: string;
+
+  // ─── v3 INLINED PAYLOAD (2026-05-09) ──────────────────────────────────
+  // The orchestrator does NOT read AIRewriteRun from inside backend-function
+  // context — that read path is broken on this entity (see incident
+  // 2026-05-09: base44.asServiceRole.entities.AIRewriteRun.[get|filter]
+  // returns empty for verifiably-present rows). Instead, the producer
+  // inlines all immutable run config into the job payload at enqueue
+  // time, and mutable run state is passed forward across ticks via
+  // next-tick payload (snapshot fields below). Writes to AIRewriteRun
+  // still happen via .update() for audit/UI — only reads are eliminated.
+  // Mirrors the same pattern translateChunk uses (schema_version: 3).
+
+  /** Immutable run config — frozen at producer time. */
+  inlined_plan?: {
+    kind: 'translation_bulk_shorten' | 'translation_bulk_expand';
+    chunk_plan: Array<{ chunk_index: number; translation_ids: string[] }>;
+    chunk_total: number;
+    cost_cap_usd: number | null;
+    started_at: string;
+  };
+  /** Mutable run state — carried forward each tick. Empty on first tick. */
+  state?: {
+    chunk_cursor: number;
+    completed_chunk_keys: string[];
+    chunk_failures: Array<{ chunk_index: number; attempts: number; error: string; record_count?: number }>;
+    chunk_jobs: Record<string, string>; // chunk_key -> bullmq_job_id
+    cost_usd: number;
+    processed_count: number;
+    succeeded_count: number;
+    failed_count: number;
+    characters_processed: number;
+    cost_cap_breached: boolean;
+    tick_count: number;
+    status: 'queued' | 'orchestrating' | 'running';
+  };
 }
 
 export interface AIRewriteChunkJobData {
@@ -362,6 +404,43 @@ export interface AIRewriteChunkJobData {
   request_id: string;
   /** Scoped JWT bound to (user, project, chunk_key, 'rewriteChunk'). */
   auth_token?: string;
+  // ─── v3 INLINED RUN CONFIG (2026-05-09) ───────────────────────────────
+  // The chunk function CANNOT read AIRewriteRun (platform read bug — see
+  // AIRewriteOrchestratorJobData rationale). Producer inlines all run
+  // config the chunk needs at orchestrator-dispatch time.
+  inlined_run_config?: {
+    provider: 'gemini' | 'chatgpt';
+    model: string;
+    target_language_code: string;
+    notes: string;
+    user_overrides: Record<string, unknown>;
+  };
+}
+
+/**
+ * v3 chunk return value. The orchestrator harvests these from BullMQ via
+ * /job-status on each tick (same pattern as TranslateChunkResult). The
+ * orchestrator is the SOLE writer for AIRewriteRun counters; the chunk
+ * only writes to TranslationSegment (the actual rewritten text) and
+ * returns its accounting via this shape.
+ */
+export interface AIRewriteChunkResult {
+  ok: boolean;
+  chunk_key: string;
+  chunk_index: number;
+  /** Per-line outcomes for orchestrator's audit aggregation. */
+  processed_count: number;
+  succeeded_count: number;
+  failed_count: number;
+  skipped_count: number;
+  characters_processed: number;
+  cost_usd: number;
+  /** When ok=false, why this chunk should be marked failed. */
+  terminal_error: { code: string; message: string } | null;
+  /** Per-line failure detail to bubble up into AIRewriteRun.chunk_failures. */
+  failed_record_ids: string[];
+  duration_ms: number;
+  request_id: string;
 }
 
 // Discriminated union for processors that need to handle multiple shapes.
