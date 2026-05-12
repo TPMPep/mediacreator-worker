@@ -55,6 +55,14 @@ export const QUEUE_NAMES = {
   // 50s edge timeout) and re-call hlsIngestWorkerStep with `carry` so
   // Base44 finalizes the run.
   HLS_INGEST: 'hls-ingest',
+  // CC Creation rules-engine re-apply pipeline. Single-shot job (no chunks).
+  // Operator-triggered "Re-apply Spec" runs (operator_reapply / spec_change /
+  // bulk_tool / import_normalize) go through this queue so the heavy
+  // delete + bulkCreate of N CaptionCue rows lives in the worker's 30-min
+  // budget instead of Base44's 3-min function ceiling. The initial format
+  // produced by ccRunTranscription stays inline (it's already inside a job
+  // with its own budget). ISOLATED to the CC Creation module.
+  CC_FORMAT_RUN: 'cc-format-run',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -279,6 +287,26 @@ export interface HlsIngestJobData {
   auth_token?: string;
 }
 
+// ─── CC format-run payload ────────────────────────────────────────────
+//
+// Single-shot job. The worker calls ccFormatRunWorkerStep ONCE; that
+// function runs the rules engine end-to-end (load cues → engine → delete +
+// bulkCreate → finalize CCFormatRun + Project) inside its function budget,
+// updating CCFormatRun.progress_pct / current_phase as it goes. The worker
+// just heartbeats during the call and exits when the function returns
+// action='done'. Pattern mirrors hls-ingest exactly — same JWT model,
+// same heartbeat shape, same DLQ semantics.
+
+export interface CCFormatRunJobData {
+  schema_version: number;
+  project_id: string;
+  format_run_id: string;
+  user_email: string;
+  request_id: string;
+  /** Scoped JWT bound to (user, project, format_run_id, 'ccFormatRunWorkerStep'). 30 min TTL. */
+  auth_token?: string;
+}
+
 // ─── v2 adaptation payloads ──────────────────────────────────────────
 //
 // Mirrors the v2 translation pipeline. One AdaptationRun discriminated by
@@ -456,7 +484,8 @@ export type AnyJobData =
   | AIRewriteOrchestratorJobData
   | AIRewriteChunkJobData
   | SrtImportJobData
-  | HlsIngestJobData;
+  | HlsIngestJobData
+  | CCFormatRunJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
 
