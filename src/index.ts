@@ -30,6 +30,7 @@ import { processAIRewriteOrchestrator } from './processors/airewrite-orchestrato
 import { processAIRewriteChunk } from './processors/airewrite-chunk.js';
 import { processSrtImport } from './processors/srt-import.js';
 import { processHlsIngest } from './processors/hls-ingest.js';
+import { processCCFormatRun } from './processors/cc-format-run.js';
 
 initSentry();
 
@@ -80,6 +81,10 @@ const workers: Worker[] = [
   // v2 HLS-to-MP4 ingest pipeline.
   new Worker(QUEUE_NAMES.HLS_INGEST, processHlsIngest, {
     ...baseOpts, concurrency: env.CONCURRENCY_HLS_INGEST,
+  }),
+  // CC Creation rules-engine re-apply pipeline (single-shot, ISOLATED to CC).
+  new Worker(QUEUE_NAMES.CC_FORMAT_RUN, processCCFormatRun, {
+    ...baseOpts, concurrency: env.CONCURRENCY_CC_FORMAT_RUN,
   }),
 ];
 
