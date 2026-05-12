@@ -88,6 +88,10 @@ export const env = {
   // keeps Railway compute bounded; tune up only after the load test green-
   // lights it.
   CONCURRENCY_HLS_INGEST: intEnv('WORKER_CONCURRENCY_HLS_INGEST', 4),
+  // CC format-run: each job blocks a worker slot for up to ~3 min on a 1,100-
+  // cue project. Set to 4 to match other heavy single-shot pipelines and
+  // give an 100-concurrent-user load headroom of ~25 runs/min sustained.
+  CONCURRENCY_CC_FORMAT_RUN: intEnv('WORKER_CONCURRENCY_CC_FORMAT_RUN', 4),
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
