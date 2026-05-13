@@ -32,6 +32,7 @@ export async function processAIRewriteChunk(job: Job<AIRewriteChunkJobData>) {
   const {
     project_id, rewrite_run_id, chunk_key, chunk_index,
     translation_ids, mode, user_email, request_id, auth_token,
+    inlined_run_config,
   } = job.data;
 
   if (!auth_token) {
@@ -59,6 +60,9 @@ export async function processAIRewriteChunk(job: Job<AIRewriteChunkJobData>) {
         translation_ids,
         mode,
         request_id,
+        // v3 (2026-05-09): forward inlined run config so the chunk
+        // function doesn't have to read AIRewriteRun (read path broken).
+        inlined_run_config,
       },
       timeoutMs: CHUNK_TIMEOUT_MS,
     });
