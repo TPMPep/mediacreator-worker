@@ -57,14 +57,23 @@ interface OrchestratorTickResult {
   cost_cap_breached?: boolean;
   cost_usd?: number;
   cost_cap_usd?: number | null;
+  /** v3 inlined-payload: post-tick state snapshot to carry into next tick. */
+  next_state?: AIRewriteOrchestratorJobData['state'];
 }
 
 export async function processAIRewriteOrchestrator(job: Job<AIRewriteOrchestratorJobData>) {
   const t0 = Date.now();
-  const { project_id, rewrite_run_id, user_email, request_id, auth_token } = job.data;
+  const { project_id, rewrite_run_id, user_email, request_id, auth_token, inlined_plan, state } = job.data;
 
   if (!auth_token) {
     throw new Error('airewrite-orchestrator: missing auth_token (re-enqueue required)');
+  }
+  // v3 inlined-payload contract — the Base44 orchestrator function rejects
+  // any call missing either field with HTTP 400 'legacy_payload_rejected'.
+  // Defensive guard here so a malformed re-enqueue surfaces as a clear
+  // BullMQ job error instead of an opaque 400 from the function.
+  if (!inlined_plan || !state) {
+    throw new Error('airewrite-orchestrator: missing inlined_plan or state (v3 contract)');
   }
 
   let heartbeatActive = true;
@@ -80,7 +89,10 @@ export async function processAIRewriteOrchestrator(job: Job<AIRewriteOrchestrato
     const result = await invokeBase44Function<OrchestratorTickResult>({
       fn: 'orchestrateAIRewriteRun',
       authToken: auth_token,
-      payload: { project_id, rewrite_run_id, request_id },
+      // v3 contract — orchestrator reads run config from inlined_plan +
+      // state, never from Base44 (AIRewriteRun read path was broken
+      // incident 2026-05-09). Forward both verbatim every tick.
+      payload: { project_id, rewrite_run_id, request_id, inlined_plan, state },
       timeoutMs: TICK_TIMEOUT_MS,
     });
 
@@ -107,9 +119,21 @@ export async function processAIRewriteOrchestrator(job: Job<AIRewriteOrchestrato
 
     if (result.next_tick && !result.finalized) {
       const delay = Math.max(500, Math.min(10_000, result.next_tick_delay_ms ?? 1_000));
+      // Carry forward the inlined plan AND the freshly-mutated state so the
+      // next tick is fully self-contained (no Base44 reads of AIRewriteRun).
+      // The orchestrator returns `next_state` containing the post-tick
+      // snapshot of cursor/completed/failures/cost/etc. We reuse the same
+      // `inlined_plan` (immutable) and replace `state` with the new snapshot.
+      const carryForward = {
+        ...job.data,
+        request_id,
+        // If the function returned a next_state snapshot, use it; otherwise
+        // fall back to the existing state (defensive — should always be set).
+        state: result.next_state ?? job.data.state,
+      };
       await orchestratorQueue().add(
         QUEUE_NAMES.AIREWRITE_ORCHESTRATOR,
-        { ...job.data, request_id },
+        carryForward,
         // attempts=1: orchestrator retries cause counter drift. Same lesson
         // as translate / enrich pipelines — stuck tick goes to DLQ for
         // human inspection rather than re-incrementing in_flight counters.
