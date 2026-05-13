@@ -38,17 +38,21 @@ export const env = {
   SENTRY_ENVIRONMENT: optional('SENTRY_ENVIRONMENT', 'production'),
   SENTRY_RELEASE: process.env.SENTRY_RELEASE || undefined,
 
-  // Voice-gen concurrency. Held DELIBERATELY at 3 (lowered from 5 on
-  // 2026-05-10 after incident: 116-segment dub at concurrency=5 saturated
-  // the platform per-app SDK gateway with HTTP 429s — each segment performs
-  // ~8 SDK writes (TranslationSegment update, S3 upload, time-stretch,
-  // fitted update, cost log, etc.), so 5 concurrent = ~40 calls/sec
-  // sustained, exceeding the platform's per-app threshold). Concurrency=3
-  // gives ~24 calls/sec sustained, well within budget. Throughput trade-
-  // off: 116-segment dub goes from ~5min → ~8min — acceptable for an
-  // auditor-defensible posture. Match-up with translation pipeline which
-  // sits at 4 with no incidents. SOC 2 CC7.4 / TPN MS-7.x.
-  CONCURRENCY_VOICE_GEN: intEnv('WORKER_CONCURRENCY_VOICE_GEN', 3),
+  // Voice-gen concurrency. Held DELIBERATELY at 2 (lowered from 3 on
+  // 2026-05-13 after observed regression: 24-segment v3-clone dub at
+  // concurrency=3 still tripped the platform SDK gateway — every segment
+  // got HTTP 403 "auth_required" + HTTP 429 "Rate limit exceeded" mid-
+  // generateOneSegment, marking the whole run failed silently. Prior
+  // history: concurrency=5 saturated on 2026-05-10 (116-seg dub), lowered
+  // to 3; that protects v2/Flash but not v3-clone runs where each segment
+  // does additional SDK writes (audit hash, cue/stability branches,
+  // identity-shift path probes). At 2 we get ~16 platform calls/sec
+  // sustained — well under the per-app threshold even for v3-clone
+  // density profiles. Throughput trade-off: 116-segment dub goes from
+  // ~8min → ~12min — acceptable for an auditor-defensible posture per
+  // SOC 2 CC7.4 / TPN MS-7.x. Bump back to 3 only after the platform
+  // rate limit is raised or the SDK adopts adaptive backoff.
+  CONCURRENCY_VOICE_GEN: intEnv('WORKER_CONCURRENCY_VOICE_GEN', 2),
   // (Legacy CONCURRENCY_TRANSLATE removed 2026-05-09 — batch-translate
   // queue is gone. Translation now uses TRANSLATE_ORCHESTRATOR/CHUNK below.)
   // Legacy single-shot enrich queue. Kept low — it shouldn't be receiving
