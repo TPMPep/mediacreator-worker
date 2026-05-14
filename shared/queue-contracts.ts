@@ -63,6 +63,17 @@ export const QUEUE_NAMES = {
   // produced by ccRunTranscription stays inline (it's already inside a job
   // with its own budget). ISOLATED to the CC Creation module.
   CC_FORMAT_RUN: 'cc-format-run',
+  // v2 proxy-generation pipeline (2026-05-14). Replaces the legacy fire-and-
+  // forget /generate-proxy + proxyGenerationCallback callback dance with
+  // the same synchronous worker pattern HLS ingest uses. Single-shot job:
+  // worker holds Railway connection open for up to 4hr (matches the
+  // ffmpeg ceiling), 15s heartbeat to Redis, then calls proxyGenWorkerStep
+  // to finalize the Project entity. Concurrency held at 1 — ffmpeg is
+  // CPU-bound on the Railway dyno and serializing reduces blast radius.
+  // Retry policy: attempts=2 (expensive job; transient retry costs 5-15min
+  // of Railway compute) with 30s exponential backoff. Deterministic ffmpeg
+  // failures throw UnrecoverableError to skip retry and go straight to DLQ.
+  PROXY_GEN: 'proxy-gen',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -307,6 +318,83 @@ export interface CCFormatRunJobData {
   auth_token?: string;
 }
 
+// ─── v2 proxy-generation payload (2026-05-14) ────────────────────────
+//
+// Single-shot job. Replaces the legacy fire-and-forget /generate-proxy +
+// webhook-callback dance with the same synchronous pattern HLS ingest
+// uses. Pipeline:
+//
+//   Producer (Base44 fn `generateProxy`)
+//     → Validates auth + ownership.
+//     → Resolves StorageProfile + signs the source S3 URL (6h TTL).
+//     → Mints the proxy_video_key + proxy_audio_key in the project namespace.
+//     → Flips Project.proxy_status = 'generating', clears proxy_error.
+//     → Mints a 60-min scoped JWT bound to (user, project, project_id,
+//       'proxyGenWorkerStep').
+//     → Enqueues ONE ProxyGenJobData job to the proxy-gen queue.
+//     → Returns immediately so the editor card shows "Optimizing for editor…"
+//
+//   Worker (src/processors/proxy-gen.ts)
+//     → POSTs to Railway /generate-proxy-sync (synchronous endpoint — Railway
+//       runs ffmpeg, uploads both S3 objects, returns 200 with the keys).
+//     → Connection held open up to 4hr (matches ffmpeg ceiling).
+//     → 15s heartbeat extends BullMQ job lock during the long call.
+//     → On Railway success → POSTs proxyGenWorkerStep with the result so the
+//       Project entity is finalized with proxy_status='ready' + keys.
+//     → On Railway failure → throws → BullMQ retries per queue policy →
+//       after 2 attempts the job lands in the DLQ and proxyGenWorkerStep
+//       is called with action='fail' so the Project shows proxy_status='failed'.
+//
+// SECURITY MODEL — identical to HLS ingest:
+//   • Scoped JWT (60-min TTL) verified by proxyGenWorkerStep on every call.
+//   • Railway api_key forwarded from the producer via job.data so the single
+//     source of truth lives on Base44 (no Railway-key in worker env).
+//   • The signed source URL has its own 6h S3 TTL — even if exfiltrated, the
+//     attacker only gets read access to ONE source media file for ≤6h.
+//
+// AUDIT POSTURE (SOC 2 CC7.2 / TPN MS-7.x):
+//   • Project.proxy_status is the audit row — auditor can answer "what is
+//     the proxy state of project X?" from a single field.
+//   • BullMQ retains failed jobs for 7 days (DEFAULT_JOB_OPTIONS) so the DLQ
+//     panel shows every failed proxy attempt with attemptsMade + failedReason.
+//   • StructuredLog rows are emitted on every state transition (enqueued,
+//     railway_dispatched, completed, failed) — full forensic trail.
+
+export interface ProxyGenJobData {
+  schema_version: number;
+  project_id: string;
+  user_email: string;
+  request_id: string;
+  /** Signed S3 GET URL Railway uses to read the source media. 6h TTL. */
+  source_url: string;
+  /** Project's pinned S3 bucket — Railway writes the two proxy objects here. */
+  bucket: string;
+  /** Project's pinned AWS region. */
+  region: string;
+  /** Output key for the 720p H.264 video proxy. */
+  proxy_video_key: string;
+  /** Output key for the 16 kHz mono FLAC audio proxy. */
+  proxy_audio_key: string;
+  /**
+   * Optional credential prefix for multi-region storage (e.g. 'STORAGE_EU_CENTRAL').
+   * Railway reads {prefix}_ACCESS_KEY_ID / {prefix}_SECRET_ACCESS_KEY when
+   * present; falls back to AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY otherwise.
+   */
+  credential_secret_prefix?: string;
+  /**
+   * Railway api_key forwarded from the producer. Single source of truth lives
+   * on Base44; worker does NOT hold this in env. Mirrors HLS-ingest design.
+   */
+  railway_api_key: string;
+  /**
+   * Railway base URL (no trailing slash, no path). Producer reads this from
+   * a Base44 secret and forwards it so the URL/key pair travels together.
+   */
+  railway_url: string;
+  /** Scoped JWT bound to (user, project, project_id, 'proxyGenWorkerStep'). 60 min TTL. */
+  auth_token?: string;
+}
+
 // ─── v2 adaptation payloads ──────────────────────────────────────────
 //
 // Mirrors the v2 translation pipeline. One AdaptationRun discriminated by
@@ -485,7 +573,8 @@ export type AnyJobData =
   | AIRewriteChunkJobData
   | SrtImportJobData
   | HlsIngestJobData
-  | CCFormatRunJobData;
+  | CCFormatRunJobData
+  | ProxyGenJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
 
@@ -503,4 +592,21 @@ export const ORCHESTRATOR_JOB_OPTIONS = {
   backoff: { type: 'exponential' as const, delay: 10000 },
   removeOnComplete: { age: 3600, count: 500 },
   removeOnFail: { age: 86400 * 7 },
+};
+
+// Proxy-gen: even more conservative than orchestrator. Each retry costs
+// 5-15 min of Railway compute, so we want at most ONE retry before DLQ.
+// Deterministic ffmpeg failures (non-zero exit code, missing source) throw
+// UnrecoverableError in the processor to skip retry entirely.
+//
+// Retry policy auditor framing (SOC 2 CC7.4 — Subprocessor / Vendor Failure
+// Response): bounded retry on transient failures (network blips, Railway
+// pod restarts), immediate DLQ on deterministic failures. Every retry +
+// every DLQ entry is auditable via BullMQ failedReason + the StructuredLog
+// rows the processor emits.
+export const PROXY_GEN_JOB_OPTIONS = {
+  attempts: 2,
+  backoff: { type: 'exponential' as const, delay: 30000 }, // 30s then DLQ
+  removeOnComplete: { age: 3600, count: 200 },
+  removeOnFail: { age: 86400 * 7 },                         // keep failed 7d for DLQ
 };
