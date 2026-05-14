@@ -31,6 +31,7 @@ import { processAIRewriteChunk } from './processors/airewrite-chunk.js';
 import { processSrtImport } from './processors/srt-import.js';
 import { processHlsIngest } from './processors/hls-ingest.js';
 import { processCCFormatRun } from './processors/cc-format-run.js';
+import { processProxyGen } from './processors/proxy-gen.js';
 
 initSentry();
 
@@ -85,6 +86,13 @@ const workers: Worker[] = [
   // CC Creation rules-engine re-apply pipeline (single-shot, ISOLATED to CC).
   new Worker(QUEUE_NAMES.CC_FORMAT_RUN, processCCFormatRun, {
     ...baseOpts, concurrency: env.CONCURRENCY_CC_FORMAT_RUN,
+  }),
+  // v2 proxy-generation pipeline (replaces the legacy fire-and-forget
+  // /generate-proxy + webhook callback architecture). Concurrency held at 1
+  // because ffmpeg pegs the Railway dyno CPU; two simultaneous transcodes
+  // would each take ~2× wall-clock and risk OOM.
+  new Worker(QUEUE_NAMES.PROXY_GEN, processProxyGen, {
+    ...baseOpts, concurrency: env.CONCURRENCY_PROXY_GEN,
   }),
 ];
 
