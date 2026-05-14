@@ -150,6 +150,92 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.url === '/queue-status' && req.method === 'POST') {
+    // ───────────────────────────────────────────────────────────────────
+    // /queue-status — admin diagnostic. Returns BullMQ counts + the most
+    // recent N jobs (with state + failedReason) for any queue. Used by
+    // _diagnoseProxyGeneration and other admin diagnostics to answer:
+    //   • Is the worker subscribed to this queue?
+    //   • Are jobs piling up in 'waiting' (worker not picking up)?
+    //   • Are jobs failing (and with what reason)?
+    //   • Is the BullMQ retention working (failed jobs visible for 7d)?
+    //
+    // Body: { queue: string, limit?: number }
+    // Returns: { counts, recent: [{ id, state, failedReason, ... }] }
+    //
+    // Auth: same shared secret as /enqueue and /job-status.
+    // SOC 2 framing: read-only ops endpoint; no tenant data exposed beyond
+    // what the producer already has on AIRewriteRun/TranslationRun/etc.
+    // ───────────────────────────────────────────────────────────────────
+    if (!env.ENQUEUE_SECRET || req.headers['x-enqueue-secret'] !== env.ENQUEUE_SECRET) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unauthorized' }));
+      return;
+    }
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    let parsed: { queue?: string; limit?: number };
+    try { parsed = JSON.parse(body); } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid JSON' }));
+      return;
+    }
+    const queue = parsed.queue;
+    const limit = Math.min(Math.max(parsed.limit || 10, 1), 50);
+    if (!queue || !Object.values(QUEUE_NAMES).includes(queue as never)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `valid queue required` }));
+      return;
+    }
+    try {
+      const q = getQueue(queue);
+      const counts = await q.getJobCounts('waiting', 'active', 'delayed', 'completed', 'failed', 'paused');
+      // Pull the most recent jobs across the three most diagnostic states.
+      const [waiting, active, failed, completed] = await Promise.all([
+        q.getJobs(['waiting'], 0, limit - 1, false),
+        q.getJobs(['active'], 0, limit - 1, false),
+        q.getJobs(['failed'], 0, limit - 1, false),
+        q.getJobs(['completed'], 0, limit - 1, false),
+      ]);
+      const shape = (j: { id?: string; name?: string; timestamp?: number; processedOn?: number; finishedOn?: number; attemptsMade?: number; failedReason?: string; data?: unknown }) => ({
+        id: j.id,
+        name: j.name,
+        timestamp: j.timestamp,
+        processedOn: j.processedOn,
+        finishedOn: j.finishedOn,
+        attempts_made: j.attemptsMade,
+        failed_reason: (j.failedReason || '').slice(0, 500),
+        // Surface project_id + request_id so the operator can correlate
+        // worker-side state with the Base44 entity tree without dumping
+        // the entire job payload (which contains JWTs).
+        project_id: (j.data as { project_id?: string } | undefined)?.project_id || null,
+        request_id: (j.data as { request_id?: string } | undefined)?.request_id || null,
+      });
+      const workerRow = workers.find(w => w.name === queue);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        queue,
+        worker_subscribed: !!workerRow,
+        worker_running: workerRow ? !workerRow.closing : false,
+        worker_concurrency: workerRow?.opts.concurrency ?? null,
+        counts,
+        recent: {
+          waiting: waiting.map(shape),
+          active: active.map(shape),
+          failed: failed.map(shape),
+          completed: completed.map(shape),
+        },
+      }));
+    } catch (err) {
+      const e = err as Error;
+      captureError(e, { route: '/queue-status', queue });
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
   if (req.url === '/job-status' && req.method === 'POST') {
     // ───────────────────────────────────────────────────────────────────
     // /job-status — orchestrators call this to harvest chunk results.
