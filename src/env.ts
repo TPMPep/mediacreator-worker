@@ -103,6 +103,13 @@ export const env = {
   // cue project. Set to 4 to match other heavy single-shot pipelines and
   // give an 100-concurrent-user load headroom of ~25 runs/min sustained.
   CONCURRENCY_CC_FORMAT_RUN: intEnv('WORKER_CONCURRENCY_CC_FORMAT_RUN', 4),
+  // Proxy-gen (2026-05-14): single-shot ffmpeg transcode jobs. Each job
+  // blocks one worker slot for up to 3.5hr during the Railway call AND
+  // pegs the Railway dyno's CPU at 100% with a hard 720p H.264 encode.
+  // Concurrency held DELIBERATELY at 1 — two simultaneous transcodes on
+  // the same Railway dyno would each take ~2× wall-clock and risk OOM.
+  // Tune up only after Railway is scaled to a multi-replica deployment.
+  CONCURRENCY_PROXY_GEN: intEnv('WORKER_CONCURRENCY_PROXY_GEN', 1),
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
