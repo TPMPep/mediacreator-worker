@@ -30,6 +30,11 @@ export const env = {
   // The platform domain returns HTTP 403 "Backend functions cannot be accessed
   // from the platform domain. Use the app's subdomain instead."
   BASE44_API_BASE: optional('BASE44_API_BASE', 'https://app.base44.app/api/apps'),
+  // Full base URL for Base44 functions (used by processors that call back to
+  // finalize steps, e.g. project-cascade calling projectCascadeWorkerStep).
+  // Derived from BASE44_API_BASE + BASE44_APP_ID if not set explicitly.
+  BASE44_FUNCTION_URL: process.env.BASE44_FUNCTION_URL ||
+    `https://app.base44.app/api/apps/${process.env.BASE44_APP_ID}/functions`,
   // BASE44_SERVICE_TOKEN intentionally removed — we now use scoped per-job JWTs
   // forwarded from the producer via job.data.auth_token. See base44-client.ts
   // and the AUTH MODEL section there for the security rationale.
@@ -110,6 +115,23 @@ export const env = {
   // the same Railway dyno would each take ~2× wall-clock and risk OOM.
   // Tune up only after Railway is scaled to a multi-replica deployment.
   CONCURRENCY_PROXY_GEN: intEnv('WORKER_CONCURRENCY_PROXY_GEN', 1),
+  // Project cascade (2026-05-15): single-shot delete jobs. Each job does
+  // many row-by-row SDK deletes (bounded at 20 in parallel per entity).
+  // Concurrency held at 2 — this keeps SDK rate budget safe while still
+  // allowing admins to bulk-delete multiple projects reasonably quickly.
+  CONCURRENCY_PROJECT_CASCADE: intEnv('WORKER_CONCURRENCY_PROJECT_CASCADE', 2),
+  // Export-project (2026-05-15): user-triggered export jobs. I/O bound
+  // (SDK pagination + S3 upload), not CPU bound. 4 concurrent = comfortable
+  // throughput for the 100-150 user target without saturating the per-app
+  // SDK rate limit. Each job reads up to 2 entity types (segments +
+  // translations) at 2000 rows/page — bounded.
+  CONCURRENCY_EXPORT_PROJECT: intEnv('WORKER_CONCURRENCY_EXPORT_PROJECT', 4),
+  // Backup-snapshot (2026-05-15): admin/scheduled full-DB export. Reads
+  // EVERY entity. Held at 1 — only one backup runs at a time, and the
+  // job's SDK density is the highest of any worker (paginates ~30 entity
+  // types in sequence). Running two simultaneously would saturate the
+  // platform rate limit.
+  CONCURRENCY_BACKUP_SNAPSHOT: intEnv('WORKER_CONCURRENCY_BACKUP_SNAPSHOT', 1),
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
