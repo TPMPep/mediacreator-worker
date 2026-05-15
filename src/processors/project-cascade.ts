@@ -1,303 +1,138 @@
 // =============================================================================
-// project-cascade.ts — BullMQ worker processor for project cascade delete.
+// PROJECT-CASCADE PROCESSOR — Step-loop messenger for project cascade delete.
 // -----------------------------------------------------------------------------
 // AUDITOR FRAMING (SOC 2 CC6.7 / CC7.2 / CC8.1, TPN MS-1.x / MS-4.x):
-//   This processor runs OUTSIDE the 3-min Base44 function timeout, enabling
-//   reliable cascade deletion of projects with thousands of segments. The
-//   worker has its own SDK quota separate from user-facing editor traffic,
-//   eliminating the rate-limit saturation incident observed on 2026-05-14.
+//   This processor has NO Base44 SDK access and NO S3 client. It is a pure
+//   step-loop messenger that calls projectCascadeWorkerStep in a loop until
+//   action='done'. The function does all S3 + entity deletes inside Base44's
+//   3-min function ceiling per tick.
 //
-// Pipeline:
-//   1. Delete S3 objects under dubflow/{project_id}/* + source/proxy keys
-//   2. For each project-scoped entity, paginate + delete rows (batched)
-//   3. Delete the Project row itself
-//   4. Call projectCascadeWorkerStep to finalize (audit log, cleanup)
+// Pattern: identical to hls-ingest.ts. Idempotent — re-running on the same
+// job is safe because the function's phase machine short-circuits when the
+// Project row is already deleted.
 //
-// Job payload (ProjectCascadePayload from queue-contracts.ts):
-//   - project_id, project_name, user_email, request_id
-//   - storage: { bucket, region, credential_secret_prefix, media_key, ... }
-//   - auth_token (scoped JWT for finalizer callback)
-//
-// Retry posture: 2 attempts with 30s exponential backoff. Failures land in
-// DLQ with 7-day retention for forensic review.
+// HEARTBEAT: 15s lock extension. A big cascade with 5000+ rows can take
+// 5-10 minutes across many ticks; heartbeat keeps the BullMQ lock alive.
 // =============================================================================
 
-import { Job } from 'bullmq';
-import { S3Client, ListObjectsV2Command, DeleteObjectsCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
-import { createClient } from '../base44-client';
-import { env } from '../env';
+import type { Job } from 'bullmq';
+import type { ProjectCascadeJobData } from '../../shared/queue-contracts.js';
+import { invokeBase44Function, logEvent } from '../base44-client.js';
 
-// Every entity that holds rows scoped to a single project.
-const PROJECT_SCOPED_ENTITIES = [
-  'TranscriptSegment',
-  'TranslationSegment',
-  'Speaker',
-  'JobRun',
-  'CostLog',
-  'VoiceAssignmentHistory',
-  'ProjectCollaborator',
-  'TranslationRun',
-  'AIRewriteRun',
-  'AdaptationSegment',
-  'AdaptationComment',
-  'AdaptationVersion',
-  'AdaptationExport',
-  'AdaptationRun',
-  'AdaptationGlossaryTerm',
-  'SuperscriptRecord',
-  'SuperscriptAnnotation',
-  'SuperscriptComment',
-  'SuperscriptLink',
-  'SuperscriptGlossaryTerm',
-  'SuperscriptCharacter',
-  'SuperscriptCanonFact',
-  'SuperscriptSceneSynopsis',
-  'SuperscriptExport',
-  'SuperscriptEnrichmentRun',
-  'SuperscriptScriptSpine',
-  'SuperscriptSpineNode',
-  'KNPHarvestRun',
-  'KNPCandidate',
-  'CaptionCue',
-  'CCFormatRun',
-];
+const FUNCTION_CALL_TIMEOUT_MS = 150_000; // 2.5 min per tick (pagination + deletes)
+const HEARTBEAT_MS = 15_000;
+// Phases: queued → deleting_s3 → deleting_entities (×N) → deleting_project → finalize.
+// 32 entities × up to a few ticks each + overhead. 200 is a generous guard.
+const MAX_PHASE_ITERATIONS = 200;
 
-interface ProjectCascadePayload {
-  schema_version: number;
-  project_id: string;
-  project_name: string;
-  user_email: string;
-  request_id: string;
-  storage: {
-    bucket: string;
-    region: string;
-    credential_secret_prefix: string;
-    media_key?: string;
-    me_track_key?: string;
-    proxy_video_key?: string;
-    proxy_audio_key?: string;
-  };
-  auth_token: string;
+interface PhaseStepResponse {
+  action: 'recall_function' | 'done';
+  phase?: string;
+  done?: boolean;
+  result?: unknown;
+  carry?: unknown;
 }
 
-function buildS3(storage: ProjectCascadePayload['storage']): S3Client {
-  const prefix = storage.credential_secret_prefix || '';
-  const accessKeyId = prefix
-    ? process.env[`${prefix}_ACCESS_KEY_ID`]
-    : process.env.AWS_ACCESS_KEY_ID;
-  const secretAccessKey = prefix
-    ? process.env[`${prefix}_SECRET_ACCESS_KEY`]
-    : process.env.AWS_SECRET_ACCESS_KEY;
-
-  if (!accessKeyId || !secretAccessKey) {
-    throw new Error(`Missing S3 credentials for prefix "${prefix}"`);
-  }
-
-  return new S3Client({
-    region: storage.region,
-    credentials: { accessKeyId, secretAccessKey },
-  });
-}
-
-async function deleteS3Prefix(s3: S3Client, bucket: string, prefix: string): Promise<number> {
-  let deleted = 0;
-  let continuationToken: string | undefined;
-
-  while (true) {
-    const list = await s3.send(new ListObjectsV2Command({
-      Bucket: bucket,
-      Prefix: prefix,
-      ContinuationToken: continuationToken,
-    }));
-
-    const contents = list.Contents || [];
-    if (contents.length > 0) {
-      // Delete in batches of 1000 (S3 limit)
-      for (let i = 0; i < contents.length; i += 1000) {
-        const chunk = contents.slice(i, i + 1000);
-        await s3.send(new DeleteObjectsCommand({
-          Bucket: bucket,
-          Delete: { Objects: chunk.map(o => ({ Key: o.Key })) },
-        }));
-        deleted += chunk.length;
-      }
-    }
-
-    if (!list.IsTruncated) break;
-    continuationToken = list.NextContinuationToken;
-  }
-
-  return deleted;
-}
-
-async function deleteSingleKey(s3: S3Client, bucket: string, key: string | undefined): Promise<boolean> {
-  if (!key) return false;
-  try {
-    await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
-    return true;
-  } catch (e) {
-    console.warn(`[project-cascade] Failed to delete S3 key ${bucket}/${key}:`, (e as Error).message);
-    return false;
-  }
-}
-
-// Delete all rows for one entity, paginating + batching.
-// Uses bounded concurrency to avoid SDK rate limits.
-async function deleteEntityRows(
-  base44: ReturnType<typeof createClient>,
-  entityName: string,
-  projectId: string,
-  job: Job,
-): Promise<{ deleted: number; failed: number; skipped: boolean }> {
-  let deleted = 0;
-  let failed = 0;
-  const MAX_PAGES = 200; // 200 * 500 = 100k row safety cap
-
-  for (let page = 0; page < MAX_PAGES; page++) {
-    let rows: { id: string }[];
-    try {
-      rows = await base44.asServiceRole.entities[entityName].filter(
-        { project_id: projectId },
-        null,
-        500,
-        0,
-      );
-    } catch (e) {
-      const msg = (e as Error)?.message || '';
-      if (/not found|unknown entity|does not exist/i.test(msg)) {
-        return { deleted, failed, skipped: true };
-      }
-      throw e;
-    }
-
-    if (!rows || rows.length === 0) break;
-
-    // Delete in parallel batches of 20 to balance speed vs rate limit
-    const BATCH_SIZE = 20;
-    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-      const batch = rows.slice(i, i + BATCH_SIZE);
-      const results = await Promise.allSettled(
-        batch.map(r => base44.asServiceRole.entities[entityName].delete(r.id))
-      );
-
-      for (const r of results) {
-        if (r.status === 'fulfilled') deleted++;
-        else failed++;
-      }
-
-      // Update job progress periodically
-      if (i % 100 === 0) {
-        await job.updateProgress({ entity: entityName, deleted, failed });
-      }
-    }
-
-    if (rows.length < 500) break;
-  }
-
-  return { deleted, failed, skipped: false };
-}
-
-export async function processProjectCascade(job: Job<ProjectCascadePayload>): Promise<void> {
+export async function processProjectCascade(job: Job<ProjectCascadeJobData>) {
+  const t0 = Date.now();
   const { project_id, project_name, user_email, request_id, storage, auth_token } = job.data;
-  const startedAt = Date.now();
 
-  console.log(`[project-cascade] Starting cascade for project ${project_id} (${project_name})`);
-
-  const summary: Record<string, unknown> = {
-    project_id,
-    project_name,
-    request_id,
-    s3_deleted: 0,
-    s3_errors: 0,
-    entities: {} as Record<string, { deleted: number; failed: number; skipped: boolean }>,
-  };
-
-  // Build S3 client for the project's storage profile
-  const s3 = buildS3(storage);
-  const bucket = storage.bucket;
-
-  // ─── 1. Delete S3 prefix ───
-  try {
-    summary.s3_deleted = await deleteS3Prefix(s3, bucket, `dubflow/${project_id}/`);
-    console.log(`[project-cascade] Deleted ${summary.s3_deleted} S3 objects from prefix`);
-  } catch (e) {
-    (summary.s3_errors as number)++;
-    console.error(`[project-cascade] S3 prefix delete failed:`, (e as Error).message);
+  if (!auth_token) {
+    throw new Error('project-cascade: missing auth_token (job from a stale schema — re-enqueue required)');
   }
 
-  // ─── 2. Delete standalone S3 keys (source, proxy, M&E) ───
-  const standaloneKeys = [
-    storage.media_key,
-    storage.me_track_key,
-    storage.proxy_video_key,
-    storage.proxy_audio_key,
-  ].filter(k => k && !k.startsWith(`dubflow/${project_id}/`));
-
-  for (const key of standaloneKeys) {
-    const ok = await deleteSingleKey(s3, bucket, key);
-    if (ok) (summary.s3_deleted as number)++;
-    else (summary.s3_errors as number)++;
-  }
-
-  // ─── 3. Delete all project-scoped entity rows ───
-  const base44 = createClient(auth_token);
-
-  for (const entityName of PROJECT_SCOPED_ENTITIES) {
-    console.log(`[project-cascade] Deleting ${entityName} rows...`);
-    const res = await deleteEntityRows(base44, entityName, project_id, job);
-    (summary.entities as Record<string, unknown>)[entityName] = res;
-
-    if (res.deleted > 0 || res.failed > 0) {
-      console.log(`[project-cascade] ${entityName}: deleted=${res.deleted}, failed=${res.failed}`);
+  // Heartbeat
+  let heartbeatActive = true;
+  const heartbeat = (async () => {
+    while (heartbeatActive) {
+      await new Promise(r => setTimeout(r, HEARTBEAT_MS));
+      if (!heartbeatActive) break;
+      try { await job.extendLock(job.token!, 30_000); } catch { /* lock may have advanced */ }
     }
-  }
+  })();
 
-  // ─── 4. Delete the Project row itself ───
-  let projectDeleted = false;
   try {
-    await base44.asServiceRole.entities.Project.delete(project_id);
-    projectDeleted = true;
-    console.log(`[project-cascade] Project row deleted`);
-  } catch (e) {
-    console.error(`[project-cascade] Failed to delete Project row:`, (e as Error).message);
-    summary.project_delete_error = (e as Error).message;
-  }
+    let carry: unknown = undefined;
+    let lastPhase: string | undefined;
 
-  summary.project_deleted = projectDeleted;
-  summary.duration_ms = Date.now() - startedAt;
-
-  // ─── 5. Call finalizer to write audit log ───
-  const finalizerUrl = env.BASE44_FUNCTION_URL?.replace(/\/$/, '') || '';
-  if (finalizerUrl) {
-    try {
-      const res = await fetch(`${finalizerUrl}/projectCascadeWorkerStep`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${auth_token}`,
+    for (let i = 0; i < MAX_PHASE_ITERATIONS; i++) {
+      const step = await invokeBase44Function<PhaseStepResponse>({
+        fn: 'projectCascadeWorkerStep',
+        authToken: auth_token,
+        payload: {
+          project_id, project_name, user_email, request_id, storage, carry,
         },
-        body: JSON.stringify({
-          project_id,
-          project_name,
-          user_email,
-          request_id,
-          summary,
-          success: projectDeleted && (summary.s3_errors as number) === 0,
-        }),
+        timeoutMs: FUNCTION_CALL_TIMEOUT_MS,
       });
 
-      if (!res.ok) {
-        console.warn(`[project-cascade] Finalizer returned ${res.status}`);
+      lastPhase = step.phase;
+
+      await logEvent({
+        function_name: 'bullmq:project-cascade',
+        event: 'cascade_phase_tick',
+        context: {
+          project_id, project_name, user_email, request_id,
+          attempts: job.attemptsMade + 1,
+          iteration: i,
+          action: step.action,
+          phase: step.phase,
+        },
+      });
+
+      if (step.action === 'done') {
+        await logEvent({
+          function_name: 'bullmq:project-cascade',
+          event: 'cascade_complete',
+          duration_ms: Date.now() - t0,
+          context: {
+            project_id, project_name, user_email, request_id,
+            attempts: job.attemptsMade + 1,
+            iterations: i + 1,
+            phase: step.phase,
+            result: step.result,
+          },
+        });
+        return step.result ?? { ok: true, phase: step.phase };
       }
-    } catch (e) {
-      console.warn(`[project-cascade] Finalizer call failed:`, (e as Error).message);
+
+      if (step.action === 'recall_function') {
+        carry = step.carry;
+        continue;
+      }
+
+      throw new Error(`project-cascade: unknown action: ${String(step.action)}`);
     }
-  }
 
-  // Throw if the project row wasn't deleted — that's the critical path
-  if (!projectDeleted) {
-    throw new Error(`Cascade completed but Project row failed to delete: ${summary.project_delete_error}`);
-  }
+    throw new Error(`project-cascade: phase machine exceeded ${MAX_PHASE_ITERATIONS} iterations (last phase: ${lastPhase ?? 'none'})`);
+  } catch (err) {
+    const e = err as Error;
+    await logEvent({
+      function_name: 'bullmq:project-cascade',
+      level: 'error',
+      event: 'cascade_failed',
+      message: e.message,
+      error_kind: e.name,
+      duration_ms: Date.now() - t0,
+      context: { project_id, project_name, user_email, request_id, attempts: job.attemptsMade + 1 },
+    });
 
-  console.log(`[project-cascade] Cascade complete in ${summary.duration_ms}ms`);
+    try {
+      await invokeBase44Function({
+        fn: 'projectCascadeWorkerStep',
+        authToken: auth_token,
+        payload: {
+          fail: true,
+          project_id, project_name, user_email, request_id,
+          error_message: e.message,
+          duration_ms: Date.now() - t0,
+        },
+        timeoutMs: 30_000,
+      });
+    } catch { /* nothing to do */ }
+
+    throw err;
+  } finally {
+    heartbeatActive = false;
+    await heartbeat.catch(() => {});
+  }
 }
