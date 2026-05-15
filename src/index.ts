@@ -32,6 +32,15 @@ import { processSrtImport } from './processors/srt-import.js';
 import { processHlsIngest } from './processors/hls-ingest.js';
 import { processCCFormatRun } from './processors/cc-format-run.js';
 import { processProxyGen } from './processors/proxy-gen.js';
+import { processProjectCascade } from './processors/project-cascade.js';
+// User-triggered export pipeline (2026-05-15) — unified processor handles
+// all four module kinds (dub / superscript / adaptation / cc) via a kind
+// discriminator on the job payload.
+import { processExportProject } from './processors/export-project.js';
+// Weekly full-DB backup pipeline (2026-05-15). Replaces the synchronous
+// backupAllEntitiesToS3 function once DB growth pushes it past the 3-min
+// function ceiling.
+import { processBackupSnapshot } from './processors/backup-snapshot.js';
 
 initSentry();
 
@@ -93,6 +102,24 @@ const workers: Worker[] = [
   // would each take ~2× wall-clock and risk OOM.
   new Worker(QUEUE_NAMES.PROXY_GEN, processProxyGen, {
     ...baseOpts, concurrency: env.CONCURRENCY_PROXY_GEN,
+  }),
+  // Project cascade-delete pipeline (2026-05-15). Runs outside the 3-min
+  // function ceiling so large projects can be deleted reliably. Concurrency=2
+  // keeps SDK rate budget safe while allowing reasonable throughput.
+  new Worker(QUEUE_NAMES.PROJECT_CASCADE, processProjectCascade, {
+    ...baseOpts, concurrency: env.CONCURRENCY_PROJECT_CASCADE,
+  }),
+  // User-triggered export pipeline (2026-05-15). Unified processor —
+  // job.data.kind selects which entity tree to paginate and which builder
+  // to use. I/O bound (not CPU bound) so concurrency=4 is safe.
+  new Worker(QUEUE_NAMES.EXPORT_PROJECT, processExportProject, {
+    ...baseOpts, concurrency: env.CONCURRENCY_EXPORT_PROJECT,
+  }),
+  // Weekly full-DB backup pipeline (2026-05-15). One backup runs at a time
+  // — concurrency=1 because the job paginates EVERY entity and would
+  // saturate the per-app SDK rate limit if two ran concurrently.
+  new Worker(QUEUE_NAMES.BACKUP_SNAPSHOT, processBackupSnapshot, {
+    ...baseOpts, concurrency: env.CONCURRENCY_BACKUP_SNAPSHOT,
   }),
 ];
 
