@@ -74,6 +74,24 @@ export const QUEUE_NAMES = {
   // of Railway compute) with 30s exponential backoff. Deterministic ffmpeg
   // failures throw UnrecoverableError to skip retry and go straight to DLQ.
   PROXY_GEN: 'proxy-gen',
+  // Project cascade-delete pipeline (2026-05-15). Single-shot job that
+  // deletes all S3 objects + all project-scoped DB rows + the Project row.
+  PROJECT_CASCADE: 'project-cascade',
+  // User-triggered export pipeline (2026-05-15). Single-shot job per export
+  // request. The worker paginates segments/translations/cues, builds the
+  // output content (SRT/VTT/CSV/JSON/TXT), uploads to S3 under
+  // dubflow/exports/<project_id>/<job_id>/<filename>, and calls
+  // exportProjectWorkerStep to finalize the ExportJob entity with the
+  // signed URL. ONE queue serves all four editor modules — the job carries
+  // a `kind` discriminator ('dub' | 'superscript' | 'adaptation' | 'cc').
+  // Concurrency held at 4 — exports are I/O bound (SDK pagination), not
+  // CPU bound, so we can run several in parallel without saturating.
+  EXPORT_PROJECT: 'export-project',
+  // Weekly backup-snapshot pipeline (2026-05-15). Single-shot job. The
+  // worker paginates EVERY entity into a single JSON file under
+  // dubflow/backups/YYYY-MM-DD/full-backup.json, then prunes old backups
+  // to KEEP_LAST_N. Concurrency=1 (only one backup runs at a time).
+  BACKUP_SNAPSHOT: 'backup-snapshot',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -559,6 +577,96 @@ export interface AIRewriteChunkResult {
   request_id: string;
 }
 
+// ─── v1 export-project payload (2026-05-15) ──────────────────────────
+//
+// Single-shot job per export request. Replaces the synchronous exportProject /
+// exportSuperscriptProject / exportAdaptation / ccExportProject functions
+// which all paginate large datasets in-band and would timeout at the 180s
+// function ceiling on 5000+ line projects under concurrent load.
+//
+// Pipeline:
+//   Producer (Base44 fn `enqueueExportProject` and module-specific aliases)
+//     → Validates auth + ownership + format.
+//     → Creates ExportJob (status='queued') for audit + status polling.
+//     → Mints 30-min scoped JWT bound to (user, job_id, 'exportProjectWorkerStep').
+//     → Enqueues ONE ExportJobData job to the export-project queue.
+//
+//   Worker (src/processors/export-project.ts)
+//     → Dispatches by `kind`: paginates all entities for the requested module,
+//       builds the output content (SRT/VTT/CSV/JSON/TXT) entirely in-memory,
+//       uploads to S3 under dubflow/exports/<project_id>/<job_id>/<filename>.
+//     → POSTs exportProjectWorkerStep with the S3 key + size + duration.
+//
+//   Finalizer (Base44 fn `exportProjectWorkerStep`)
+//     → Signs the S3 URL (24h TTL), updates ExportJob with status='completed' +
+//       file_url + file_size_bytes.
+//     → Writes ActivityLog 'export.completed' for the audit trail.
+//
+// SECURITY MODEL — same as project-cascade:
+//   • Scoped JWT (30-min TTL) verified by exportProjectWorkerStep.
+//   • ExportJob.created_by gates who can poll/download.
+//   • Signed URL has 24h TTL — sufficient for the user to download once.
+//
+// AUDIT POSTURE (SOC 2 CC8.1 / TPN MS-4.x — deliverable chain of custody):
+//   • Every export is a tracked entity, not an ephemeral request/response.
+//   • ActivityLog 'export.completed' captures actor + project + format +
+//     target_language + signed URL byte size.
+//   • BullMQ retains failed jobs for 7 days — every failed export is
+//     queryable from the DLQ panel.
+
+export interface ExportJobData {
+  schema_version: number;
+  /** Discriminator — selects which entity tree to paginate + which builders to use. */
+  kind: 'dub' | 'superscript' | 'adaptation' | 'cc';
+  export_job_id: string;
+  project_id: string;
+  user_email: string;
+  request_id: string;
+  /** Output format — interpreted by the module-specific builder. */
+  format: string;
+  /** Target language (when format is per-language: srt/vtt/txt_translation/csv). */
+  target_language_code?: string;
+  /** Where to drop the output in S3. Producer mints the full key. */
+  s3_bucket: string;
+  s3_key: string;
+  s3_region: string;
+  credential_secret_prefix?: string;
+  /** Filename the UI should suggest on download. */
+  suggested_filename: string;
+  /** Optional CC export options (passed through verbatim to ccExporters). */
+  cc_options?: Record<string, unknown>;
+  /** Optional Superscript / Adaptation export options. */
+  module_options?: Record<string, unknown>;
+  /** Scoped JWT bound to (user, export_job_id, 'exportProjectWorkerStep'). 30 min TTL. */
+  auth_token: string;
+}
+
+// ─── v1 backup-snapshot payload (2026-05-15) ─────────────────────────
+//
+// Single-shot job. The worker paginates EVERY entity in ENTITIES into a
+// single JSON file in S3, then calls backupSnapshotWorkerStep to record
+// completion + prune old backups. Replaces the synchronous
+// backupAllEntitiesToS3 which will timeout once the DB exceeds ~75k total
+// rows (currently ~30k — comfortable but trending toward the ceiling).
+
+export interface BackupSnapshotJobData {
+  schema_version: number;
+  /** Date stamp (YYYY-MM-DD) — used to mint the S3 folder. */
+  date_stamp: string;
+  /** Where to drop the backup files. */
+  s3_bucket: string;
+  s3_region: string;
+  /** Entity names to back up. Producer freezes the list at enqueue time so the
+   *  set is reproducible even if the schema changes mid-run. */
+  entity_names: string[];
+  /** How many recent backup folders to keep when pruning. */
+  keep_last_n: number;
+  user_email: string;
+  request_id: string;
+  /** Scoped JWT bound to (user, date_stamp, 'backupSnapshotWorkerStep'). 30 min TTL. */
+  auth_token: string;
+}
+
 // Discriminated union for processors that need to handle multiple shapes.
 export type AnyJobData =
   | VoiceGenJobData
@@ -574,7 +682,10 @@ export type AnyJobData =
   | SrtImportJobData
   | HlsIngestJobData
   | CCFormatRunJobData
-  | ProxyGenJobData;
+  | ProxyGenJobData
+  | ProjectCascadeJobData
+  | ExportJobData
+  | BackupSnapshotJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
 
@@ -610,3 +721,70 @@ export const PROXY_GEN_JOB_OPTIONS = {
   removeOnComplete: { age: 3600, count: 200 },
   removeOnFail: { age: 86400 * 7 },                         // keep failed 7d for DLQ
 };
+
+// Project cascade: same posture as proxy-gen (expensive operation, 1 retry).
+// Each cascade does many row-level SDK deletes, so 2 attempts is sufficient
+// to handle transient network blips while not burning rate budget on a
+// doomed retry.
+export const PROJECT_CASCADE_JOB_OPTIONS = {
+  attempts: 2,
+  backoff: { type: 'exponential' as const, delay: 30000 },
+  removeOnComplete: { age: 3600, count: 100 },
+  removeOnFail: { age: 86400 * 7 },
+};
+
+// Export: short retry budget (2 attempts). Exports are idempotent — re-running
+// the same job produces the same S3 object at the same key, so a retry is
+// cheap and safe. Transient SDK pagination blips DO happen at scale, so we
+// give one bounded retry before DLQ.
+export const EXPORT_JOB_OPTIONS = {
+  attempts: 2,
+  backoff: { type: 'exponential' as const, delay: 10000 },
+  removeOnComplete: { age: 3600, count: 500 },
+  removeOnFail: { age: 86400 * 7 },
+};
+
+// Backup: same as export — idempotent (same date_stamp → same S3 path), so
+// one retry is safe. Backups are weekly, so DLQ retention of 7 days catches
+// a Monday failure before the next attempt the following week.
+export const BACKUP_JOB_OPTIONS = {
+  attempts: 2,
+  backoff: { type: 'exponential' as const, delay: 60000 },
+  removeOnComplete: { age: 86400 * 7, count: 50 },
+  removeOnFail: { age: 86400 * 14 },
+};
+
+// ─── Project cascade payload (2026-05-15) ────────────────────────────
+//
+// Single-shot job. The worker loops through all project-scoped entities,
+// paginating + deleting rows in bounded batches (20 parallel within each
+// entity), then deletes the Project row and calls projectCascadeWorkerStep
+// to write the audit log.
+//
+// SECURITY MODEL:
+//   • Scoped JWT (2h TTL) verified by projectCascadeWorkerStep.
+//   • S3 creds resolved from storage profile prefix in worker env.
+//
+// AUDIT POSTURE (SOC 2 CC6.7 / CC8.1):
+//   • ActivityLog row + StructuredLog rows written by finalizer.
+//   • BullMQ retains failed jobs for 7 days — every failed cascade is
+//     queryable from the Compliance DLQ panel.
+
+export interface ProjectCascadeJobData {
+  schema_version: number;
+  project_id: string;
+  project_name: string;
+  user_email: string;
+  request_id: string;
+  storage: {
+    bucket: string;
+    region: string;
+    credential_secret_prefix: string;
+    media_key?: string;
+    me_track_key?: string;
+    proxy_video_key?: string;
+    proxy_audio_key?: string;
+  };
+  /** Scoped JWT bound to (user, project_id, 'projectCascadeWorkerStep'). 2h TTL. */
+  auth_token: string;
+}
