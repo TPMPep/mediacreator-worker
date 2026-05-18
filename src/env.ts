@@ -58,6 +58,13 @@ export const env = {
   // SOC 2 CC7.4 / TPN MS-7.x. Bump back to 3 only after the platform
   // rate limit is raised or the SDK adopts adaptive backoff.
   CONCURRENCY_VOICE_GEN: intEnv('WORKER_CONCURRENCY_VOICE_GEN', 2),
+  // v2 voice-gen orchestrator concurrency (2026-05-18). The orchestrator
+  // dispatches per-segment jobs in bounded ticks — it does NOT itself call
+  // ElevenLabs or do any TTS work, so this knob is about how many
+  // simultaneous voice-gen RUNS we orchestrate. 4 matches the other
+  // orchestrators (translate, adapt, airewrite) and gives 100-user
+  // concurrent-dub headroom.
+  CONCURRENCY_VOICE_GEN_ORCHESTRATOR: intEnv('WORKER_CONCURRENCY_VOICE_GEN_ORCHESTRATOR', 4),
   // (Legacy CONCURRENCY_TRANSLATE removed 2026-05-09 — batch-translate
   // queue is gone. Translation now uses TRANSLATE_ORCHESTRATOR/CHUNK below.)
   // Legacy single-shot enrich queue. Kept low — it shouldn't be receiving
