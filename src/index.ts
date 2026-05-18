@@ -13,6 +13,10 @@ import { logEvent } from './base44-client.js';
 import { QUEUE_NAMES } from '../shared/queue-contracts.js';
 
 import { processVoiceGen } from './processors/voice-gen.js';
+// v2 voice-gen orchestrator (2026-05-18) — handles the fan-out phase that
+// previously ran synchronously inside runVoiceGeneration. The per-segment
+// voice-gen workers (processVoiceGen above) are unchanged.
+import { processVoiceGenOrchestrator } from './processors/voice-gen-orchestrator.js';
 import { processBatchEnrich } from './processors/batch-enrich.js';
 import { processEnrichOrchestrator } from './processors/enrich-orchestrator.js';
 import { processEnrichChunk } from './processors/enrich-chunk.js';
@@ -51,6 +55,15 @@ const baseOpts: Pick<WorkerOptions, 'connection'> = { connection };
 const workers: Worker[] = [
   new Worker(QUEUE_NAMES.VOICE_GEN, processVoiceGen, {
     ...baseOpts, concurrency: env.CONCURRENCY_VOICE_GEN,
+  }),
+  // v2 voice-gen orchestrator (2026-05-18). One ORCHESTRATOR job per
+  // voice-gen RUN (not per segment); it dispatches the per-segment
+  // voice-gen jobs in bounded ticks. Concurrency=4 mirrors the other
+  // orchestrators (translate, adapt, airewrite) — they're lightweight
+  // (each tick is ~100-150 enqueues + a JobRun.update) so 4 simultaneous
+  // RUNS being orchestrated is comfortable.
+  new Worker(QUEUE_NAMES.VOICE_GEN_ORCHESTRATOR, processVoiceGenOrchestrator, {
+    ...baseOpts, concurrency: env.CONCURRENCY_VOICE_GEN_ORCHESTRATOR,
   }),
   new Worker(QUEUE_NAMES.BATCH_ENRICH, processBatchEnrich, {
     ...baseOpts, concurrency: env.CONCURRENCY_ENRICH,
