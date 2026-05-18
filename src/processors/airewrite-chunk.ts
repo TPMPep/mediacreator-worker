@@ -31,8 +31,8 @@ export async function processAIRewriteChunk(job: Job<AIRewriteChunkJobData>) {
   const t0 = Date.now();
   const {
     project_id, rewrite_run_id, chunk_key, chunk_index,
-    translation_ids, mode, user_email, request_id, auth_token,
-    inlined_run_config,
+    inlined_translations, mode, user_email, request_id, auth_token,
+    provider, project_context, inlined_run_config,
   } = job.data;
 
   if (!auth_token) {
@@ -57,11 +57,18 @@ export async function processAIRewriteChunk(job: Job<AIRewriteChunkJobData>) {
         rewrite_run_id,
         chunk_key,
         chunk_index,
-        translation_ids,
+        // v3 pure-compute contract (incident 2026-05-09): the chunk
+        // function makes ZERO Base44 reads. The producer inlines every
+        // translation row + the run-config block the chunk needs; the
+        // orchestrator forwards them verbatim through this queue. The
+        // legacy `translation_ids` field is intentionally dropped — the
+        // chunk has no way to dereference IDs without a Base44 read.
+        inlined_translations,
         mode,
+        provider,
+        project_context,
+        user_email,
         request_id,
-        // v3 (2026-05-09): forward inlined run config so the chunk
-        // function doesn't have to read AIRewriteRun (read path broken).
         inlined_run_config,
       },
       timeoutMs: CHUNK_TIMEOUT_MS,
@@ -73,7 +80,7 @@ export async function processAIRewriteChunk(job: Job<AIRewriteChunkJobData>) {
       duration_ms: Date.now() - t0,
       context: {
         project_id, rewrite_run_id, chunk_key, chunk_index, mode,
-        line_count: translation_ids.length,
+        line_count: inlined_translations?.length ?? 0,
         attempts: job.attemptsMade + 1,
         request_id, user_email,
       },
@@ -90,7 +97,7 @@ export async function processAIRewriteChunk(job: Job<AIRewriteChunkJobData>) {
       duration_ms: Date.now() - t0,
       context: {
         project_id, rewrite_run_id, chunk_key, chunk_index, mode,
-        line_count: translation_ids.length,
+        line_count: inlined_translations?.length ?? 0,
         attempts: job.attemptsMade + 1,
         request_id, user_email,
       },
