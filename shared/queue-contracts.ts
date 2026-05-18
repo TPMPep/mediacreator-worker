@@ -13,6 +13,17 @@ export const JOB_SCHEMA_VERSION = 2;
 
 export const QUEUE_NAMES = {
   VOICE_GEN: 'voice-gen',
+  // v2 voice-gen producer/orchestrator/tick pipeline (2026-05-18). The
+  // legacy runVoiceGeneration function fanned out 5000+ enqueue calls
+  // synchronously inside the 180s function ceiling — at 100+ user
+  // concurrency this would timeout on long-form content. The new
+  // producer (runVoiceGeneration) creates the JobRun + freezes a
+  // chunk_plan, then enqueues ONE orchestrator job. The orchestrator
+  // ticks bounded batches (~150 voice-gen jobs per 45s tick) and re-
+  // enqueues itself until all segments dispatched. The voice-gen
+  // workers themselves are unchanged — still one job per segment.
+  // Auditor framing (SOC 2 CC7.2): the fan-out is now resumable.
+  VOICE_GEN_ORCHESTRATOR: 'voice-gen-orchestrator',
   // (Legacy BATCH_TRANSLATE queue removed 2026-05-09 — translation now uses
   // the v4 producer/orchestrator/chunk pipeline below. The old runTranslation
   // function and batch-translate.ts processor were deleted.)
@@ -123,6 +134,55 @@ export interface VoiceGenJobData {
    * SOC 2 CC7.2 zombie-JobRun gap. Optional for legacy/direct callers.
    */
   job_run_id?: string;
+}
+
+// ─── v2 voice-gen orchestrator payload (2026-05-18) ──────────────────
+//
+// Producer (Base44 fn `runVoiceGeneration`)
+//   → Validates auth + ownership + concurrent-run guard.
+//   → Resolves all voice/speaker/style context once, freezes a chunk_plan
+//     (each plan entry = a fully-built VoiceGenJobData payload, pinned).
+//   → Creates JobRun with the frozen plan.
+//   → Mints a scoped JWT and enqueues ONE VoiceGenOrchestratorJobData job.
+//
+// Orchestrator (worker → Base44 fn `orchestrateVoiceGenerationRun`)
+//   → Bounded ≤45s per tick. Advances dispatch_cursor by VOICE_GEN_DISPATCH_PER_TICK.
+//   → Mints a NEW per-segment JWT for each voice-gen job (so the 15-min TTL
+//     starts when the segment is actually about to run, not at producer time).
+//   → Re-enqueues itself until all segments dispatched.
+//   → Once dispatch_cursor >= chunk_total, exits (the per-segment
+//     generateOneSegment workers do their own work, frontend polls JobRun
+//     for terminal status; the finalizer or watchdog closes the run).
+//
+// State carried forward across ticks via inlined_plan + state, same pattern
+// as AIRewriteOrchestratorJobData (incident 2026-05-09 read-path workaround).
+
+export interface VoiceGenOrchestratorJobData {
+  schema_version: number;
+  project_id: string;
+  job_run_id: string;
+  user_email: string;
+  request_id: string;
+  /** Scoped JWT bound to (user, project, job_run_id, 'orchestrateVoiceGenerationRun'). 30 min TTL. */
+  auth_token: string;
+  /** Immutable run config — frozen at producer time. */
+  inlined_plan: {
+    target_language: string;
+    /** Each entry is a fully-built voice-gen payload (minus auth_token, which
+     *  the orchestrator mints per-segment on dispatch). */
+    chunk_plan: Array<Omit<VoiceGenJobData, 'schema_version' | 'auth_token' | 'request_id'>>;
+    chunk_total: number;
+    started_at: string;
+  };
+  /** Mutable run state — carried forward each tick. Empty on first tick. */
+  state: {
+    dispatch_cursor: number;
+    /** segment_id (translation_id) → bullmq job_id; bookkeeping for ops/DLQ. */
+    dispatched_jobs: Record<string, string>;
+    enqueue_failed_count: number;
+    enqueue_failed_ids: string[];
+    tick_count: number;
+  };
 }
 
 // Legacy v1 payload — still accepted by the batch-enrich queue.
@@ -688,6 +748,7 @@ export interface BackupSnapshotJobData {
 // Discriminated union for processors that need to handle multiple shapes.
 export type AnyJobData =
   | VoiceGenJobData
+  | VoiceGenOrchestratorJobData
   | BatchEnrichJobData
   | EnrichOrchestratorJobData
   | EnrichChunkJobData
