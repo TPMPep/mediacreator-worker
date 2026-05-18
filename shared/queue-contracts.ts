@@ -530,10 +530,28 @@ export interface AIRewriteChunkJobData {
   /** Stable id for this chunk: `chunk:${index}`. Used for idempotency. */
   chunk_key: string;
   chunk_index: number;
-  /** TranslationSegment IDs to rewrite in this chunk. ≤10 per chunk. */
-  translation_ids: string[];
+  /**
+   * v3 pure-compute contract (incident 2026-05-09): the chunk function makes
+   * ZERO Base44 reads. The producer inlines every translation row the chunk
+   * needs (source_segment_id, current translated_text, segment duration,
+   * speaker label for prompt context). The orchestrator forwards this array
+   * verbatim. The chunk LLM calls operate on this in-memory payload only;
+   * the orchestrator is the SOLE writer for TranslationSegment when it
+   * harvests this chunk's return value.
+   */
+  inlined_translations: Array<{
+    translation_id: string;
+    source_segment_id: string;
+    translated_text: string;
+    segment_duration_sec: number;
+    speaker_label: string;
+  }>;
   /** Mirror of the run's mode for fast dispatch. 'shorten' | 'expand'. */
   mode: 'shorten' | 'expand';
+  /** Provider pinned by the producer at run-start. */
+  provider: 'gemini' | 'chatgpt';
+  /** Free-text project context threaded into the rewrite prompt. */
+  project_context: string;
   user_email: string;
   request_id: string;
   /** Scoped JWT bound to (user, project, chunk_key, 'rewriteChunk'). */
