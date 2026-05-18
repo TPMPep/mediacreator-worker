@@ -103,6 +103,20 @@ export const QUEUE_NAMES = {
   // dubflow/backups/YYYY-MM-DD/full-backup.json, then prunes old backups
   // to KEEP_LAST_N. Concurrency=1 (only one backup runs at a time).
   BACKUP_SNAPSHOT: 'backup-snapshot',
+  // Admin-only load-test harness fan-out pipeline (2026-05-18). Mirrors the
+  // voice-gen / translate / airewrite orchestrator pattern: ONE job per
+  // LoadTestRun, tick-driven, resumable. Each tick calls Base44's
+  // loadTestFanoutWorkerStep with the inlined plan + current state; the
+  // step fires a bounded batch of producer calls (e.g. enqueueTranslation
+  // x≤8) inside its own 30s budget, persists progress to
+  // LoadTestRun.metrics._driver, and returns next_state. The worker
+  // re-enqueues until dispatch_cursor === concurrency_target.
+  //
+  // Architectural purpose: keep the LOAD-TEST HARNESS in a runtime that is
+  // not subject to Base44's per-function HTTP ceiling so measurements of
+  // the Base44 system-under-test (gateway, DB writes, orchestrator) are
+  // not contaminated by harness limitations.
+  LOAD_TEST_FANOUT: 'load-test-fanout',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -745,6 +759,71 @@ export interface BackupSnapshotJobData {
   auth_token: string;
 }
 
+// ─── Load-test-fanout payload (2026-05-18) ───────────────────────────
+//
+// Producer (Base44 fn `runPipelineLoadTest`)
+//   → Validates auth (admin only) + resolves the load-test fixture project.
+//   → Creates LoadTestRun row in 'running' status.
+//   → Mints a scoped JWT bound to (admin_email, fixture_project_id,
+//     load_test_run_id, 'loadTestFanoutWorkerStep'), 60-min TTL.
+//   → Enqueues ONE LoadTestFanoutJobData onto LOAD_TEST_FANOUT.
+//   → Returns { run_id } to the UI.
+//
+// Worker (`processLoadTestFanout`)
+//   → Each tick calls Base44 fn `loadTestFanoutWorkerStep` with the inlined
+//     plan + current state. The step:
+//       • fires up to FANOUT_BATCH_PER_TICK producer calls (e.g.
+//         enqueueTranslation per target language) with the configured stagger
+//         between them — staying within its own 30s function budget
+//       • appends results (child_run_ids, fanout_errors, enqueue_latencies_ms)
+//         to LoadTestRun.metrics._driver via a single update
+//       • returns next_state with the advanced dispatch_cursor OR
+//         { finalized: true } when dispatch_cursor === concurrency_target
+//   → Re-enqueues with a small delay between ticks until finalized.
+//   → Once finalized, exits. finalizeLoadTestRun (scheduled every minute,
+//     plus on-demand from the UI) aggregates metrics from the child runs.
+//
+// State carried forward across ticks via inlined_plan + state, identical
+// pattern to VoiceGenOrchestratorJobData / AIRewriteOrchestratorJobData.
+
+export interface LoadTestFanoutJobData {
+  schema_version: number;
+  /** LoadTestRun.id — the run this fan-out belongs to. */
+  load_test_run_id: string;
+  /** Fixture Project.id pinned at producer time. */
+  fixture_project_id: string;
+  /** Admin email that triggered the run (preserved for attribution + RBAC). */
+  user_email: string;
+  /** Correlation id threaded into every StructuredLog row for this run. */
+  request_id: string;
+  /** Scoped JWT bound to (user_email, fixture_project_id, load_test_run_id,
+   *  'loadTestFanoutWorkerStep'). 60-min TTL — covers the longest expected
+   *  fan-out (N=150 @ 30s stagger = ~75 min, but the harness clamps stagger
+   *  × N to ≤60min via the worker-step). */
+  auth_token: string;
+  /** Immutable plan — frozen at producer time. */
+  inlined_plan: {
+    pipeline: 'translation' | 'voice_gen' | 'adaptation' | 'enrichment';
+    /** Pipeline-specific provider key (e.g. 'gemini' for translation under
+     *  load test — see runPipelineLoadTest for why DeepL is not used). */
+    provider: string;
+    concurrency_target: number;
+    /** Requested stagger between producer calls in ms. */
+    stagger_ms: number;
+    /** Pipeline-specific payload templates. For translation:
+     *    target_languages: string[]  (length === concurrency_target)
+     *  For voice_gen: translation_segment_ids: string[]
+     *  Other pipelines: pipeline-specific keys. */
+    targets: Record<string, unknown>;
+    started_at: string;
+  };
+  /** Mutable state — carried forward each tick. Empty on first tick. */
+  state: {
+    dispatch_cursor: number;
+    tick_count: number;
+  };
+}
+
 // Discriminated union for processors that need to handle multiple shapes.
 export type AnyJobData =
   | VoiceGenJobData
@@ -764,7 +843,8 @@ export type AnyJobData =
   | ProxyGenJobData
   | ProjectCascadeJobData
   | ExportJobData
-  | BackupSnapshotJobData;
+  | BackupSnapshotJobData
+  | LoadTestFanoutJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
 
