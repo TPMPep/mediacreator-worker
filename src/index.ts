@@ -45,6 +45,11 @@ import { processExportProject } from './processors/export-project.js';
 // backupAllEntitiesToS3 function once DB growth pushes it past the 3-min
 // function ceiling.
 import { processBackupSnapshot } from './processors/backup-snapshot.js';
+// Admin-only load-test fan-out (2026-05-18). Off-platform harness that
+// fires N producer calls in tick-bounded batches. Same architecture as the
+// other orchestrators. Producer is Base44 fn `runPipelineLoadTest`; each
+// tick calls back into `loadTestFanoutWorkerStep`.
+import { processLoadTestFanout } from './processors/load-test-fanout.js';
 
 initSentry();
 
@@ -133,6 +138,13 @@ const workers: Worker[] = [
   // saturate the per-app SDK rate limit if two ran concurrently.
   new Worker(QUEUE_NAMES.BACKUP_SNAPSHOT, processBackupSnapshot, {
     ...baseOpts, concurrency: env.CONCURRENCY_BACKUP_SNAPSHOT,
+  }),
+  // Load-test fan-out (2026-05-18). Concurrency=2 — admins may rarely
+  // kick off two load tests back-to-back; one runs while the second
+  // queues. Each fan-out tick is lightweight (one Base44 fn call + state
+  // bookkeeping), so 2 in flight does NOT meaningfully load the worker.
+  new Worker(QUEUE_NAMES.LOAD_TEST_FANOUT, processLoadTestFanout, {
+    ...baseOpts, concurrency: env.CONCURRENCY_LOAD_TEST_FANOUT,
   }),
 ];
 
