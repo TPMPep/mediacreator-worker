@@ -1,20 +1,14 @@
 // =============================================================================
 // TRANSLATE-ORCHESTRATOR PROCESSOR
 // -----------------------------------------------------------------------------
-// Calls back into Base44's `orchestrateTranslationRun`. That function is the
-// brain of the v2 translation pipeline:
+// Calls back into Base44's `orchestrateTranslationRun`. Mirrors
+// adapt-orchestrator exactly — same heartbeat pattern, same retry policy
+// (attempts=1 to avoid counter drift), same forward-the-JWT auth model.
 //
-//   - Reads the TranslationRun checkpoint.
-//   - Advances chunk_cursor by a small batch and dispatches translate-chunk
-//     jobs.
-//   - If more chunks remain, asks the worker to re-enqueue this orchestrator
-//     for the next tick (returned as `next_tick: true`).
-//   - When all chunks dispatched AND chunk_completed >= chunk_total,
-//     finalizes the run and returns `finalized: true`.
-//
-// Mirrors enrich-orchestrator's design exactly — same heartbeat pattern, same
-// auth model (scoped JWT forwarded as X-Worker-JWT), same retry policy
-// (attempts: 1 to avoid counter drift on partial ticks).
+// Per-tick SDK density on the Base44 side: 3 calls. CHUNKS_PER_TICK on the
+// orchestrator side is 2. Combined chunk-worker concurrency is 4. This bounds
+// total platform SDK density at ~6 calls/sec sustained — safely below the
+// platform's per-app rate limit threshold that triggered the May 8 incident.
 // =============================================================================
 
 import type { Job } from 'bullmq';
@@ -33,8 +27,6 @@ function orchestratorQueue(): Queue {
 }
 
 const HEARTBEAT_MS = 15_000;
-// Hard ceiling on a single tick. Base44 fn aims to finish in ≤45s; this is the
-// network-side safety net.
 const TICK_TIMEOUT_MS = 90_000;
 
 interface OrchestratorTickResult {
@@ -96,8 +88,7 @@ export async function processTranslateOrchestrator(job: Job<TranslateOrchestrato
       await orchestratorQueue().add(
         QUEUE_NAMES.TRANSLATE_ORCHESTRATOR,
         { ...job.data, request_id },
-        // attempts=1: orchestrator retries cause counter drift (see
-        // enqueueTranslation for the full rationale — same lesson as Day 1).
+        // attempts=1: orchestrator retries cause counter drift.
         { ...ORCHESTRATOR_JOB_OPTIONS, attempts: 1, delay },
       );
     }
