@@ -139,6 +139,12 @@ export const env = {
   // types in sequence). Running two simultaneously would saturate the
   // platform rate limit.
   CONCURRENCY_BACKUP_SNAPSHOT: intEnv('WORKER_CONCURRENCY_BACKUP_SNAPSHOT', 1),
+  // Load-test fan-out (2026-05-18). Each in-flight fan-out is one job per
+  // LoadTestRun; the actual fan-out work happens via tick-bounded calls
+  // back into Base44, so the worker slot itself is mostly idle while a
+  // tick is in flight. Concurrency=2 covers the rare case of two admin
+  // load tests running back-to-back without queuing them.
+  CONCURRENCY_LOAD_TEST_FANOUT: intEnv('WORKER_CONCURRENCY_LOAD_TEST_FANOUT', 2),
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
