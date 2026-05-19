@@ -53,6 +53,24 @@ import { processLoadTestFanout } from './processors/load-test-fanout.js';
 
 initSentry();
 
+// =============================================================================
+// BUILD FINGERPRINT (2026-05-19) — Surfaces on /health and the
+// worker_started StructuredLog row so we can prove which commit Railway is
+// actually running, without grepping Railway logs. Railway injects
+// RAILWAY_GIT_COMMIT_SHA / RAILWAY_GIT_BRANCH / RAILWAY_DEPLOYMENT_ID into
+// the build environment automatically (no config required). If Railway is
+// not the platform, the fields fall back to 'unknown' but BUILD_TAG still
+// identifies the source-tree version.
+// =============================================================================
+const BUILD_INFO = {
+  build_tag: '2026-05-19-cc-format-run-instrumentation',
+  git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
+  git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
+  deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
+  started_at: new Date().toISOString(),
+} as const;
+console.log('[worker] BUILD_INFO', JSON.stringify(BUILD_INFO));
+
 const connection = getRedis();
 const baseOpts: Pick<WorkerOptions, 'connection'> = { connection };
 
@@ -171,6 +189,7 @@ void logEvent({
   context: {
     queues: workers.map(w => ({ name: w.name, concurrency: w.opts.concurrency })),
     release: env.SENTRY_RELEASE || 'unknown',
+    build_info: BUILD_INFO,
   },
 });
 
@@ -197,6 +216,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ok: true,
+      build_info: BUILD_INFO,
       queues: workers.map(w => ({ name: w.name, concurrency: w.opts.concurrency, running: !w.closing })),
     }));
     return;
