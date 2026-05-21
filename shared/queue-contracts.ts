@@ -117,6 +117,20 @@ export const QUEUE_NAMES = {
   // the Base44 system-under-test (gateway, DB writes, orchestrator) are
   // not contaminated by harness limitations.
   LOAD_TEST_FANOUT: 'load-test-fanout',
+  // Worker-side bulk cleanup for load-test fixtures (B8, 2026-05-21).
+  // ONE job per LoadTestCleanupRun. Each tick calls back into
+  // loadTestCleanupWorkerStep on Base44, which deletes one bounded page
+  // (≤200 rows) of one entity bucket within its 22s budget and returns
+  // next_tick. The worker re-enqueues until current_phase === 'done'.
+  // Hard-pinned to the four __loadtest_* fixture project names; refuses
+  // anything else (enforced in both the producer AND every worker tick).
+  //
+  // Architectural purpose: Base44's 30s function ceiling can't drain a
+  // 5k-row dirty fixture in a single call. This queue inherits the
+  // worker's 1hr job ceiling so cleanup runs to completion regardless
+  // of fixture size — eliminates the 504 timeout failure mode that
+  // motivated B8.
+  LOAD_TEST_CLEANUP: 'load-test-cleanup',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -824,6 +838,51 @@ export interface LoadTestFanoutJobData {
   };
 }
 
+// ─── Load-test-cleanup payload (B8, 2026-05-21) ──────────────────────
+//
+// Producer (Base44 fn `enqueueLoadTestCleanup`)
+//   → Validates admin role + fixture project name against hard allowlist.
+//   → Creates LoadTestCleanupRun row in 'queued' status (or returns the
+//     existing in-flight run if one already exists for this fixture —
+//     idempotent by design).
+//   → Mints a scoped JWT bound to (admin_email, fixture_project_id,
+//     cleanup_run_id, 'loadTestCleanupWorkerStep'), 30-min TTL.
+//   → Enqueues ONE LoadTestCleanupJobData onto LOAD_TEST_CLEANUP.
+//   → Returns { cleanup_run_id, worker_job_id } to the UI.
+//
+// Worker (`processLoadTestCleanup`)
+//   → Each tick calls Base44 fn `loadTestCleanupWorkerStep`. The step:
+//       • Re-verifies the fixture project name against the allowlist
+//         (defense-in-depth — never trust the payload alone).
+//       • Deletes one page (≤200 rows) of the current_phase entity
+//         bucket with 429-aware rate-limited delete helpers.
+//       • Advances the phase machine when a bucket is drained.
+//       • Returns next_tick OR finalized when current_phase === 'done'.
+//   → Re-enqueues with a small delay until finalized.
+//   → attempts=1 by design (same as load-test-fanout): retrying mid-tick
+//     would re-issue deletes already in flight. The step function is
+//     idempotent within its own boundary; we don't double down with
+//     BullMQ retries.
+
+export interface LoadTestCleanupJobData {
+  schema_version: number;
+  /** LoadTestCleanupRun.id — the cleanup pass this job advances. */
+  cleanup_run_id: string;
+  /** Fixture Project.id pinned at producer time. Must be one of the four
+   *  allowlisted __loadtest_* projects; the step re-verifies on every tick. */
+  fixture_project_id: string;
+  /** Denormalized fixture project name for log/UI display. Audit-only. */
+  fixture_project_name: string;
+  /** Admin email that triggered the cleanup (preserved for attribution). */
+  user_email: string;
+  /** Correlation id threaded into every StructuredLog row for this run. */
+  request_id: string;
+  /** Scoped JWT bound to (user_email, fixture_project_id, cleanup_run_id,
+   *  'loadTestCleanupWorkerStep'). 30-min TTL — comfortably covers a 5k-row
+   *  cleanup (~3-8 min wall-clock under typical 429 pressure). */
+  auth_token: string;
+}
+
 // Discriminated union for processors that need to handle multiple shapes.
 export type AnyJobData =
   | VoiceGenJobData
@@ -844,7 +903,8 @@ export type AnyJobData =
   | ProjectCascadeJobData
   | ExportJobData
   | BackupSnapshotJobData
-  | LoadTestFanoutJobData;
+  | LoadTestFanoutJobData
+  | LoadTestCleanupJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
 
