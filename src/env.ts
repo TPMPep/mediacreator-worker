@@ -90,20 +90,19 @@ export const env = {
   // and bump as Gemini quota allows.
   CONCURRENCY_ADAPT_ORCHESTRATOR: intEnv('WORKER_CONCURRENCY_ADAPT_ORCHESTRATOR', 4),
   CONCURRENCY_ADAPT_CHUNK: intEnv('WORKER_CONCURRENCY_ADAPT_CHUNK', 15),
-  // v2 AI-rewrite (bulk shorten/expand) pipeline. Each chunk = up to 10 LLM
-  // calls (one per line, CPS-verified, processed serially inside the chunk)
-  // + 1 TranslationSegment.update per line. Chunk concurrency held
-  // DELIBERATELY at 3 (lowered from 10 on 2026-05-13 after incident: 4
+  // v2 AI-rewrite (bulk shorten/expand) pipeline. Stage 2 scale-up (2026-05-21):
+  // chunk concurrency raised to 5 via Railway env (WORKER_CONCURRENCY_AIREWRITE_CHUNK).
+  // Each chunk = up to 10 LLM calls (one per line, CPS-verified, processed
+  // serially inside the chunk) + 1 TranslationSegment.update per line.
+  // Previous cap was 3 (lowered from 10 on 2026-05-13 after incident: 4
   // concurrent chunks × 10 lines × (LLM + DB write) burst-triggered the
-  // Base44 platform gateway 403 'auth_required' regression — same failure
-  // mode as voice-gen on 2026-05-10 which was resolved by lowering
-  // voice-gen concurrency 5→3). Mirrors voice-gen's posture: same "many
-  // SDK writes per job" profile, same conservative cap. Throughput trade-
-  // off: a 34-line bulk rewrite completes in ~3 sequential chunk batches
-  // instead of 1 (~+30-60s wall-clock) — auditor-defensible posture per
-  // SOC 2 CC7.4 / TPN MS-7.x. Bump only after a clean load-test run.
+  // Base44 platform gateway 403 'auth_required' regression). At concurrency=5
+  // with 4 Railway replicas, effective platform-wide concurrency is 20,
+  // eliminating head-of-line blocking observed at N=10. Rate limiter
+  // (100 jobs / 60s per replica) protects provider load (400/min platform-wide).
+  // SOC 2 CC7.4 — subprocessor protection provable from config alone.
   CONCURRENCY_AIREWRITE_ORCHESTRATOR: intEnv('WORKER_CONCURRENCY_AIREWRITE_ORCHESTRATOR', 4),
-  CONCURRENCY_AIREWRITE_CHUNK: intEnv('WORKER_CONCURRENCY_AIREWRITE_CHUNK', 3),
+  CONCURRENCY_AIREWRITE_CHUNK: intEnv('WORKER_CONCURRENCY_AIREWRITE_CHUNK', 5),
   CONCURRENCY_SRT_IMPORT: intEnv('WORKER_CONCURRENCY_SRT_IMPORT', 2),
   // v2 HLS ingest: single-shot remux jobs. Each job blocks one worker slot
   // for up to 15 min during the Railway call, so this is a hard cap on
