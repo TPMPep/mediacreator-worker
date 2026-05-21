@@ -103,7 +103,15 @@ export const env = {
   // instead of 1 (~+30-60s wall-clock) — auditor-defensible posture per
   // SOC 2 CC7.4 / TPN MS-7.x. Bump only after a clean load-test run.
   CONCURRENCY_AIREWRITE_ORCHESTRATOR: intEnv('WORKER_CONCURRENCY_AIREWRITE_ORCHESTRATOR', 4),
-  CONCURRENCY_AIREWRITE_CHUNK: intEnv('WORKER_CONCURRENCY_AIREWRITE_CHUNK', 3),
+  // Stage 2 scale-up (2026-05-21): default raised 3 → 5. With 4 Railway
+  // replicas, effective platform-wide concurrency = 20 — eliminates the
+  // head-of-line blocking observed at N=10 where children starved each
+  // other for worker slots. Rate-limiter in index.ts (100 jobs / 60s per
+  // replica = 400/min platform-wide) is the provider-side safety belt,
+  // well under Gemini paid (1000 RPM) and OpenAI Tier-4 (30k RPM).
+  // SOC 2 CC7.4 — subprocessor protection provable from config alone.
+  // Revertable in <60s by lowering the env var or restoring the `3` default.
+  CONCURRENCY_AIREWRITE_CHUNK: intEnv('WORKER_CONCURRENCY_AIREWRITE_CHUNK', 5),
   CONCURRENCY_SRT_IMPORT: intEnv('WORKER_CONCURRENCY_SRT_IMPORT', 2),
   // v2 HLS ingest: single-shot remux jobs. Each job blocks one worker slot
   // for up to 15 min during the Railway call, so this is a hard cap on
@@ -145,6 +153,11 @@ export const env = {
   // tick is in flight. Concurrency=2 covers the rare case of two admin
   // load tests running back-to-back without queuing them.
   CONCURRENCY_LOAD_TEST_FANOUT: intEnv('WORKER_CONCURRENCY_LOAD_TEST_FANOUT', 2),
+  // Load-test cleanup (B8, 2026-05-21). Held at 1 — only one cleanup per
+  // fixture at a time, bottleneck is the Base44 per-app write rate limiter
+  // (not parallelism). Bumping this would amplify 429 backoff without
+  // shortening any single run. See processor file header for rationale.
+  CONCURRENCY_LOAD_TEST_CLEANUP: intEnv('WORKER_CONCURRENCY_LOAD_TEST_CLEANUP', 1),
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
