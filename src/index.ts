@@ -130,7 +130,7 @@ const workers: Worker[] = [
   // <60s by removing the `limiter` block or lowering the env var.
   new Worker(QUEUE_NAMES.AIREWRITE_CHUNK, processAIRewriteChunk, {
     ...baseOpts,
-    concurrency: env.CONCURRENCY_AIREWRITE_CHUNK,
+    concurrency: env.WORKER_CONCURRENCY_AIREWRITE_CHUNK,
     limiter: { max: 100, duration: 60_000 },
   }),
   new Worker(QUEUE_NAMES.SRT_IMPORT, processSrtImport, {
