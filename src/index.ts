@@ -50,6 +50,12 @@ import { processBackupSnapshot } from './processors/backup-snapshot.js';
 // other orchestrators. Producer is Base44 fn `runPipelineLoadTest`; each
 // tick calls back into `loadTestFanoutWorkerStep`.
 import { processLoadTestFanout } from './processors/load-test-fanout.js';
+// Worker-side bulk cleanup for load-test fixtures (B8, 2026-05-21).
+// Replaces the in-platform cleanupLoadTestArtifacts function which 504'd
+// on any fixture with >~2k accumulated rows. Producer is Base44 fn
+// `enqueueLoadTestCleanup`; each tick calls back into
+// `loadTestCleanupWorkerStep` to drain one entity bucket page at a time.
+import { processLoadTestCleanup } from './processors/load-test-cleanup.js';
 
 initSentry();
 
@@ -63,7 +69,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-05-21-airewrite-stage2-scaleup-v2',
+  build_tag: '2026-05-21-b8-loadtest-cleanup',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -175,6 +181,15 @@ const workers: Worker[] = [
   // bookkeeping), so 2 in flight does NOT meaningfully load the worker.
   new Worker(QUEUE_NAMES.LOAD_TEST_FANOUT, processLoadTestFanout, {
     ...baseOpts, concurrency: env.CONCURRENCY_LOAD_TEST_FANOUT,
+  }),
+  // Load-test cleanup (B8, 2026-05-21). Concurrency held DELIBERATELY at 1:
+  // only one cleanup runs per fixture at a time (admins rarely have multiple
+  // fixtures dirty simultaneously), and the bottleneck is the Base44
+  // platform's per-app write rate limiter — bumping concurrency higher
+  // would amplify 429 backoff penalties without shortening any single run.
+  // SOC 2 CC7.4 — bounded subprocessor load provable from config alone.
+  new Worker(QUEUE_NAMES.LOAD_TEST_CLEANUP, processLoadTestCleanup, {
+    ...baseOpts, concurrency: env.CONCURRENCY_LOAD_TEST_CLEANUP,
   }),
 ];
 
