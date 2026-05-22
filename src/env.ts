@@ -158,6 +158,11 @@ export const env = {
   // (not parallelism). Bumping this would amplify 429 backoff without
   // shortening any single run. See processor file header for rationale.
   CONCURRENCY_LOAD_TEST_CLEANUP: intEnv('WORKER_CONCURRENCY_LOAD_TEST_CLEANUP', 1),
+  // Load-test reseed (2026-05-22). Held at 1 for the same reason as
+  // cleanup — only one reseed per fixture at a time, bottleneck is the
+  // Base44 per-app write rate limiter. The reseed is just a delete-then-
+  // create variant of cleanup; same rate-limiter wall, same posture.
+  CONCURRENCY_LOAD_TEST_RESEED: intEnv('WORKER_CONCURRENCY_LOAD_TEST_RESEED', 1),
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
