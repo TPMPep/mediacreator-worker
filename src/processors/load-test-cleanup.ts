@@ -66,9 +66,20 @@ function getCleanupQueue(): Queue {
 }
 
 const HEARTBEAT_MS = 15_000;
-// Each cleanup tick targets a 22s budget on the Base44 side; 60s network-
-// side ceiling gives comfortable headroom for the function to return.
-const TICK_TIMEOUT_MS = 60_000;
+// Each cleanup tick targets a 22s budget on the Base44 side. The network-
+// side ceiling MUST exceed that by enough margin to absorb 429 backoff
+// amplification inside deletePage: with concurrency=8, a single page of 200
+// rows can produce up to 8 simultaneous 429-backoff waits (up to ~8s each
+// with jitter, capped by per-row attempt budget of 5). Combined with
+// response serialization, the realistic p99 wall-clock of one tick is
+// ~90-110s under sustained 429 pressure. 120s gives 10-30s safety margin
+// while still keeping a stuck-call from silently consuming a worker slot
+// forever. Observed in production (2026-05-22): the previous 60s ceiling
+// aborted every cleanup tick at the exact 60s mark even though the Base44
+// step would have returned cleanly within ~25s under light load — the
+// abort was platform-side from this AbortController, NOT a Base44 timeout.
+// SOC 2 CC7.4: bound is provable from this constant alone.
+const TICK_TIMEOUT_MS = 120_000;
 // Hard wall-clock cap on a single cleanup run. A 5k-row cleanup completes
 // in ~3-8 min under typical 429 pressure; anything past 1hr is pathological
 // and should fail visibly so an admin notices.
