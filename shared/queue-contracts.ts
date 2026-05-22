@@ -131,6 +131,20 @@ export const QUEUE_NAMES = {
   // of fixture size — eliminates the 504 timeout failure mode that
   // motivated B8.
   LOAD_TEST_CLEANUP: 'load-test-cleanup',
+  // Worker-side deterministic TranslationSegment reseed for load-test
+  // fixtures (2026-05-22). Replaces the in-platform _loadTestSeedTranslations
+  // function which 502'd on any dirty fixture because the synchronous
+  // delete loop saturated the platform write rate limiter inside Base44's
+  // 30s function ceiling. ONE job per LoadTestReseedRun. Each tick calls
+  // back into loadTestReseedWorkerStep on Base44, which advances one
+  // language's wipe + deterministic seed under its own 22s budget and
+  // returns next_tick. The worker re-enqueues until
+  // current_language_index === languages.length. Hard-pinned to the four
+  // __loadtest_* fixture project names; refuses anything else (enforced
+  // in both the producer AND every worker tick). Only mutates
+  // TranslationSegment — never touches Project / TranscriptSegment /
+  // Speaker / TranslationRun / AIRewriteRun rows. SOC 2 CC8.1.
+  LOAD_TEST_RESEED: 'load-test-reseed',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -883,6 +897,31 @@ export interface LoadTestCleanupJobData {
   auth_token: string;
 }
 
+// ─── Load-test-reseed payload (2026-05-22) ───────────────────────────
+//
+// Mirrors LoadTestCleanupJobData exactly. The trust envelope and
+// re-enqueue posture are identical; only the resource type (reseed_run_id)
+// and step function (loadTestReseedWorkerStep) differ.
+
+export interface LoadTestReseedJobData {
+  schema_version: number;
+  /** LoadTestReseedRun.id — the reseed pass this job advances. */
+  reseed_run_id: string;
+  /** Fixture Project.id pinned at producer time. Must be one of the four
+   *  allowlisted __loadtest_* projects; the step re-verifies on every tick. */
+  fixture_project_id: string;
+  /** Denormalized fixture project name for log/UI display. Audit-only. */
+  fixture_project_name: string;
+  /** Admin email that triggered the reseed (preserved for attribution). */
+  user_email: string;
+  /** Correlation id threaded into every StructuredLog row for this run. */
+  request_id: string;
+  /** Scoped JWT bound to (user_email, fixture_project_id, reseed_run_id,
+   *  'loadTestReseedWorkerStep'). 30-min TTL — comfortably covers a 25-language
+   *  × 200-segment reseed (~3-8 min wall-clock under typical 429 pressure). */
+  auth_token: string;
+}
+
 // Discriminated union for processors that need to handle multiple shapes.
 export type AnyJobData =
   | VoiceGenJobData
@@ -904,7 +943,8 @@ export type AnyJobData =
   | ExportJobData
   | BackupSnapshotJobData
   | LoadTestFanoutJobData
-  | LoadTestCleanupJobData;
+  | LoadTestCleanupJobData
+  | LoadTestReseedJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
 
