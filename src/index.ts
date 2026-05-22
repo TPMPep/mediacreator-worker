@@ -56,6 +56,12 @@ import { processLoadTestFanout } from './processors/load-test-fanout.js';
 // `enqueueLoadTestCleanup`; each tick calls back into
 // `loadTestCleanupWorkerStep` to drain one entity bucket page at a time.
 import { processLoadTestCleanup } from './processors/load-test-cleanup.js';
+// Worker-side deterministic TranslationSegment reseed for load-test
+// fixtures (2026-05-22). Replaces the in-platform _loadTestSeedTranslations
+// which 502'd on any fixture with prior translations. Producer is Base44
+// fn `enqueueLoadTestReseed`; each tick calls back into
+// `loadTestReseedWorkerStep` to advance one language's wipe+seed at a time.
+import { processLoadTestReseed } from './processors/load-test-reseed.js';
 
 initSentry();
 
@@ -69,7 +75,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-05-22-airewrite-terminal-promotion-guard',
+  build_tag: '2026-05-22-loadtest-reseed-worker',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -190,6 +196,11 @@ const workers: Worker[] = [
   // SOC 2 CC7.4 — bounded subprocessor load provable from config alone.
   new Worker(QUEUE_NAMES.LOAD_TEST_CLEANUP, processLoadTestCleanup, {
     ...baseOpts, concurrency: env.CONCURRENCY_LOAD_TEST_CLEANUP,
+  }),
+  // Load-test reseed (2026-05-22). Same posture as cleanup — concurrency=1,
+  // bottleneck is the Base44 write rate limiter not parallelism.
+  new Worker(QUEUE_NAMES.LOAD_TEST_RESEED, processLoadTestReseed, {
+    ...baseOpts, concurrency: env.CONCURRENCY_LOAD_TEST_RESEED,
   }),
 ];
 
