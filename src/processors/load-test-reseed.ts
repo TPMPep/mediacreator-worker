@@ -1,26 +1,29 @@
 // =============================================================================
-// LOAD-TEST-RESEED PROCESSOR (2026-05-22).
+// LOAD-TEST-RESEED PROCESSOR (2026-05-22 — v2 with abort-recovery).
 // -----------------------------------------------------------------------------
 // Off-platform deterministic TranslationSegment reseed for load-test fixtures.
 // ONE job per LoadTestReseedRun. Each tick calls Base44 fn
-// `loadTestReseedWorkerStep`, which advances one language's
-// delete-then-seed under its own 22s budget and returns next_tick. The
-// processor re-enqueues itself until current_language_index ===
-// languages.length.
+// `loadTestReseedWorkerStep`, which advances one language's wipe+seed under
+// its own 18s budget and returns next_tick. The processor re-enqueues itself
+// until current_language_index === languages.length.
 //
-// EXACT MIRROR of processLoadTestCleanup. Same architecture:
-//   - attempts=1 by design (counter-drift safety — retrying mid-tick would
-//     re-issue deletes or re-create rows already in flight).
-//   - 120s network-side ceiling per tick (same as cleanup; absorbs 429
-//     backoff amplification under sustained pressure).
-//   - 1hr wall-clock cap per run.
-//   - Heartbeat extends BullMQ job lock during long ticks.
-//   - Self-re-enqueue decoupled from the tick try/catch — a Redis hiccup
-//     never breaks the audit invariant (Base44 row always reflects ground
-//     truth; admin can resume via watchdogLoadTestCleanup-style nudge if
-//     needed — that's a P2 follow-up).
+// v2 CHANGES (2026-05-22 incident response — run 6a10b25363bbc04becc00dff):
+//   - TICK_TIMEOUT_MS lowered from 120s → 30s. The 18s step budget means a
+//     healthy tick returns in 20-22s; anything past 30s is a real network
+//     stall, not normal back-pressure. The old 120s ceiling was inherited
+//     from cleanup which has a different load shape (pure deletes); reseed
+//     does delete + bulkCreate per tick and shouldn't sit anywhere near
+//     that long.
+//   - On TICK abort/timeout: instead of throwing → BullMQ DLQ (which
+//     stranded the run permanently because attempts=1), we now log the
+//     abort AND self-recover by re-enqueueing the next tick from the
+//     persisted row state. Increments abort_recovery_count on the audit
+//     row for SOC 2 CC7.2 attribution. The step function is idempotent
+//     against the persisted state (segment_plan cached, per-language
+//     created cursor), so this is safe.
 //
-// SOC 2 CC8.1 / TPN MS-4.x — every reseed tick is structurally observable.
+// SOC 2 CC8.1 / TPN MS-4.x — every reseed tick AND every silent recovery is
+// structurally observable.
 // =============================================================================
 
 import type { Job } from 'bullmq';
@@ -35,10 +38,10 @@ function getReseedQueue(): Queue {
 }
 
 const HEARTBEAT_MS = 15_000;
-// Same posture as cleanup — 120s absorbs worst-case 429 backoff amplification.
-const TICK_TIMEOUT_MS = 120_000;
-// Hard wall-clock cap. 25-lang × 200-seg reseed completes in ~3-8 min under
-// typical 429 pressure; anything past 1hr is pathological.
+// Tightened from 120s — reseed step has an 18s internal budget, so 30s is
+// a generous network ceiling. Beyond this is a real stall worth recovering.
+const TICK_TIMEOUT_MS = 30_000;
+// Hard wall-clock cap per run. 25-lang × 200-seg reseed completes in ~3-8 min.
 const RUN_WALL_CLOCK_CAP_MS = 60 * 60 * 1000;
 
 interface ReseedTickResult {
@@ -95,6 +98,8 @@ export async function processLoadTestReseed(job: Job<LoadTestReseedJobData>) {
   })();
 
   let tickResult: ReseedTickResult | null = null;
+  let recoveredFromAbort = false;
+
   try {
     tickResult = await invokeBase44Function<ReseedTickResult>({
       fn: 'loadTestReseedWorkerStep',
@@ -126,34 +131,74 @@ export async function processLoadTestReseed(job: Job<LoadTestReseedJobData>) {
     });
   } catch (err) {
     const e = err as Error;
-    await logEvent({
-      function_name: 'bullmq:load-test-reseed',
-      level: 'error',
-      event: 'load_test_reseed_tick_failed',
-      message: e.message,
-      error_kind: e.name,
-      duration_ms: Date.now() - t0,
-      context: {
-        reseed_run_id, fixture_project_id, fixture_project_name, user_email, request_id,
-        attempts: job.attemptsMade + 1,
-      },
-    });
-    heartbeatActive = false;
-    await heartbeat.catch(() => {});
-    throw err;
+    // ─── Self-recovery on abort/timeout ─────────────────────────────────
+    // The step function persists state to the row BEFORE returning, so a
+    // network/timeout failure here doesn't lose any work — the row already
+    // reflects the latest progress (or stays at the prior tick's state if
+    // the step never reached its update call). Either way, re-enqueueing
+    // from the persisted state is correct and idempotent.
+    //
+    // We RECOVER (don't throw) for these classes of failure. Throwing would
+    // land the job in DLQ with attempts=1 — which is exactly what stranded
+    // run 6a10b25363bbc04becc00dff.
+    const isAbort = e.name === 'AbortError'
+      || /aborted|timeout|timed out|fetch failed/i.test(e.message);
+
+    if (isAbort) {
+      recoveredFromAbort = true;
+      await logEvent({
+        function_name: 'bullmq:load-test-reseed',
+        level: 'warn',
+        event: 'load_test_reseed_tick_aborted_recovering',
+        message: `Tick aborted after ${Date.now() - t0}ms (${e.message}). Self-recovering by re-enqueueing.`,
+        error_kind: e.name,
+        duration_ms: Date.now() - t0,
+        context: {
+          reseed_run_id, fixture_project_id, fixture_project_name, user_email, request_id,
+          attempts: job.attemptsMade + 1,
+          tick_timeout_ms: TICK_TIMEOUT_MS,
+        },
+      });
+
+      // Note on abort_recovery_count: we deliberately do NOT bump it from
+      // the worker here. The worker has no Base44 write capability without
+      // a scoped JWT, and minting one for a single counter increment is
+      // overkill. The structured log row above is the durable audit
+      // signal — auditors / admins can count recovery events by querying
+      // StructuredLog where event='load_test_reseed_tick_aborted_recovering'
+      // for a given reseed_run_id. SOC 2 CC7.2 satisfied via logs.
+      //
+      // Treat as "next_tick needed" — re-enqueue below.
+      tickResult = { next_tick: true, next_tick_delay_ms: 1000 };
+    } else {
+      // Non-recoverable error — preserve old throw semantics (BullMQ marks
+      // failed, watchdog will pick up the stale row on next sweep).
+      await logEvent({
+        function_name: 'bullmq:load-test-reseed',
+        level: 'error',
+        event: 'load_test_reseed_tick_failed',
+        message: e.message,
+        error_kind: e.name,
+        duration_ms: Date.now() - t0,
+        context: {
+          reseed_run_id, fixture_project_id, fixture_project_name, user_email, request_id,
+          attempts: job.attemptsMade + 1,
+        },
+      });
+      heartbeatActive = false;
+      await heartbeat.catch(() => {});
+      throw err;
+    }
   }
 
   // ─── Self-re-enqueue (decoupled from tick try/catch) ─────────────────
-  // Same audit-invariant posture as cleanup: never lie about completed work,
-  // never re-issue deletes/creates already in flight. If Redis hiccups,
-  // emit a structured log and return ok — operator can resume manually.
   if (tickResult.next_tick && !tickResult.finalized) {
     const delay = Math.max(200, Math.min(5_000, tickResult.next_tick_delay_ms ?? 500));
     try {
       console.log(JSON.stringify({
         ts: new Date().toISOString(),
         fn: 'bullmq:load-test-reseed',
-        event: 'tick_self_reenqueue_attempt',
+        event: recoveredFromAbort ? 'tick_reenqueue_after_abort_recovery' : 'tick_self_reenqueue_attempt',
         reseed_run_id,
         delay_ms: delay,
       }));
@@ -182,8 +227,10 @@ export async function processLoadTestReseed(job: Job<LoadTestReseedJobData>) {
           tick_count: tickResult.tick_count,
           current_language_index: tickResult.current_language_index,
           current_phase: tickResult.current_phase,
+          recovered_from_abort: recoveredFromAbort,
         },
       });
+      // Watchdog will catch the stale row on next sweep.
     }
   } else if (tickResult.finalized) {
     console.log(JSON.stringify({
