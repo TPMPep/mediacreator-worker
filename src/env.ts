@@ -103,15 +103,20 @@ export const env = {
   // instead of 1 (~+30-60s wall-clock) — auditor-defensible posture per
   // SOC 2 CC7.4 / TPN MS-7.x. Bump only after a clean load-test run.
   CONCURRENCY_AIREWRITE_ORCHESTRATOR: intEnv('WORKER_CONCURRENCY_AIREWRITE_ORCHESTRATOR', 4),
-  // Stage 2 scale-up (2026-05-21): default raised 3 → 5. With 4 Railway
-  // replicas, effective platform-wide concurrency = 20 — eliminates the
-  // head-of-line blocking observed at N=10 where children starved each
-  // other for worker slots. Rate-limiter in index.ts (100 jobs / 60s per
-  // replica = 400/min platform-wide) is the provider-side safety belt,
-  // well under Gemini paid (1000 RPM) and OpenAI Tier-4 (30k RPM).
-  // SOC 2 CC7.4 — subprocessor protection provable from config alone.
-  // Revertable in <60s by lowering the env var or restoring the `3` default.
-  CONCURRENCY_AIREWRITE_CHUNK: intEnv('WORKER_CONCURRENCY_AIREWRITE_CHUNK', 5),
+  // Stage 2 provider-tail tuning (2026-05-24): default lowered 5 → 3. The
+  // 2026-05-21 5/replica × 4 replicas = 20 effective concurrency was the
+  // correct ceiling for orchestrator throughput, but the N=10 smoke run on
+  // 2026-05-24 (LoadTestRun 6a13372f...) showed Gemini Flash tail-latency
+  // exceeded the per-chunk retry budget at that fan-out (367 DLQ landings,
+  // p99 chunk latency 29.8 min). 3/replica × 4 replicas = 12 effective
+  // concurrency reduces the simultaneous provider call burst, which directly
+  // reduces stacked tail-latency without changing chunk size or retry policy.
+  // Combined with the 50s → 90s per-call timeout bump in rewriteChunk and
+  // the 4 → 6 BullMQ chunk attempts bump in orchestrateAIRewriteRun, this
+  // is the three-lever provider-pressure relief for the next N=10 smoke.
+  // SOC 2 CC7.4 — every concurrency knob traces to a real load-test
+  // observation. Revertable in <60s by raising the env var.
+  CONCURRENCY_AIREWRITE_CHUNK: intEnv('WORKER_CONCURRENCY_AIREWRITE_CHUNK', 3),
   CONCURRENCY_SRT_IMPORT: intEnv('WORKER_CONCURRENCY_SRT_IMPORT', 2),
   // v2 HLS ingest: single-shot remux jobs. Each job blocks one worker slot
   // for up to 15 min during the Railway call, so this is a hard cap on
