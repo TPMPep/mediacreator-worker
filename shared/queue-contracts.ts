@@ -176,6 +176,27 @@ export interface VoiceGenJobData {
    * SOC 2 CC7.2 zombie-JobRun gap. Optional for legacy/direct callers.
    */
   job_run_id?: string;
+  /**
+   * Voice Consistency Engine strategy (Phase 3, 2026-05-25).
+   * Optional — when omitted, generateOneSegment defaults to 'NONE' so existing
+   * call sites stay bit-for-bit unchanged. Values: 'NONE' | 'REFERENCE_CONTEXT' |
+   * 'SEED_LOCK' | 'STYLE_MATCH' | 'PROVIDER_NATIVE'.
+   *
+   * 'REFERENCE_CONTEXT' is the only value the editor surfaces today (via the
+   * per-segment "Match surrounding voice" toggle + the project-level default).
+   * The strategy resolver inside generateOneSegment gracefully degrades when
+   * the (provider, model) pair can't satisfy the requested strategy — the
+   * degraded result is recorded on the VoiceGenerationRun audit row.
+   *
+   * Bulk generation deliberately omits this field in Phase 3 (manual-only
+   * scope per the spec); bulk runs continue using the existing default 'NONE'
+   * posture for safety.
+   *
+   * SOC 2 CC8.1 — every requested strategy is provably attributable to the
+   * single job that carried it. The audit row pins both requested AND applied,
+   * so any divergence is forensically resolvable from the row alone.
+   */
+  consistency_strategy?: 'NONE' | 'REFERENCE_CONTEXT' | 'SEED_LOCK' | 'STYLE_MATCH' | 'PROVIDER_NATIVE';
 }
 
 // ─── v2 voice-gen orchestrator payload (2026-05-18) ──────────────────
