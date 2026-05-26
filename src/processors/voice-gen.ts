@@ -16,6 +16,12 @@ export async function processVoiceGen(job: Job<VoiceGenJobData>) {
     performance_prompt, cue_stability,
     user_email, request_id, auth_token,
     job_run_id,
+    // Phase 3 Voice Consistency Engine: optional, additive, never throws.
+    // When omitted the producer didn't request a consistency posture and
+    // generateOneSegment will default to 'NONE' — bit-for-bit identical to
+    // pre-Phase-3 behavior. Set only when the user opted into the per-segment
+    // "Match surrounding voice" toggle (or project default flips it on).
+    consistency_strategy,
   } = job.data;
   try {
     if (!auth_token) {
@@ -49,6 +55,10 @@ export async function processVoiceGen(job: Job<VoiceGenJobData>) {
         // when all segments in the run reach a terminal state. Closes the
         // SOC 2 CC7.2 zombie-JobRun gap.
         job_run_id: job_run_id ?? null,
+        // Phase 3 Voice Consistency Engine. Forwarded verbatim. Undefined
+        // when the producer didn't set it (the common case — manual segment
+        // regen with the toggle OFF, and ALL bulk runs).
+        consistency_strategy: consistency_strategy ?? undefined,
       },
       timeoutMs: 5 * 60 * 1000,
     });
