@@ -135,11 +135,18 @@ export const env = {
   // the same Railway dyno would each take ~2× wall-clock and risk OOM.
   // Tune up only after Railway is scaled to a multi-replica deployment.
   CONCURRENCY_PROXY_GEN: intEnv('WORKER_CONCURRENCY_PROXY_GEN', 1),
-  // Project cascade (2026-05-15): single-shot delete jobs. Each job does
-  // many row-by-row SDK deletes (bounded at 20 in parallel per entity).
-  // Concurrency held at 2 — this keeps SDK rate budget safe while still
-  // allowing admins to bulk-delete multiple projects reasonably quickly.
-  CONCURRENCY_PROJECT_CASCADE: intEnv('WORKER_CONCURRENCY_PROJECT_CASCADE', 2),
+  // Project cascade (lowered 2 → 1 on 2026-05-26 after rate-limit incident).
+  // The worker step now uses the audited rate-aware delete pattern
+  // (_lib_rateAwareDelete.js) which is SERIAL per cascade at the platform's
+  // measured ~2 deletes/sec ceiling. Two concurrent cascades would double
+  // the SDK pressure and re-trigger the 429 storm that killed the previous
+  // implementation (every bulk delete of source-missing projects failed
+  // with "Rate limit exceeded" until DLQ). Single-cascade-at-a-time is
+  // also consistent with LOAD_TEST_CLEANUP and BACKUP_SNAPSHOT — same
+  // "heavy SDK density per job" profile, same posture. Bulk-delete UIs
+  // serialize the enqueue side as belt + suspenders. SOC 2 CC7.4 —
+  // subprocessor pressure bounded by config, provable from this file alone.
+  CONCURRENCY_PROJECT_CASCADE: intEnv('WORKER_CONCURRENCY_PROJECT_CASCADE', 1),
   // Export-project (2026-05-15): user-triggered export jobs. I/O bound
   // (SDK pagination + S3 upload), not CPU bound. 4 concurrent = comfortable
   // throughput for the 100-150 user target without saturating the per-app
