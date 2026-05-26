@@ -24,6 +24,14 @@ const HEARTBEAT_MS = 15_000;
 // Phases: queued → deleting_s3 → deleting_entities (×N) → deleting_project → finalize.
 // 32 entities × up to a few ticks each + overhead. 200 is a generous guard.
 const MAX_PHASE_ITERATIONS = 200;
+// Wall-clock kill switch. If a single cascade job has been running for longer
+// than this, abort and let BullMQ retry. Auditor-grade: prevents a stuck
+// fetch / hung platform call from holding the queue's single worker slot
+// indefinitely (the 2026-05-26 incident — job stuck "active" for 15+ min
+// with no tick logs, blocking every subsequent cascade on the queue).
+// 12 minutes = comfortable headroom for the largest cascade observed
+// (Job Interview _Test: 354s = ~6 min) with 2× safety margin.
+const WALL_CLOCK_KILL_MS = 12 * 60 * 1000;
 
 interface PhaseStepResponse {
   action: 'recall_function' | 'done';
@@ -56,6 +64,20 @@ export async function processProjectCascade(job: Job<ProjectCascadeJobData>) {
     let lastPhase: string | undefined;
 
     for (let i = 0; i < MAX_PHASE_ITERATIONS; i++) {
+      // Wall-clock kill — auditor-defensible safety belt against a stuck
+      // fetch / hung platform call. If we've burned more than
+      // WALL_CLOCK_KILL_MS on this single cascade, throw → BullMQ retry
+      // path → next attempt starts cleanly (pre-flight check inside the
+      // function will short-circuit if the project already got deleted by
+      // another path in the meantime).
+      const elapsedMs = Date.now() - t0;
+      if (elapsedMs > WALL_CLOCK_KILL_MS) {
+        throw new Error(
+          `project-cascade: wall-clock kill at ${elapsedMs}ms ` +
+          `(limit ${WALL_CLOCK_KILL_MS}ms, iteration ${i}, last phase ${lastPhase ?? 'none'})`,
+        );
+      }
+
       const step = await invokeBase44Function<PhaseStepResponse>({
         fn: 'projectCascadeWorkerStep',
         authToken: auth_token,
