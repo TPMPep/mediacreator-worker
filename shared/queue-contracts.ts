@@ -145,6 +145,33 @@ export const QUEUE_NAMES = {
   // TranslationSegment — never touches Project / TranscriptSegment /
   // Speaker / TranslationRun / AIRewriteRun rows. SOC 2 CC8.1.
   LOAD_TEST_RESEED: 'load-test-reseed',
+  // CC Creation cue supersede + engine dispatch pipeline (2026-05-28).
+  // -------------------------------------------------------------------
+  // Replaces the in-band supersede + Railway POST that previously ran
+  // inside ccRunTranscription. On a >800-cue project the synchronous
+  // supersede loop exceeded Base44's 30s function ceiling, leaving
+  // CCFormatRun + JobRun in 'running' forever and the editor overlay
+  // permanently stuck on "Dispatching 0%" (incident 2026-05-28).
+  //
+  // This queue is single-shot per CCFormatRun. The worker step is
+  // resumable — each tick paginates up to ~500 active CaptionCue rows,
+  // flips is_active=true → false via bulkUpdate with 429-aware retries,
+  // updates CCFormatRun.cue_supersede_progress, and returns one of:
+  //   • action='continue' → worker re-enqueues itself for the next page
+  //   • action='dispatch_engine' → all cues superseded; worker calls
+  //     ccDispatchToEngine which POSTs to Railway and pins engine_job_id
+  //   • action='done' → no engine dispatch needed (admin_cleanup /
+  //     speaker_rename) — terminal success
+  //
+  // Concurrency held at 4 — matches CC_FORMAT_RUN and other heavy
+  // single-shot pipelines. Supports 100+ concurrent users initiating
+  // re-transcribe simultaneously (each run takes ~2-10s of supersede
+  // wall-clock + ~5-15s engine dispatch, then hands off to AAI).
+  //
+  // SOC 2 CC8.1 — no caption row is silently destroyed; every superseded
+  // row carries (superseded_by_run_id, superseded_at) joining back to
+  // the CCFormatRun that obsoleted it.
+  CC_CUE_SUPERSEDE: 'cc-cue-supersede',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -943,6 +970,56 @@ export interface LoadTestReseedJobData {
   auth_token: string;
 }
 
+// ─── CC cue supersede payload (2026-05-28) ────────────────────────────
+//
+// Single-shot tick-resumable job. The worker calls ccCueSupersedeWorkerStep
+// on each tick; the step paginates up to ~500 active CaptionCue rows,
+// flips is_active=true → false via bulkUpdate with 429-aware retries,
+// updates CCFormatRun.cue_supersede_progress (cursor + counters), and
+// returns one of three actions:
+//
+//   action='continue'         → more cues remain; worker re-enqueues self
+//   action='dispatch_engine'  → all cues superseded AND this run carries
+//                               needs_engine_dispatch=true (initial_apply
+//                               trigger only); worker invokes
+//                               ccDispatchToEngine then exits
+//   action='done'             → all cues superseded; no engine handoff
+//                               (admin_cleanup / speaker_rename); CCFormatRun
+//                               is already finalized status='completed'
+//                               by the step itself
+//
+// When dispatch_engine fires the worker POSTs to ccDispatchToEngine on
+// Base44 (NOT to Railway directly — single source of truth for the
+// Railway api_key + signed URL lives in Base44). That function does the
+// actual Railway POST, pins engine_job_id on the CCFormatRun + JobRun,
+// flips Project.cc_status='transcribing', and returns. The worker then
+// exits cleanly — the ccPollRailwayJobs scheduled function takes over
+// to drive completion ingest.
+
+export interface CCCueSupersedeJobData {
+  schema_version: number;
+  project_id: string;
+  format_run_id: string;
+  /** JobRun.id paired with this CCFormatRun (only present when this run
+   *  is the initial_apply for a transcription — admin_cleanup and
+   *  speaker_rename runs do not carry a JobRun). The step / dispatch
+   *  function uses this to finalize the JobRun in lockstep with the
+   *  CCFormatRun. */
+  job_run_id?: string;
+  /** True when this run is the initial_apply for a transcription and the
+   *  worker should call ccDispatchToEngine after the supersede phase
+   *  completes. False for admin_cleanup, speaker_rename, and any other
+   *  trigger that wants supersede only. */
+  needs_engine_dispatch: boolean;
+  user_email: string;
+  request_id: string;
+  /** Scoped JWT bound to (user, project, format_run_id, 'ccCueSupersedeWorkerStep').
+   *  30-min TTL — comfortably covers a 1500-cue supersede (~3-8 min
+   *  wall-clock under typical 429 pressure) plus the engine dispatch
+   *  follow-up. */
+  auth_token: string;
+}
+
 // Discriminated union for processors that need to handle multiple shapes.
 export type AnyJobData =
   | VoiceGenJobData
@@ -965,7 +1042,8 @@ export type AnyJobData =
   | BackupSnapshotJobData
   | LoadTestFanoutJobData
   | LoadTestCleanupJobData
-  | LoadTestReseedJobData;
+  | LoadTestReseedJobData
+  | CCCueSupersedeJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
 
