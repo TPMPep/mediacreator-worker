@@ -62,6 +62,13 @@ import { processLoadTestCleanup } from './processors/load-test-cleanup.js';
 // fn `enqueueLoadTestReseed`; each tick calls back into
 // `loadTestReseedWorkerStep` to advance one language's wipe+seed at a time.
 import { processLoadTestReseed } from './processors/load-test-reseed.js';
+// CC Creation cue supersede + engine dispatch (2026-05-28). Moves the
+// heavy bulk-supersede + Railway dispatch out of ccRunTranscription's
+// 30s function ceiling. Producer is Base44 fn `ccRunTranscription`;
+// each tick calls back into `ccCueSupersedeWorkerStep` to flip up to
+// ~500 cues per tick; on completion the worker calls `ccDispatchToEngine`
+// to POST to Railway.
+import { processCCCueSupersede } from './processors/cc-cue-supersede.js';
 
 initSentry();
 
@@ -75,7 +82,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-05-26-project-cascade-wallclock-kill-preflight',
+  build_tag: '2026-05-28-cc-cue-supersede-queue',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -201,6 +208,13 @@ const workers: Worker[] = [
   // bottleneck is the Base44 write rate limiter not parallelism.
   new Worker(QUEUE_NAMES.LOAD_TEST_RESEED, processLoadTestReseed, {
     ...baseOpts, concurrency: env.CONCURRENCY_LOAD_TEST_RESEED,
+  }),
+  // CC cue supersede + engine dispatch (2026-05-28). Concurrency=4 — each
+  // job is mostly idle between ticks (paginated bulkUpdate calls), so 4
+  // simultaneous re-transcribes is comfortable for 100+ concurrent users.
+  // Bottleneck is the per-tick Base44 write budget, not parallelism.
+  new Worker(QUEUE_NAMES.CC_CUE_SUPERSEDE, processCCCueSupersede, {
+    ...baseOpts, concurrency: env.CONCURRENCY_CC_CUE_SUPERSEDE,
   }),
 ];
 
