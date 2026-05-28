@@ -175,6 +175,15 @@ export const env = {
   // Base44 per-app write rate limiter. The reseed is just a delete-then-
   // create variant of cleanup; same rate-limiter wall, same posture.
   CONCURRENCY_LOAD_TEST_RESEED: intEnv('WORKER_CONCURRENCY_LOAD_TEST_RESEED', 1),
+  // CC cue supersede (2026-05-28). Each in-flight job is one tick-resumable
+  // bulk-supersede pass against ONE CCFormatRun. The supersede itself is
+  // fast (bulkUpdate of 500 rows per call), and the engine dispatch tail
+  // is a single HTTP POST — so the worker slot is mostly idle between
+  // ticks. Concurrency=4 matches CC_FORMAT_RUN and gives 100-concurrent-
+  // user re-transcribe headroom. Bottleneck is the per-tick Base44 write
+  // budget, not parallelism — bumping higher would amplify 429 pressure
+  // without shortening any single run.
+  CONCURRENCY_CC_CUE_SUPERSEDE: intEnv('WORKER_CONCURRENCY_CC_CUE_SUPERSEDE', 4),
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
