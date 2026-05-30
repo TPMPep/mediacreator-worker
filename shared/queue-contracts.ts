@@ -9,7 +9,7 @@
 // Changing a payload shape: bump JOB_SCHEMA_VERSION and migrate in-flight jobs.
 // =============================================================================
 
-export const JOB_SCHEMA_VERSION = 2;
+export const JOB_SCHEMA_VERSION = 3;
 
 export const QUEUE_NAMES = {
   VOICE_GEN: 'voice-gen',
