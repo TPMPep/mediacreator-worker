@@ -82,7 +82,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-05-30-cc-raw-baseline-output-versions',
+  build_tag: '2026-06-02-voice-gen-burst-limiter',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -95,8 +95,24 @@ const baseOpts: Pick<WorkerOptions, 'connection'> = { connection };
 
 // ─── Spin up one Worker per queue ────────────────────────────────────
 const workers: Worker[] = [
+  // VOICE_GEN — per-segment ElevenLabs TTS. The `limiter` is the keystone fix
+  // for the 2026-06-02 provider_429 storm: the ElevenLabs concurrency semaphore
+  // in generateOneSegment caps how many calls are IN FLIGHT at once (6), but
+  // NOTHING capped the RATE at which the worker STARTED jobs. At
+  // concurrency=2/replica × 4 replicas the orchestrator's 150-job-per-tick
+  // dispatch let all 8 slots try to start near-simultaneously, hammering
+  // ElevenLabs in a synchronized wave that the provider burst-rate-limited →
+  // 429s → exhausted retries → failed + incomplete segments (the exact reported
+  // symptom). The limiter spreads job STARTS to 6/sec platform-wide, so calls
+  // arrive at ElevenLabs as a steady stream instead of a thundering herd. Same
+  // proven pattern as AIREWRITE_CHUNK (line below). Pairs with the in-function
+  // semaphore (in-flight cap) — start-rate AND concurrency are both now bounded.
+  // SOC 2 CC7.4 — subprocessor burst protection provable from config alone;
+  // revertable in <60s by removing the `limiter` block.
   new Worker(QUEUE_NAMES.VOICE_GEN, processVoiceGen, {
-    ...baseOpts, concurrency: env.CONCURRENCY_VOICE_GEN,
+    ...baseOpts,
+    concurrency: env.CONCURRENCY_VOICE_GEN,
+    limiter: { max: 6, duration: 1000 },
   }),
   // v2 voice-gen orchestrator (2026-05-18). One ORCHESTRATOR job per
   // voice-gen RUN (not per segment); it dispatches the per-segment
