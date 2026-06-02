@@ -1054,6 +1054,27 @@ export const DEFAULT_JOB_OPTIONS = {
   removeOnFail: { age: 86400 * 7 },                        // keep failed 7d
 };
 
+// Voice-gen per-segment jobs (2026-06-02). Deeper + longer than the default
+// because the bottleneck is ElevenLabs' request-BURST limit, which can 429 for
+// minutes at peak (100+ concurrent users). The default 3-attempt / 5s-25s-125s
+// budget can have all 3 BullMQ attempts land inside the SAME sustained burst
+// window and exhaust → the segment fails as provider_429. 5 attempts with a
+// 10s base (10s/40s/160s/...) spreads the retries across a wider window so a
+// transient burst clears between attempts. Combined with (a) the worker's new
+// start-rate limiter, (b) the in-function 6-attempt retry, and (c) the global
+// concurrency semaphore, this is the four-layer provider-pressure relief.
+// generateOneSegment is idempotent per-segment (skips already-ready rows), so
+// a retry of a segment whose prior attempt actually succeeded is a safe no-op.
+// SOC 2 CC7.4 — bounded retry traces to a real provider-pressure observation;
+// every retry + DLQ entry is auditable via BullMQ failedReason. Revertable in
+// <60s by reverting to DEFAULT_JOB_OPTIONS at the enqueue call site.
+export const VOICE_GEN_JOB_OPTIONS = {
+  attempts: 5,
+  backoff: { type: 'exponential' as const, delay: 10000 }, // 10s, 40s, 160s, …
+  removeOnComplete: { age: 3600, count: 1000 },
+  removeOnFail: { age: 86400 * 7 },                          // keep failed 7d for DLQ
+};
+
 // Orchestrator should retry less aggressively — a stuck run needs human eyes,
 // not infinite re-ticks. 2 attempts means 1 retry then DLQ.
 export const ORCHESTRATOR_JOB_OPTIONS = {
