@@ -82,7 +82,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-06-02-airewrite-stale-ceiling-6min',
+  build_tag: '2026-06-02-airewrite-true-ghost-reclaim',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -457,6 +457,20 @@ const server = http.createServer(async (req, res) => {
             state,
             returnvalue: state === 'completed' ? job.returnvalue : undefined,
             failedReason: state === 'failed' ? job.failedReason : undefined,
+            // PROGRESS DISCRIMINATOR (2026-06-02 — wedged-chunk true-ghost fix):
+            // processedOn is set the instant a worker actually PICKS UP the job
+            // and starts the processor. timestamp is when the job was added to
+            // the queue. The orchestrator's stale-reclaim uses these to tell a
+            // genuinely-working `active` job (processedOn set, recent) apart from
+            // a true ghost (`active` but processedOn null — a job that entered
+            // the active set but whose worker died before the processor ran, so
+            // BullMQ's stalled checker can't promote it because no lock exists).
+            // Without this signal the orchestrator aged chunks on dispatch
+            // wall-clock alone and killed LIVE work as `stale_reclaim_exhausted`.
+            // SOC 2 CC7.2 — reclaim acts on real job state, not an inferred timer.
+            processed_on: job.processedOn ?? null,
+            timestamp: job.timestamp ?? null,
+            attempts_made: job.attemptsMade ?? null,
           };
         } catch (e) {
           // Per-id failure shouldn't poison the whole response.
