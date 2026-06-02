@@ -442,7 +442,14 @@ const server = http.createServer(async (req, res) => {
 
     try {
       const q = getQueue(queue);
-      const results: Record<string, { state: string; returnvalue?: unknown; failedReason?: string }> = {};
+      const results: Record<string, {
+        state: string;
+        returnvalue?: unknown;
+        failedReason?: string;
+        processed_on?: number | null;
+        timestamp?: number | null;
+        attempts_made?: number | null;
+      }> = {};
       // Lookups are independent — fan out in parallel.
       await Promise.all(ids.map(async (id) => {
         try {
