@@ -82,7 +82,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-06-02-voice-gen-burst-limiter',
+  build_tag: '2026-06-02-airewrite-wedged-chunk-reclaim',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -163,10 +163,23 @@ const workers: Worker[] = [
   // paid (1000 RPM) and OpenAI Tier-4 (30k RPM) quotas. SOC 2 CC7.4 —
   // subprocessor protection provable from config alone. Revertable in
   // <60s by removing the `limiter` block or lowering the env var.
+  // STALLED-JOB RECLAIM (2026-06-02 — wedged-chunk root-cause fix): a chunk
+  // job stuck in BullMQ state `active` after its worker pod was killed
+  // mid-execution (Railway pod recycle / OOM) is NEVER auto-requeued by
+  // default — BullMQ's stalled-job checker only runs with explicit settings.
+  // Without it, the orchestrator harvest loop sees `active` forever and the
+  // run stalls permanently under a live orchestrator (the exact 70%-forever
+  // symptom). `stalledInterval`+`maxStalledCount` make BullMQ reclaim the
+  // orphaned job and re-run it (rewriteChunk is idempotent — the orchestrator
+  // is the sole writer, so a re-run never double-writes). This is the PRIMARY,
+  // native self-heal; the orchestrator's staleness-reclaim is belt-and-
+  // suspenders. SOC 2 CC7.2 — a dead pod can no longer strand a run forever.
   new Worker(QUEUE_NAMES.AIREWRITE_CHUNK, processAIRewriteChunk, {
     ...baseOpts,
     concurrency: env.CONCURRENCY_AIREWRITE_CHUNK,
     limiter: { max: 100, duration: 60_000 },
+    stalledInterval: 30_000,
+    maxStalledCount: 2,
   }),
   new Worker(QUEUE_NAMES.SRT_IMPORT, processSrtImport, {
     ...baseOpts, concurrency: env.CONCURRENCY_SRT_IMPORT,
