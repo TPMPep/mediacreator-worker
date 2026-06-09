@@ -69,6 +69,13 @@ import { processLoadTestReseed } from './processors/load-test-reseed.js';
 // ~500 cues per tick; on completion the worker calls `ccDispatchToEngine`
 // to POST to Railway.
 import { processCCCueSupersede } from './processors/cc-cue-supersede.js';
+// AI-Dubbing transcript REPLACE pipeline (2026-06-09). Moves the heavy
+// destructive replace (delete old + bulk-create new) out of importTranscript's
+// gateway-timeout window using a stage-then-flip resumable worker step.
+// Producer is Base44 fn `importTranscript` (mode='replace'); each tick calls
+// back into `transcriptImportWorkerStep`. Scoped to AI Dubbing replace only —
+// create/import into an empty project stays synchronous.
+import { processTranscriptImport } from './processors/transcript-import.js';
 
 initSentry();
 
@@ -82,7 +89,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-06-02-airewrite-true-ghost-reclaim',
+  build_tag: '2026-06-09-transcript-import-worker-ready',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -244,6 +251,18 @@ const workers: Worker[] = [
   // Bottleneck is the per-tick Base44 write budget, not parallelism.
   new Worker(QUEUE_NAMES.CC_CUE_SUPERSEDE, processCCCueSupersede, {
     ...baseOpts, concurrency: env.CONCURRENCY_CC_CUE_SUPERSEDE,
+  }),
+  // AI-Dubbing transcript REPLACE (2026-06-09). Each in-flight job is one
+  // tick-resumable stage-then-flip pass against ONE TranscriptImportRun. The
+  // staging phase is bulkCreate-bound (150 rows/tick) and the cutover/finalize
+  // phases are bounded bulkUpdate passes — so the worker slot is mostly idle
+  // between ticks. Concurrency=4 matches CC_CUE_SUPERSEDE and gives 100-
+  // concurrent-user replace headroom. Bottleneck is the per-tick Base44 write
+  // budget, not parallelism — bumping higher would amplify 429 pressure
+  // without shortening any single run. SOC 2 CC7.2 — resumable: a pod death
+  // mid-stage re-creates ZERO already-staged rows (checkpoint tracks it).
+  new Worker(QUEUE_NAMES.TRANSCRIPT_IMPORT, processTranscriptImport, {
+    ...baseOpts, concurrency: env.CONCURRENCY_TRANSCRIPT_IMPORT,
   }),
 ];
 
