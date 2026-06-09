@@ -184,6 +184,15 @@ export const env = {
   // budget, not parallelism — bumping higher would amplify 429 pressure
   // without shortening any single run.
   CONCURRENCY_CC_CUE_SUPERSEDE: intEnv('WORKER_CONCURRENCY_CC_CUE_SUPERSEDE', 4),
+  // AI-Dubbing transcript REPLACE (2026-06-09). Each in-flight job is one
+  // tick-resumable stage-then-flip pass against ONE TranscriptImportRun. The
+  // staging phase is bulkCreate-bound (150 rows/tick), cutover/finalize are
+  // bounded bulkUpdate passes — the worker slot is mostly idle between ticks.
+  // Concurrency=4 matches CC_CUE_SUPERSEDE and gives 100-concurrent-user
+  // replace headroom. Bottleneck is the per-tick Base44 write budget, not
+  // parallelism — bumping higher would amplify 429 pressure without
+  // shortening any single run.
+  CONCURRENCY_TRANSCRIPT_IMPORT: intEnv('WORKER_CONCURRENCY_TRANSCRIPT_IMPORT', 4),
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
