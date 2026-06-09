@@ -89,7 +89,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-06-09-transcript-import-worker-ready',
+  build_tag: '2026-06-09-remove-job-endpoint',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -509,6 +509,81 @@ const server = http.createServer(async (req, res) => {
     } catch (err) {
       const e = err as Error;
       captureError(e, { route: '/job-status', queue });
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  if (req.url === '/remove-job' && req.method === 'POST') {
+    // ───────────────────────────────────────────────────────────────────
+    // /remove-job — admin recovery. Removes ONE explicit job (by id) from a
+    // queue regardless of its state (waiting / completed / failed / delayed).
+    //
+    // This is the missing primitive behind the project-cascade dedup dead-end:
+    // a deterministic jobId (e.g. cascade-<project_id>) sitting in completed/
+    // failed retention blocks every re-enqueue with the same id until BullMQ's
+    // retention GC fires (1h completed / 7d failed). job.remove() clears it
+    // immediately so a fresh enqueue can run.
+    //
+    // Body: { queue: string, job_id: string }
+    // Returns: { ok, queue, job_id, removed: boolean, state_before }
+    //
+    // Auth: same shared secret as /enqueue + /queue-status. Scope/allowlist
+    // enforcement (which job_ids an actor may remove) lives in the Base44
+    // caller (_adminRemoveCascadeJob), which is admin-gated and pattern-
+    // restricted to cascade-<project_id> ids. This endpoint is intentionally
+    // a generic primitive — the policy belongs on the Base44 side where the
+    // user identity + RBAC live. SOC 2 CC6.1 — every removal is attributable
+    // via the calling function's ActivityLog row.
+    // ───────────────────────────────────────────────────────────────────
+    if (!env.ENQUEUE_SECRET || req.headers['x-enqueue-secret'] !== env.ENQUEUE_SECRET) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unauthorized' }));
+      return;
+    }
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    let parsed: { queue?: string; job_id?: string };
+    try { parsed = JSON.parse(body); } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid JSON' }));
+      return;
+    }
+    const { queue, job_id } = parsed;
+    if (!queue || !job_id) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'queue + job_id required' }));
+      return;
+    }
+    if (!Object.values(QUEUE_NAMES).includes(queue as never)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `unknown queue: ${queue}` }));
+      return;
+    }
+    try {
+      const q = getQueue(queue);
+      const job = await q.getJob(job_id);
+      if (!job) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, queue, job_id, removed: false, state_before: 'not_found' }));
+        return;
+      }
+      const state_before = await job.getState();
+      // Never remove a job that is actively executing — that would orphan the
+      // entities mid-delete (same rationale as _adminPurgeStuckCascades leaving
+      // active jobs alone). Caller must wait for it to terminalise.
+      if (state_before === 'active') {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, queue, job_id, removed: false, state_before, error: 'job is active — refusing to remove mid-execution' }));
+        return;
+      }
+      await job.remove();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, queue, job_id, removed: true, state_before }));
+    } catch (err) {
+      const e = err as Error;
+      captureError(e, { route: '/remove-job', queue, job_id });
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: e.message }));
     }
