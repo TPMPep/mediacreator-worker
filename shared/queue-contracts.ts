@@ -662,6 +662,21 @@ export interface AIRewriteOrchestratorJobData {
     completed_chunk_keys: string[];
     chunk_failures: Array<{ chunk_index: number; attempts: number; error: string; record_count?: number }>;
     chunk_jobs: Record<string, string>; // chunk_key -> bullmq_job_id
+    /**
+     * chunk_key -> ISO timestamp the chunk was (re-)dispatched. Powers the
+     * orchestrator's per-chunk staleness reclaim (2026-06-02): a chunk in
+     * flight longer than the hard ceiling is treated as abandoned and
+     * re-dispatched once, then terminalised. Without this, a chunk wedged
+     * in BullMQ `active` (dead pod) strands the run forever under a live
+     * orchestrator. Carried forward each tick. SOC 2 CC7.2.
+     */
+    chunk_dispatch_at?: Record<string, string>;
+    /**
+     * chunk_key -> count of stale-reclaim re-dispatches (cap 1). Bounds the
+     * reclaim so a structurally-broken chunk terminalises rather than
+     * re-dispatching forever. SOC 2 CC7.4.
+     */
+    stale_reclaim_tracker?: Record<string, number>;
     cost_usd: number;
     processed_count: number;
     succeeded_count: number;
