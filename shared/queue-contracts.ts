@@ -172,6 +172,38 @@ export const QUEUE_NAMES = {
   // row carries (superseded_by_run_id, superseded_at) joining back to
   // the CCFormatRun that obsoleted it.
   CC_CUE_SUPERSEDE: 'cc-cue-supersede',
+  // AI-Dubbing transcript REPLACE pipeline (2026-06-09). Scoped EXCLUSIVELY to
+  // mode='replace' — create/import into a brand-new empty project stays
+  // synchronous (no existing transcript to protect, never caused the 504).
+  // -------------------------------------------------------------------
+  // Replaces the in-band destructive replace that previously ran inside
+  // importTranscript. On a 400+ row TTML the synchronous path paginated +
+  // deleted every TranscriptSegment / TranslationSegment / Speaker then
+  // bulk-created the new segments in-band, blowing past the gateway timeout
+  // and stranding the project mid-destruction (incident 2026-06-09).
+  //
+  // STAGE-THEN-FLIP (the explicit "old transcript stays visible until the
+  // replacement is staged" requirement): this queue is single-shot per
+  // TranscriptImportRun and the worker step is tick-resumable. Each tick:
+  //   • Phase 'staging_new': bulk-create up to ~150 NEW TranscriptSegment
+  //     rows as is_active=false (tagged import_run_id) while the OLD rows
+  //     stay is_active=true and fully visible in the editor — there is
+  //     never an empty-transcript window. Resumes from checkpoint.stage_cursor.
+  //   • Phase 'cutover' (once all new rows staged): flip this run's new rows
+  //     is_active=false→true AND supersede the old rows (TranscriptSegment +
+  //     TranslationSegment + Speaker) is_active=true→false, stamping
+  //     superseded_by_run_id + superseded_at. The editor's is_active read
+  //     flips old→new with no observable gap.
+  //   • Phase 'finalizing': update Project workflow/counters, write ActivityLog.
+  //
+  // The worker re-enqueues itself between phases/pages until the step returns
+  // action='done'. watchdogTranscriptImportRuns recovers a stalled run.
+  //
+  // SOC 2 CC7.2 — resumable: a pod death mid-stage re-creates ZERO already-
+  // staged rows (cursor + import_run_id make resume idempotent).
+  // SOC 2 CC8.1 — every superseded transcript/translation row joins back to
+  // the exact TranscriptImportRun that obsoleted it.
+  TRANSCRIPT_IMPORT: 'transcript-import',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -1035,30 +1067,73 @@ export interface CCCueSupersedeJobData {
   auth_token: string;
 }
 
+// ─── Transcript-import (AI-Dubbing REPLACE) payload (2026-06-09) ──────
+//
+// Single-shot tick-resumable job. The worker calls transcriptImportWorkerStep
+// on each tick; the step walks a STAGE-THEN-FLIP phase machine:
+//
+//   phase 'staging_new'  → bulk-create up to ~150 NEW TranscriptSegment rows
+//                          as is_active=false (tagged import_run_id) from the
+//                          frozen parsed-segments snapshot in S3. Resumes from
+//                          checkpoint.stage_cursor. Old rows untouched + visible.
+//                          Returns action='continue' until all staged.
+//   phase 'cutover'      → flip THIS run's staged rows is_active=false→true,
+//                          then supersede the old TranscriptSegment /
+//                          TranslationSegment / Speaker rows (is_active=true→
+//                          false + superseded_by_run_id + superseded_at).
+//   phase 'finalizing'   → update Project (status/workflow/counters), write
+//                          ActivityLog, mark run completed. Returns action='done'.
+//
+// The parsed-segments payload NEVER travels through the BullMQ job body (Redis)
+// — the producer writes it to S3 (parsed_segments_key) and the worker step
+// reads it back. This keeps a 5000-line replace's payload off the queue.
+//
+// SECURITY MODEL — identical to cc-cue-supersede:
+//   • Scoped JWT (30-min TTL) verified by transcriptImportWorkerStep.
+//   • Bound to (user, project, transcript_import_run_id, fn).
+//
+// AUDIT POSTURE (SOC 2 CC7.2 / CC8.1):
+//   • TranscriptImportRun is the audit row; current_phase + checkpoint answer
+//     "how far did this replace get?" from a single row.
+//   • BullMQ retains failed jobs 7d — every failed replace is DLQ-queryable.
+
+export interface TranscriptImportJobData {
+  schema_version: number;
+  project_id: string;
+  transcript_import_run_id: string;
+  user_email: string;
+  request_id: string;
+  /** Scoped JWT bound to (user, project, transcript_import_run_id,
+   *  'transcriptImportWorkerStep'). 30-min TTL — comfortably covers a
+   *  5000-line stage-then-flip (~3-10 min wall-clock under 429 pressure). */
+  auth_token: string;
+}
+
 // Discriminated union for processors that need to handle multiple shapes.
 export type AnyJobData =
-  | VoiceGenJobData
-  | VoiceGenOrchestratorJobData
-  | BatchEnrichJobData
-  | EnrichOrchestratorJobData
-  | EnrichChunkJobData
-  | TranslateOrchestratorJobData
-  | TranslateChunkJobData
-  | AdaptOrchestratorJobData
-  | AdaptChunkJobData
-  | AIRewriteOrchestratorJobData
-  | AIRewriteChunkJobData
-  | SrtImportJobData
-  | HlsIngestJobData
-  | CCFormatRunJobData
-  | ProxyGenJobData
-  | ProjectCascadeJobData
-  | ExportJobData
-  | BackupSnapshotJobData
-  | LoadTestFanoutJobData
-  | LoadTestCleanupJobData
-  | LoadTestReseedJobData
-  | CCCueSupersedeJobData;
+   | VoiceGenJobData
+   | VoiceGenOrchestratorJobData
+   | BatchEnrichJobData
+   | EnrichOrchestratorJobData
+   | EnrichChunkJobData
+   | TranslateOrchestratorJobData
+   | TranslateChunkJobData
+   | AdaptOrchestratorJobData
+   | AdaptChunkJobData
+   | AIRewriteOrchestratorJobData
+   | AIRewriteChunkJobData
+   | SrtImportJobData
+   | HlsIngestJobData
+   | CCFormatRunJobData
+   | ProxyGenJobData
+   | ProjectCascadeJobData
+   | ExportJobData
+   | BackupSnapshotJobData
+   | LoadTestFanoutJobData
+   | LoadTestCleanupJobData
+   | LoadTestReseedJobData
+   | CCCueSupersedeJobData
+   | TranscriptImportJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
 
