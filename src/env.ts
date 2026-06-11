@@ -196,4 +196,47 @@ export const env = {
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
+
+  // ── S3 credentials (default storage profile) ──────────────────────────
+  // Read directly from process.env by the export-project / backup-snapshot
+  // processors via buildWorkerS3 (process.env.AWS_ACCESS_KEY_ID / _SECRET, or
+  // per-profile {PREFIX}_ACCESS_KEY_ID / _SECRET for region-pinned profiles).
+  // We surface the DEFAULT pair here only so assertS3CredsOrWarn (called at
+  // boot from index.ts) can fail LOUDLY when the audio/video + backup paths
+  // would otherwise silently fail every deliverable mid-render after burning
+  // Replicate/Railway compute. Region-pinned profiles use a {PREFIX}_* pair
+  // that we cannot enumerate at boot (the prefix lives on the StorageProfile
+  // row, not in env), so this is a best-effort default-profile check — the
+  // per-job error in buildWorkerS3 remains the authoritative guard for those.
+  AWS_REGION: process.env.AWS_REGION || '',
+  AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID || '',
+  AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY || '',
 };
+
+// ── Boot-time S3 credential assertion ───────────────────────────────────
+// DELIBERATELY a warning, NOT a process.exit: the default-profile S3 creds
+// gate ONLY the export-project + backup-snapshot pipelines. Hard-crashing the
+// worker would also take down translation, voice-gen, CC, adaptation, HLS
+// ingest, etc. — a disproportionate blast radius for a config gap that only
+// affects two pipelines. At 100+ concurrent users across many pipelines,
+// partial availability (everything except S3 deliverables) beats total
+// outage. The loud structured boot log + the per-job "Missing S3 credentials
+// in worker env" error in buildWorkerS3 together make the misconfiguration
+// impossible to miss without holding the other 19 queues hostage.
+// SOC 2 CC7.2 — misconfiguration is observable at deploy time, not only
+// discovered per-deliverable.
+export function assertS3CredsOrWarn(): { ok: boolean; missing: string[] } {
+  const missing: string[] = [];
+  if (!env.AWS_ACCESS_KEY_ID) missing.push('AWS_ACCESS_KEY_ID');
+  if (!env.AWS_SECRET_ACCESS_KEY) missing.push('AWS_SECRET_ACCESS_KEY');
+  if (missing.length > 0) {
+    console.error(
+      `[env] ⚠️  S3 credentials missing (${missing.join(', ')}). ` +
+      `EXPORT_PROJECT (audio/video deliverables) and BACKUP_SNAPSHOT will FAIL ` +
+      `until these are set in the worker environment. All other pipelines run normally.`,
+    );
+    return { ok: false, missing };
+  }
+  console.log('[env] S3 default-profile credentials present.');
+  return { ok: true, missing: [] };
+}
