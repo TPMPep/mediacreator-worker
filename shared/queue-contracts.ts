@@ -831,17 +831,24 @@ export interface AIRewriteChunkResult {
 
 export interface ExportJobData {
   schema_version: number;
-  /** Discriminator — selects which entity tree to paginate + which builders to use. */
-  kind: 'dub' | 'superscript' | 'adaptation' | 'cc';
+  /** Discriminator — selects which entity tree to paginate + which builders to use.
+   *  'audio' is the AI-Dubbing audio/video deliverable path: instead of building
+   *  text bytes from entity data, the worker calls Railway /mix-final directly
+   *  (it has no function ceiling, only a heartbeat-extended BullMQ lock), streams
+   *  the WAV to S3, and calls exportProjectWorkerStep to finalize. This is the
+   *  Path-A move that takes the long /mix-final call off the browser/function
+   *  gateway timeout that produced the infinite export spinner. */
+  kind: 'dub' | 'superscript' | 'adaptation' | 'cc' | 'audio';
   export_job_id: string;
   project_id: string;
   user_email: string;
   request_id: string;
-  /** Output format — interpreted by the module-specific builder. */
+  /** Output format — interpreted by the module-specific builder. For kind='audio' always 'wav'. */
   format: string;
-  /** Target language (when format is per-language: srt/vtt/txt_translation/csv). */
+  /** Target language (when format is per-language: srt/vtt/txt_translation/csv, OR any audio export). */
   target_language_code?: string;
-  /** Where to drop the output in S3. Producer mints the full key. */
+  /** Where to drop the output in S3. Producer mints the full key. For per_speaker
+   *  audio this is the key PREFIX; the worker appends a per-speaker suffix. */
   s3_bucket: string;
   s3_key: string;
   s3_region: string;
@@ -852,6 +859,28 @@ export interface ExportJobData {
   cc_options?: Record<string, unknown>;
   /** Optional Superscript / Adaptation export options. */
   module_options?: Record<string, unknown>;
+  /** [audio kind] Which deliverable to render. 'video_mux' produces a finished
+   *  MP4: source video stream copied verbatim (-c:v copy) with a NEW audio track
+   *  that is the 3-stem mix (dubbed + M&E + optional original dialogue) at the
+   *  operator's fader levels, normalized. The worker renders the audio via
+   *  /mix-final then muxes via /mux-video — one audio code path. */
+  audio_mode?: 'full_mix' | 'per_speaker' | 'video_dub_me' | 'video_mux';
+  /** [audio kind] EBU R128 loudness target (-16 | -23). Null/absent = raw mix.
+   *  Applies only to full_mix / video_dub_me / video_mux; ignored for per_speaker. */
+  loudness_target_lufs?: number | null;
+  /** [audio kind, video_mux mode] The 3-stem mixing-console fader recipe, pinned
+   *  verbatim. Faders control relative BLEND (dB); loudness_target_lufs controls
+   *  absolute delivery loudness. Reproducible from the row alone (SOC 2 CC8.1). */
+  mix_recipe?: {
+    dub_gain_db: number;
+    me_gain_db: number;
+    /** Null/absent = original dialogue NOT mixed in. */
+    original_dialogue_gain_db?: number | null;
+    include_original_dialogue: boolean;
+  } | null;
+  /** [audio kind, video_mux mode] Which video stream to mux onto.
+   *  'original' = full-res source (deliverable). 'proxy' = 720p editor proxy. */
+  source_res?: 'original' | 'proxy';
   /** Scoped JWT bound to (user, export_job_id, 'exportProjectWorkerStep'). 30 min TTL. */
   auth_token: string;
 }
