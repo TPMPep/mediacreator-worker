@@ -6,7 +6,7 @@
 
 import { Worker, type WorkerOptions } from 'bullmq';
 import http from 'node:http';
-import { env } from './env.js';
+import { env, assertS3CredsOrWarn } from './env.js';
 import { getRedis, closeRedis } from './redis.js';
 import { initSentry, captureError, flushSentry } from './sentry.js';
 import { logEvent } from './base44-client.js';
@@ -89,13 +89,19 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-06-11-aws-sdk-deps',
+  build_tag: '2026-06-11-export-render-parity-trim',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
   started_at: new Date().toISOString(),
 } as const;
 console.log('[worker] BUILD_INFO', JSON.stringify(BUILD_INFO));
+
+// Boot-time S3 credential check — warns loudly (does NOT crash) if the
+// default-profile AWS creds are missing, so EXPORT_PROJECT / BACKUP_SNAPSHOT
+// misconfiguration is visible at deploy instead of per-deliverable. Surfaced
+// on the worker_started StructuredLog row below for auditor visibility.
+const s3Creds = assertS3CredsOrWarn();
 
 const connection = getRedis();
 const baseOpts: Pick<WorkerOptions, 'connection'> = { connection };
@@ -290,6 +296,8 @@ void logEvent({
     queues: workers.map(w => ({ name: w.name, concurrency: w.opts.concurrency })),
     release: env.SENTRY_RELEASE || 'unknown',
     build_info: BUILD_INFO,
+    s3_creds_present: s3Creds.ok,
+    s3_creds_missing: s3Creds.missing,
   },
 });
 
@@ -317,6 +325,8 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       build_info: BUILD_INFO,
+      s3_creds_present: s3Creds.ok,
+      s3_creds_missing: s3Creds.missing,
       queues: workers.map(w => ({ name: w.name, concurrency: w.opts.concurrency, running: !w.closing })),
     }));
     return;
