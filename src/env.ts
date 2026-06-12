@@ -193,6 +193,15 @@ export const env = {
   // parallelism — bumping higher would amplify 429 pressure without
   // shortening any single run.
   CONCURRENCY_TRANSCRIPT_IMPORT: intEnv('WORKER_CONCURRENCY_TRANSCRIPT_IMPORT', 4),
+  // GLTV API cascade (Phase 2, 2026-06-12). ISOLATED concurrency lane for the
+  // GLTV Dubbing API cascade — its OWN budget so a 100-job API burst can never
+  // starve human Media Creator editors (translation/voice-gen/CC/etc. keep
+  // their existing lanes untouched). Each in-flight job is one tick-resumable
+  // cascade against ONE DubbingApiJob; between ticks the slot is idle (the step
+  // does one bounded phase transition then the worker re-enqueues). Default 5
+  // — comfortable for 100+ concurrent API customers without amplifying Base44
+  // write pressure. Env-overridable via GLTV_CASCADE_CONCURRENCY.
+  CONCURRENCY_GLTV_CASCADE: intEnv('GLTV_CASCADE_CONCURRENCY', 5),
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
