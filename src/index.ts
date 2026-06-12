@@ -76,6 +76,11 @@ import { processCCCueSupersede } from './processors/cc-cue-supersede.js';
 // back into `transcriptImportWorkerStep`. Scoped to AI Dubbing replace only —
 // create/import into an empty project stays synchronous.
 import { processTranscriptImport } from './processors/transcript-import.js';
+// GLTV API cascade orchestrator (Phase 2, 2026-06-12). FULLY ISOLATED product
+// surface — its own queue + concurrency lane; never shares state with any human
+// Media Creator pipeline. Factory-built because the processor re-enqueues its
+// own next tick and needs a handle to the lazily-initialised queue registry.
+import { makeGltvCascadeProcessor } from './processors/gltv-cascade.js';
 
 initSentry();
 
@@ -89,7 +94,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-06-11-single-source-clip-plan-speedfit-stale-fitted',
+  build_tag: '2026-06-12-gltv-cascade-phase2',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -270,6 +275,15 @@ const workers: Worker[] = [
   new Worker(QUEUE_NAMES.TRANSCRIPT_IMPORT, processTranscriptImport, {
     ...baseOpts, concurrency: env.CONCURRENCY_TRANSCRIPT_IMPORT,
   }),
+  // GLTV API cascade (Phase 2, 2026-06-12). ISOLATED lane — default 5
+  // concurrent cascades (GLTV_CASCADE_CONCURRENCY) so an API burst can never
+  // starve human editors. Each in-flight job is one tick-resumable phase
+  // transition against ONE DubbingApiJob; the processor re-enqueues its own
+  // next tick (10s delay), so the slot is idle between ticks. Built via a
+  // factory so it can re-enqueue through the hoisted getQueue handle.
+  new Worker(QUEUE_NAMES.GLTV_CASCADE, makeGltvCascadeProcessor(getQueue), {
+    ...baseOpts, concurrency: env.CONCURRENCY_GLTV_CASCADE,
+  }),
 ];
 
 for (const w of workers) {
@@ -301,19 +315,7 @@ void logEvent({
   },
 });
 
-// ─── Lazy-init queue handles (only used by /enqueue endpoint) ────────
-import { Queue } from 'bullmq';
 import { DEFAULT_JOB_OPTIONS } from '../shared/queue-contracts.js';
-
-const queueRegistry = new Map<string, Queue>();
-function getQueue(name: string): Queue {
-  let q = queueRegistry.get(name);
-  if (!q) {
-    q = new Queue(name, { connection });
-    queueRegistry.set(name, q);
-  }
-  return q;
-}
 
 // ─── HTTP endpoints for Railway ──────────────────────────────────────
 // /health  — Railway healthcheck.
