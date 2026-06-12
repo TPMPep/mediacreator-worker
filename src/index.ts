@@ -111,6 +111,22 @@ const s3Creds = assertS3CredsOrWarn();
 const connection = getRedis();
 const baseOpts: Pick<WorkerOptions, 'connection'> = { connection };
 
+// ─── Queue handle registry (hoisted) ─────────────────────────────────
+// Declared BEFORE the workers array so the GLTV cascade processor — which
+// re-enqueues its own next tick — can be given a getQueue handle at
+// construction time. Also used by the /enqueue, /queue-status, /job-status,
+// and /remove-job HTTP endpoints below. Lazy-inits one Queue per name.
+import { Queue } from 'bullmq';
+const queueRegistry = new Map<string, Queue>();
+function getQueue(name: string): Queue {
+  let q = queueRegistry.get(name);
+  if (!q) {
+    q = new Queue(name, { connection });
+    queueRegistry.set(name, q);
+  }
+  return q;
+}
+
 // ─── Spin up one Worker per queue ────────────────────────────────────
 const workers: Worker[] = [
   // VOICE_GEN — per-segment ElevenLabs TTS. The `limiter` is the keystone fix
