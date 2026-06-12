@@ -204,6 +204,29 @@ export const QUEUE_NAMES = {
   // SOC 2 CC8.1 — every superseded transcript/translation row joins back to
   // the exact TranscriptImportRun that obsoleted it.
   TRANSCRIPT_IMPORT: 'transcript-import',
+  // GLTV API cascade orchestrator (Phase 2, 2026-06-12). FULLY ISOLATED to the
+  // GLTV API product surface — never shares state, queue, or concurrency lane
+  // with any human Media Creator pipeline. ONE single-shot tick-resumable job
+  // per DubbingApiJob. The worker calls gltvCascadeWorkerStep on each tick; the
+  // step performs exactly ONE idempotent phase transition (start-or-poll keyed
+  // by the job's *_run_id fields) and returns:
+  //   • action='continue'   → more work in this phase; worker re-enqueues self
+  //                            after GLTV_CASCADE_TICK_DELAY_MS (10s)
+  //   • action='advance'    → phase complete, status advanced; re-enqueue next tick
+  //   • action='await_review' → checkpoint-mode parked at awaiting_review;
+  //                            worker exits (gltvApproveDubbingJob re-enqueues)
+  //   • action='done'       → terminal (completed/failed/cancelled); worker exits
+  //
+  // Pattern mirrors cc-cue-supersede exactly (single-shot, tick-resumable,
+  // heartbeat-extended lock, JWT-scoped callback). Concurrency is its OWN lane
+  // (GLTV_CASCADE_CONCURRENCY, default 5) so an API burst can NEVER starve human
+  // editors. Gated off until the gltv_cascade_enabled FeatureFlag is on.
+  //
+  // SOC 2 CC7.2 — resumable: a pod death mid-phase re-reads DubbingApiJob.status
+  // + *_run_id and resumes the exact phase (no double-start). CC8.1 — every
+  // phase transition appends to DubbingApiJob.phase_history with timestamps +
+  // the underlying run id.
+  GLTV_CASCADE: 'gltv-cascade',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -1138,6 +1161,36 @@ export interface TranscriptImportJobData {
   auth_token: string;
 }
 
+// ─── GLTV cascade payload (Phase 2, 2026-06-12) ──────────────────────
+//
+// Single-shot tick-resumable job. The worker calls gltvCascadeWorkerStep on
+// each tick; the step advances ONE phase transition and returns an action.
+// The parsed pipeline config is NEVER in this payload — the step reads the
+// FROZEN recipe_snapshot off DubbingApiJob (the reproducibility anchor), so
+// the cascade is recipe-snapshot-driven, never live-recipe-driven.
+//
+// SECURITY MODEL — identical to cc-cue-supersede:
+//   • Scoped JWT (60-min TTL) bound to (system, dubbing_api_job_id,
+//     'gltvCascadeWorkerStep'). Worker forwards verbatim as X-Worker-JWT.
+//
+// AUDIT POSTURE (SOC 2 CC7.2 / CC8.1):
+//   • DubbingApiJob is the audit row; status + phase_history + *_run_id answer
+//     "what phase, under which run, with what cost?" from a single row.
+//   • BullMQ retains failed jobs 7d — every failed cascade is DLQ-queryable.
+export interface GltvCascadeJobData {
+  schema_version: number;
+  /** DubbingApiJob.id — the API job this cascade advances. */
+  dubbing_api_job_id: string;
+  /** Internal Project.id spawned for this job (tagged gltv_api). */
+  project_id: string;
+  /** Correlation id threaded into every StructuredLog row for this cascade. */
+  request_id: string;
+  /** Scoped JWT bound to (system, dubbing_api_job_id, 'gltvCascadeWorkerStep').
+   *  60-min TTL — a single phase tick is short, but the cascade re-enqueues
+   *  across many ticks; the producer mints a fresh JWT each (re-)enqueue. */
+  auth_token: string;
+}
+
 // Discriminated union for processors that need to handle multiple shapes.
 export type AnyJobData =
    | VoiceGenJobData
@@ -1162,7 +1215,8 @@ export type AnyJobData =
    | LoadTestCleanupJobData
    | LoadTestReseedJobData
    | CCCueSupersedeJobData
-   | TranscriptImportJobData;
+   | TranscriptImportJobData
+   | GltvCascadeJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
 
@@ -1250,6 +1304,21 @@ export const BACKUP_JOB_OPTIONS = {
   backoff: { type: 'exponential' as const, delay: 60000 },
   removeOnComplete: { age: 86400 * 7, count: 50 },
   removeOnFail: { age: 86400 * 14 },
+};
+
+// GLTV cascade (Phase 2, 2026-06-12). Conservative — like the orchestrators,
+// a wedged cascade needs human eyes, not infinite re-ticks. attempts=2 means
+// one retry then DLQ. The cascade re-enqueues ITSELF for each tick (the step
+// returns action='continue'/'advance'), so a single job's attempt budget only
+// covers a hard failure of ONE tick, not the whole pipeline. Idempotent by
+// design (start-or-poll keyed by *_run_id) so a retried tick is a safe no-op.
+// SOC 2 CC7.4 — bounded retry; every DLQ entry is auditable via BullMQ
+// failedReason + the DubbingApiJob.phase_history row.
+export const GLTV_CASCADE_JOB_OPTIONS = {
+  attempts: 2,
+  backoff: { type: 'exponential' as const, delay: 10000 },
+  removeOnComplete: { age: 3600, count: 500 },
+  removeOnFail: { age: 86400 * 7 },
 };
 
 // ─── Project cascade payload (2026-05-15) ────────────────────────────
