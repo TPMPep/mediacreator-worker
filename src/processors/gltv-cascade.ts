@@ -1,67 +1,79 @@
-
 // =============================================================================
-// GLTV-CASCADE PROCESSOR — Advance ONE GLTV Dubbing API job through its
-// pipeline, one phase per tick, fully isolated from human Media Creator work.
+// GLTV-CASCADE PROCESSOR — Transport executor for the GLTV Dubbing API cascade.
 // -----------------------------------------------------------------------------
-// FULLY ISOLATED PRODUCT SURFACE. This processor only ever touches a
-// DubbingApiJob (api_product='gltv_api') and its internal Project (tagged
-// 'gltv_api'). It never reads/writes any human-facing entity for control flow.
+// FULLY ISOLATED PRODUCT SURFACE. This processor only ever advances a
+// DubbingApiJob (api_product='gltv_api') via its brain function on Base44.
+// It never reads/writes any human-facing entity directly.
 //
-// The producer is the Base44 fn `gltvEnqueueCascade` (gated behind the
-// gltv_cascade_enabled FeatureFlag). On each tick this worker calls
-// `gltvCascadeWorkerStep` on Base44, which performs EXACTLY ONE idempotent
-// phase transition (start-or-poll keyed by the job's *_run_id fields, reading
-// the FROZEN recipe_snapshot — never the live recipe) and returns one of:
-//   • action='continue'     → current phase still running; re-enqueue self
-//   • action='advance'      → phase complete + status advanced; re-enqueue self
-//   • action='await_review' → checkpoint-mode parked at awaiting_review; EXIT
-//                             (gltvApproveDubbingJob re-enqueues a fresh tick)
-//   • action='done'         → terminal (completed/failed/cancelled); EXIT
+// ─── DIRECTIVE MODEL (Option A, 2026-06-13) ───────────────────────────────
+// AUTH-BOUNDARY CORRECTION. Proven dead transports for Base44-fn → producer:
+//   ❌ base44.functions.invoke(fn, body, { headers })  — custom header DROPPED.
+//   ❌ Base44-fn → same-deployment raw fetch            — 508 Loop Detected.
+// The ONLY header-bearing transport is THIS worker → Base44 raw fetch (it
+// crosses the deployment boundary, so a custom header lands on the wire).
 //
-// Pattern: identical shape to cc-cue-supersede (single-shot, tick-resumable,
-// heartbeat-extended lock, JWT-scoped callback). The cascade re-enqueues a
-// FRESH job for each continue/advance tick (with a 10s delay) rather than
-// looping in-process — this keeps every tick bounded, gives the watchdog a
-// clean per-tick staleness signal, and means a pod death between ticks loses
-// nothing (the step is idempotent and resumes from DubbingApiJob.status).
+// THEREFORE the BRAIN (gltvCascadeWorkerStep) decides + persists; THIS worker
+// is the pure TRANSPORT that executes the producer HTTP call the brain asks
+// for. The worker holds NO orchestration knowledge — it just relays HTTP and
+// the brain's directives.
+//
+// ─── PER-TICK FLOW ────────────────────────────────────────────────────────
+//   1. Call brain in DECIDE mode → get an action.
+//   2. If action='call_producer':
+//        a. POST the producer (directive.producer_fn) with directive.body +
+//           BOTH headers: X-Gltv-System-JWT (directive.system_jwt, the auth-
+//           bypass) and X-Worker-JWT (directive.gateway_jwt, gateway admission).
+//        b. Call the brain again in RECORD mode with { producer_result } so the
+//           brain persists the run-id + status transition (sole writer).
+//        c. The RECORD response carries the real next action (advance/done/...).
+//   3. Re-enqueue the next tick for continue/advance; exit for await_review/done.
 //
 // IDEMPOTENCY
-// gltvCascadeWorkerStep short-circuits if DubbingApiJob.status is already
-// terminal (returns action='done' with already_terminal=true). Start-or-poll
-// per phase keyed by *_run_id means a re-run never double-starts a phase.
+// The brain short-circuits if DubbingApiJob.status is already terminal. Its
+// directives are keyed by *_run_id, so a re-run never double-starts a phase.
 //
 // HEARTBEAT
-// A single tick's step call (start-or-poll) is short, but polling an
-// underlying run can briefly exceed the BullMQ 30s stall window under load.
-// We extend the job lock every 15s during the function call.
+// A producer call (e.g. runTranscription polling internally) can briefly exceed
+// the BullMQ 30s stall window. We extend the job lock every 15s.
 //
 // AUTH MODEL
-// Scoped JWT (60-min TTL) bound to (system, dubbing_api_job_id,
-// 'gltvCascadeWorkerStep'). Worker forwards verbatim as X-Worker-JWT.
+// • Worker→brain: scoped JWT (job.data.auth_token) bound to (system,
+//   dubbing_api_job_id, 'gltvCascadeWorkerStep'). Forwarded as X-Worker-JWT.
+// • Worker→producer: BOTH tokens are MINTED BY THE BRAIN and handed to the
+//   worker in the directive. The worker never mints a producer token itself —
+//   it only relays what the brain provides. Blast radius of a leaked directive
+//   token: ONE producer fn, ONE job, ≤30 min.
 //
-// SOC 2 CC7.2 — resumable across pod death. CC8.1 — every phase transition
-// appends to DubbingApiJob.phase_history with timestamps + the underlying
-// run id; the step (not the worker) is the sole writer of job.status.
+// SOC 2 CC7.2 — resumable across pod death. CC8.1 — the brain is the sole
+// writer of job.status / *_run_id / phase_history; the producer result is
+// verified server-side (in the brain) BEFORE any status mutation.
 // =============================================================================
 
 import type { Job, Queue } from 'bullmq';
 import type { GltvCascadeJobData } from '../../shared/queue-contracts.js';
 import { QUEUE_NAMES, GLTV_CASCADE_JOB_OPTIONS } from '../../shared/queue-contracts.js';
 import { invokeBase44Function, logEvent } from '../base44-client.js';
+import { env } from '../env.js';
 
-const FUNCTION_CALL_TIMEOUT_MS = 90_000;   // One phase step (start-or-poll).
+const FUNCTION_CALL_TIMEOUT_MS = 90_000;   // One brain step (decide or record).
+const PRODUCER_CALL_TIMEOUT_MS = 120_000;  // One producer POST (e.g. transcription start/poll).
 const HEARTBEAT_MS = 15_000;
 // Delay before the worker re-enqueues the NEXT tick. Approved cadence: 10s.
-// Balances responsiveness against Base44 read pressure at 100+ concurrent jobs.
 const TICK_DELAY_MS = 10_000;
 
 interface CascadeStepResponse {
-  action: 'continue' | 'advance' | 'await_review' | 'done';
+  action: 'continue' | 'advance' | 'await_review' | 'done' | 'call_producer';
   status?: string;
   phase?: string;
   progress_pct?: number;
   already_terminal?: boolean;
   result?: unknown;
+  // call_producer directive fields (brain → worker):
+  producer_fn?: string;
+  body?: Record<string, unknown>;
+  system_jwt?: string;
+  gateway_jwt?: string;
+  expected_result_contract?: string;
 }
 
 async function _log(
@@ -84,6 +96,40 @@ async function _log(
     });
   } catch (logErr) {
     console.error(`[bullmq:gltv-cascade] logEvent_failed event=${event} reason=${String((logErr as Error)?.message || logErr).slice(0, 200)}`);
+  }
+}
+
+/**
+ * Execute the brain's call_producer directive: raw-fetch the producer with
+ * BOTH the system-JWT (auth bypass) and the gateway-JWT (gateway admission)
+ * on the wire. Returns the parsed producer response + HTTP status. The worker
+ * does NOT interpret the result — it relays it back to the brain in RECORD mode.
+ */
+async function executeProducerDirective(directive: CascadeStepResponse): Promise<{ data: unknown; status: number }> {
+  const url = `${env.BASE44_FUNCTION_URL}/${directive.producer_fn}`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), PRODUCER_CALL_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-App-Id': env.BASE44_APP_ID,
+        // The producer's GLTV seam reads THIS — the auth-bypass token.
+        'X-Gltv-System-JWT': directive.system_jwt!,
+        // Gateway admission for an unauthenticated server-to-server call.
+        // (Worker finding 2026-05-06: send the scoped JWT, NEVER Authorization.)
+        'X-Worker-JWT': directive.gateway_jwt!,
+      },
+      body: JSON.stringify(directive.body ?? {}),
+      signal: ctrl.signal,
+    });
+    const text = await res.text().catch(() => '');
+    let data: unknown;
+    try { data = text ? JSON.parse(text) : {}; } catch { data = { _raw: text.slice(0, 500) }; }
+    return { data, status: res.status };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -129,30 +175,62 @@ export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
     })();
 
     try {
-      // ─── One bounded phase transition ──────────────────────────────
-      const step: CascadeStepResponse = await invokeBase44Function<CascadeStepResponse>({
+      // ─── 1. DECIDE: ask the brain what to do next ──────────────────
+      let step: CascadeStepResponse = await invokeBase44Function<CascadeStepResponse>({
         fn: 'gltvCascadeWorkerStep',
         authToken: auth_token,
         payload: { dubbing_api_job_id, project_id, request_id },
         timeoutMs: FUNCTION_CALL_TIMEOUT_MS,
       });
 
-      await _log('info', 'gltv_cascade_step_done', {
-        ...baseCtx,
-        action: step.action,
-        status: step.status,
-        phase: step.phase,
-        progress_pct: step.progress_pct,
-        already_terminal: !!step.already_terminal,
-        tick_ms: Date.now() - t0,
-      }, `Step returned action=${step.action} (status=${step.status ?? '?'} phase=${step.phase ?? '?'}).`);
+      // ─── 2. call_producer: relay the producer call, then RECORD ────
+      if (step.action === 'call_producer') {
+        await _log('info', 'gltv_cascade_producer_directive', {
+          ...baseCtx, producer_fn: step.producer_fn, phase: step.phase,
+          contract: step.expected_result_contract,
+        }, `Brain directive: call producer ${step.producer_fn} for phase ${step.phase}.`);
 
-      // ─── Re-enqueue the next tick for continue/advance ─────────────
-      // A fresh job (not an in-process loop) keeps every tick bounded and
-      // gives the watchdog a clean per-tick staleness signal. The producer
-      // already minted a 60-min JWT; we reuse it across ticks (well within TTL
-      // for a tick cadence of 10s). On a hard failure the JWT may approach
-      // expiry — the watchdog re-enqueues with a fresh JWT in that case.
+        const producerResp = await executeProducerDirective(step);
+
+        await _log('info', 'gltv_cascade_producer_done', {
+          ...baseCtx, producer_fn: step.producer_fn, phase: step.phase,
+          producer_http_status: producerResp.status,
+        }, `Producer ${step.producer_fn} returned HTTP ${producerResp.status}.`);
+
+        // RECORD: hand the producer result back to the brain so it persists
+        // the run-id + status transition (the brain is the sole status writer).
+        step = await invokeBase44Function<CascadeStepResponse>({
+          fn: 'gltvCascadeWorkerStep',
+          authToken: auth_token,
+          payload: {
+            dubbing_api_job_id,
+            project_id,
+            request_id,
+            producer_result: {
+              phase: step.phase,
+              data: producerResp.data,
+              status: producerResp.status,
+            },
+          },
+          timeoutMs: FUNCTION_CALL_TIMEOUT_MS,
+        });
+
+        await _log('info', 'gltv_cascade_record_done', {
+          ...baseCtx, action: step.action, status: step.status, phase: step.phase,
+        }, `Brain recorded transition → action=${step.action} (status=${step.status ?? '?'}).`);
+      } else {
+        await _log('info', 'gltv_cascade_step_done', {
+          ...baseCtx,
+          action: step.action,
+          status: step.status,
+          phase: step.phase,
+          progress_pct: step.progress_pct,
+          already_terminal: !!step.already_terminal,
+          tick_ms: Date.now() - t0,
+        }, `Step returned action=${step.action} (status=${step.status ?? '?'} phase=${step.phase ?? '?'}).`);
+      }
+
+      // ─── 3. Re-enqueue / exit per the (final) action ───────────────
       if (step.action === 'continue' || step.action === 'advance') {
         const q = getQueue(QUEUE_NAMES.GLTV_CASCADE);
         await q.add(QUEUE_NAMES.GLTV_CASCADE, {
@@ -170,10 +248,8 @@ export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
         return { ok: true, action: step.action, status: step.status, duration_ms: Date.now() - t0 };
       }
 
-      // ─── await_review (checkpoint mode) — EXIT cleanly ─────────────
-      // The cascade parks at awaiting_review. gltvApproveDubbingJob re-enqueues
-      // a fresh cascade tick when the API caller approves. The worker does NOT
-      // re-enqueue here — that would busy-poll a parked job.
+      // await_review (checkpoint mode) — EXIT cleanly. gltvApproveDubbingJob
+      // re-enqueues a fresh tick when the API caller approves.
       if (step.action === 'await_review') {
         await _log('info', 'gltv_cascade_awaiting_review', {
           ...baseCtx, total_duration_ms: Date.now() - t0, heartbeat_ticks: heartbeatTicks,
@@ -181,7 +257,7 @@ export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
         return { ok: true, action: 'await_review', status: step.status, duration_ms: Date.now() - t0 };
       }
 
-      // ─── done — terminal (completed/failed/cancelled) ──────────────
+      // done — terminal (completed/failed/cancelled).
       await _log('info', 'gltv_cascade_done', {
         ...baseCtx,
         total_duration_ms: Date.now() - t0,
