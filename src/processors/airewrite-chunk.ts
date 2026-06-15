@@ -46,6 +46,30 @@ const HEARTBEAT_MS = 15_000;
 // Raised from 180s on 2026-05-24 — see file header for the N=10 evidence.
 const CHUNK_TIMEOUT_MS = 330_000;
 
+// HARD WALL-CLOCK DEADLINE for the WHOLE processor invocation (reliability fix).
+// -----------------------------------------------------------------------------
+// CHUNK_TIMEOUT_MS bounds the SINGLE invokeBase44Function call. But if that
+// promise ever fails to settle (gateway socket wedged, fetch never resolving
+// nor rejecting), the await sits forever, the heartbeat loop starves, the
+// BullMQ lock expires, and the job is reclaimed as `stalled` WITHOUT the
+// processor's catch ever firing — no `airewrite_chunk_failed` log, no
+// terminal state. That silent stall-loop is the exact wedge we are closing.
+//
+// This deadline is a Promise.race backstop: if the invocation has not settled
+// by DEADLINE_MS, we throw a CLASSIFIED error so the job lands in BullMQ
+// `failed` (harvestable by the orchestrator) instead of stalling invisibly.
+// Sized just above CHUNK_TIMEOUT_MS so the in-call AbortController is always
+// the first line of defence; this only fires when that defence itself wedged.
+// SOC 2 CC7.2 — a hung invocation can no longer strand a chunk silently.
+const CHUNK_DEADLINE_MS = 345_000; // 15s above CHUNK_TIMEOUT_MS
+
+class ChunkDeadlineError extends Error {
+  constructor(ms: number) {
+    super(`airewrite-chunk: hard wall-clock deadline (${ms}ms) exceeded — invocation never settled. Classified as worker_deadline_exceeded so BullMQ fails the job instead of stalling it.`);
+    this.name = 'ChunkDeadlineError';
+  }
+}
+
 export async function processAIRewriteChunk(job: Job) {
   const t0 = Date.now();
   const {
@@ -67,31 +91,44 @@ export async function processAIRewriteChunk(job: Job) {
     }
   })();
 
+  // Hard wall-clock deadline: if the invocation never settles within
+  // CHUNK_DEADLINE_MS, reject with a classified error so BullMQ fails the
+  // job (orchestrator-harvestable) instead of the lock silently expiring
+  // and the job being reclaimed as `stalled` with no failure surface.
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    deadlineTimer = setTimeout(() => reject(new ChunkDeadlineError(CHUNK_DEADLINE_MS)), CHUNK_DEADLINE_MS);
+  });
+
   try {
-    const result = await invokeBase44Function({
-      fn: 'rewriteChunk',
-      authToken: auth_token,
-      payload: {
-        project_id,
-        rewrite_run_id,
-        chunk_key,
-        chunk_index,
-        // v3 pure-compute contract (incident 2026-05-09): the chunk
-        // function makes ZERO Base44 reads. The producer inlines every
-        // translation row + the run-config block the chunk needs; the
-        // orchestrator forwards them verbatim through this queue. The
-        // legacy `translation_ids` field is intentionally dropped — the
-        // chunk has no way to dereference IDs without a Base44 read.
-        inlined_translations,
-        mode,
-        provider,
-        project_context,
-        user_email,
-        request_id,
-        inlined_run_config,
-      },
-      timeoutMs: CHUNK_TIMEOUT_MS,
-    });
+    const result = await Promise.race([
+      invokeBase44Function({
+        fn: 'rewriteChunk',
+        authToken: auth_token,
+        payload: {
+          project_id,
+          rewrite_run_id,
+          chunk_key,
+          chunk_index,
+          // v3 pure-compute contract (incident 2026-05-09): the chunk
+          // function makes ZERO Base44 reads. The producer inlines every
+          // translation row + the run-config block the chunk needs; the
+          // orchestrator forwards them verbatim through this queue. The
+          // legacy `translation_ids` field is intentionally dropped — the
+          // chunk has no way to dereference IDs without a Base44 read.
+          inlined_translations,
+          mode,
+          provider,
+          project_context,
+          user_email,
+          request_id,
+          inlined_run_config,
+        },
+        timeoutMs: CHUNK_TIMEOUT_MS,
+      }),
+      deadline,
+    ]);
+    clearTimeout(deadlineTimer);
 
     await logEvent({
       function_name: 'bullmq:airewrite-chunk',
@@ -123,6 +160,7 @@ export async function processAIRewriteChunk(job: Job) {
     });
     throw err;
   } finally {
+    clearTimeout(deadlineTimer);
     heartbeatActive = false;
     await heartbeat.catch(() => {});
   }
