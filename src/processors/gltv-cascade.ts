@@ -60,6 +60,17 @@ const PRODUCER_CALL_TIMEOUT_MS = 120_000;  // One producer POST (e.g. transcript
 const HEARTBEAT_MS = 15_000;
 // Delay before the worker re-enqueues the NEXT tick. Approved cadence: 10s.
 const TICK_DELAY_MS = 10_000;
+// Safety cap on how many producer calls a SINGLE tick may chain. The brain
+// can legitimately return a `call_producer` directive as the result of a
+// RECORD step (e.g. the scan-clean RECORD writes status='transcribing' and
+// then immediately directs runTranscription in the same response). The worker
+// therefore loops: execute producer → RECORD → if the RECORD itself returns
+// another `call_producer`, execute that too, until the brain returns a
+// non-directive action (continue/advance/await_review/done). This cap is the
+// belt-and-suspenders guard against a misbehaving brain spinning a tick
+// forever — under correct operation a tick chains at most 2 producer calls
+// (the phase's own + one RECORD-then-directive handoff). SOC 2 CC7.2.
+const MAX_PRODUCER_CHAIN_PER_TICK = 4;
 
 interface CascadeStepResponse {
   action: 'continue' | 'advance' | 'await_review' | 'done' | 'call_producer';
@@ -184,21 +195,48 @@ export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
       });
 
       // ─── 2. call_producer: relay the producer call, then RECORD ────
-      if (step.action === 'call_producer') {
+      // LOOP, not a single `if`: the brain may return a `call_producer`
+      // directive as the result of EITHER a DECIDE step OR a RECORD step. The
+      // scan-clean RECORD is the canonical case — it persists status='transcribing'
+      // and then directs runTranscription in the SAME response. A single `if`
+      // executed only the first directive and silently dropped a directive that
+      // came back from the RECORD, wedging the cascade at the scan→transcription
+      // handoff (the run-id never got pinned, no next tick was enqueued). The
+      // loop drains the directive chain until the brain returns a non-directive
+      // action, bounded by MAX_PRODUCER_CHAIN_PER_TICK so a misbehaving brain can
+      // never spin a tick forever. SOC 2 CC7.2 — resumable + non-wedging.
+      let producerChainCount = 0;
+      while (step.action === 'call_producer') {
+        producerChainCount++;
+        if (producerChainCount > MAX_PRODUCER_CHAIN_PER_TICK) {
+          // The brain kept asking for producer calls past the safe ceiling.
+          // Throw so BullMQ retries the tick / the watchdog resumes — never
+          // silently drop the directive (that's the exact bug we are fixing).
+          await _log('error', 'gltv_cascade_producer_chain_overflow', {
+            ...baseCtx, producer_fn: step.producer_fn, phase: step.phase,
+            chain_count: producerChainCount,
+          }, `Producer chain exceeded ${MAX_PRODUCER_CHAIN_PER_TICK} in one tick — aborting tick for retry.`);
+          throw new Error(`gltv-cascade: producer chain exceeded ${MAX_PRODUCER_CHAIN_PER_TICK} for job ${dubbing_api_job_id} (last producer ${step.producer_fn})`);
+        }
+
         await _log('info', 'gltv_cascade_producer_directive', {
           ...baseCtx, producer_fn: step.producer_fn, phase: step.phase,
+          chain_count: producerChainCount,
           contract: step.expected_result_contract,
         }, `Brain directive: call producer ${step.producer_fn} for phase ${step.phase}.`);
 
         const producerResp = await executeProducerDirective(step);
+        const directivePhase = step.phase; // pin before `step` is reassigned by RECORD
 
         await _log('info', 'gltv_cascade_producer_done', {
-          ...baseCtx, producer_fn: step.producer_fn, phase: step.phase,
+          ...baseCtx, producer_fn: step.producer_fn, phase: directivePhase,
           producer_http_status: producerResp.status,
         }, `Producer ${step.producer_fn} returned HTTP ${producerResp.status}.`);
 
         // RECORD: hand the producer result back to the brain so it persists
         // the run-id + status transition (the brain is the sole status writer).
+        // The RECORD response may itself be another `call_producer` directive —
+        // the while-loop executes it on the next iteration.
         step = await invokeBase44Function<CascadeStepResponse>({
           fn: 'gltvCascadeWorkerStep',
           authToken: auth_token,
@@ -207,7 +245,7 @@ export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
             project_id,
             request_id,
             producer_result: {
-              phase: step.phase,
+              phase: directivePhase,
               data: producerResp.data,
               status: producerResp.status,
             },
@@ -217,8 +255,11 @@ export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
 
         await _log('info', 'gltv_cascade_record_done', {
           ...baseCtx, action: step.action, status: step.status, phase: step.phase,
+          chain_count: producerChainCount,
+          chained_directive: step.action === 'call_producer',
         }, `Brain recorded transition → action=${step.action} (status=${step.status ?? '?'}).`);
-      } else {
+      }
+      if (producerChainCount === 0) {
         await _log('info', 'gltv_cascade_step_done', {
           ...baseCtx,
           action: step.action,
