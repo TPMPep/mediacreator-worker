@@ -227,6 +227,29 @@ export const QUEUE_NAMES = {
   // phase transition appends to DubbingApiJob.phase_history with timestamps +
   // the underlying run id.
   GLTV_CASCADE: 'gltv-cascade',
+  // Simple Translation (SRT) async translate pipeline (2026-06-16). FULLY
+  // ISOLATED to the Translation module (project_type='simple_translation' +
+  // TranslationCue + SimpleTranslationRun) — never shares state, queue, or
+  // concurrency lane with the AI-Dubbing translate pipeline (TRANSLATE_*) or
+  // any other surface. Single-shot tick-resumable job per SimpleTranslationRun.
+  // The worker calls srtTranslateWorkerStep in a loop; each tick translates a
+  // bounded batch (~120 cues) in parallel via the caller-chosen provider
+  // (DeepL / Gemini / ChatGPT) and writes the results back inside its own ~22s
+  // budget, returning action='continue' (re-call) or action='done' (finalize).
+  //
+  // WHY: the old translateSrtProject translated + delete+bulkCreate'd the whole
+  // cue set in ONE function call — fine for short subtitle files, but a feature
+  // film (1000-3000+ cues) under 100+ concurrent users brushed the function
+  // gateway ceiling and concentrated the entire write burst into one budget.
+  // The tick design spreads it across resumable batches so a full movie
+  // translates reliably regardless of concurrency. A pod death mid-run re-reads
+  // SimpleTranslationRun.checkpoint.cursor + only translates 'pending' cues, so
+  // resume never re-translates a done cue (idempotent).
+  //
+  // Concurrency: its OWN lane (default 4) so a translation burst never starves
+  // any other pipeline. SOC 2 CC7.2 — resumable; CC8.1 — provider + per-cue
+  // provenance (TranslationCue.translated_by_provider) join back to the run.
+  SRT_TRANSLATE: 'srt-translate',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -1191,6 +1214,38 @@ export interface GltvCascadeJobData {
   auth_token: string;
 }
 
+// ─── Simple Translation (SRT) async translate payload (2026-06-16) ───────────
+//
+// Single-shot tick-resumable job. The worker calls srtTranslateWorkerStep in a
+// loop; the step translates a bounded batch of pending TranslationCue rows and
+// returns action='continue' (re-call) or action='done' (run finalized). The
+// parsed cues are NEVER in this payload — the step reads them off the DB keyed
+// by (project_id, cue_index > checkpoint.cursor). FULLY ISOLATED to the
+// Translation module.
+//
+// SECURITY MODEL — identical to cc-cue-supersede / transcript-import:
+//   • Scoped JWT (30-min TTL) bound to (user, project, run_id,
+//     'srtTranslateWorkerStep'). Worker forwards verbatim as X-Worker-JWT.
+//
+// AUDIT POSTURE (SOC 2 CC7.2 / CC8.1):
+//   • SimpleTranslationRun is the audit row; status + checkpoint answer "how far
+//     did this translate get?" from a single row.
+//   • BullMQ retains failed jobs 7d — every failed run is DLQ-queryable.
+export interface SrtTranslateJobData {
+  schema_version: number;
+  /** Owning Project.id (project_type='simple_translation'). */
+  project_id: string;
+  /** SimpleTranslationRun.id — the run this job advances. */
+  run_id: string;
+  /** User that triggered the translate (preserved for attribution). */
+  user_email: string;
+  /** Correlation id threaded into every StructuredLog row for this run. */
+  request_id: string;
+  /** Scoped JWT bound to (user, project, run_id, 'srtTranslateWorkerStep').
+   *  30-min TTL — comfortably covers a 3000-cue feature film (~10-20 ticks). */
+  auth_token: string;
+}
+
 // Discriminated union for processors that need to handle multiple shapes.
 export type AnyJobData =
    | VoiceGenJobData
@@ -1216,7 +1271,8 @@ export type AnyJobData =
    | LoadTestReseedJobData
    | CCCueSupersedeJobData
    | TranscriptImportJobData
-   | GltvCascadeJobData;
+   | GltvCascadeJobData
+   | SrtTranslateJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
 
