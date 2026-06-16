@@ -88,12 +88,16 @@ export async function processTranslateChunk(job: Job<TranslateChunkJobData>): Pr
   } catch (err) {
     const e = err as Error;
     const lockLost = e instanceof WorkerLockLostError;
+    // Read off the un-narrowed Error — the instanceof check narrows the false
+    // branch to `never` (WorkerLockLostError is structurally identical to Error).
+    const errName: string = e.name;
+    const errMessage: string = e.message;
     await logEvent({
       function_name: 'bullmq:translate-chunk',
       level: lockLost ? 'warn' : 'error',
       event: lockLost ? 'translate_chunk_lock_lost' : 'translate_chunk_failed',
-      message: e.message,
-      error_kind: lockLost ? 'lock_lost' : e.name,
+      message: errMessage,
+      error_kind: lockLost ? 'lock_lost' : errName,
       duration_ms: Date.now() - t0,
       context: {
         project_id, translation_run_id, chunk_key, chunk_index,
