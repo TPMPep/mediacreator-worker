@@ -43,10 +43,9 @@
 
 import type { Job } from 'bullmq';
 import type { TranscriptImportJobData } from '../../shared/queue-contracts.js';
-import { invokeBase44Function, logEvent } from '../base44-client.js';
+import { invokeBase44Function, logEvent, runWithLockHeartbeat, WorkerLockLostError } from '../base44-client.js';
 
 const FUNCTION_CALL_TIMEOUT_MS = 60_000;
-const HEARTBEAT_MS = 15_000;
 
 interface ImportStepResponse {
   action: 'continue' | 'done';
@@ -107,21 +106,12 @@ export async function processTranscriptImport(job: Job<TranscriptImportJobData>)
   await _log('info', 'transcript_import_started', baseCtx,
     `Worker picked up job ${job.id} for transcript_import_run ${transcript_import_run_id} (attempt ${job.attemptsMade + 1}).`);
 
-  let heartbeatActive = true;
-  let heartbeatTicks = 0;
-  const heartbeat = (async () => {
-    while (heartbeatActive) {
-      await new Promise(r => setTimeout(r, HEARTBEAT_MS));
-      if (!heartbeatActive) break;
-      try {
-        await job.extendLock(job.token!, 30_000);
-        heartbeatTicks++;
-      } catch (hbErr) {
-        console.warn(`[bullmq:transcript-import] heartbeat_lock_extend_failed job=${job.id} reason=${String((hbErr as Error)?.message || hbErr).slice(0, 200)}`);
-      }
-    }
-  })();
-
+  // ZOMBIE-KILL (2026-06-16): runWithLockHeartbeat owns the lock-renewal loop
+  // AND aborts the in-flight Base44 call the instant the BullMQ lock is lost
+  // (extendLock throws = reclaim). Replaces the old swallow-the-error heartbeat
+  // that let a pod-recycle orphan run as a zombie holding worker concurrency
+  // forever. Each invokeBase44 call below runs inside this wrapper via the
+  // passed `signal`. SOC 2 CC7.2.
   try {
     // ─── Paginated stage-then-flip lifecycle ──────────────────────────
     // Loop calling transcriptImportWorkerStep until it returns
@@ -140,12 +130,15 @@ export async function processTranscriptImport(job: Job<TranscriptImportJobData>)
       const tickT0 = Date.now();
       await _log('info', 'transcript_import_tick_start', { ...baseCtx, tick: tickCount }, `Tick ${tickCount} starting.`);
 
-      const step: ImportStepResponse = await invokeBase44Function<ImportStepResponse>({
-        fn: 'transcriptImportWorkerStep',
-        authToken: auth_token,
-        payload: { project_id, transcript_import_run_id },
-        timeoutMs: FUNCTION_CALL_TIMEOUT_MS,
-      });
+      const step: ImportStepResponse = await runWithLockHeartbeat<ImportStepResponse>(job, (signal) =>
+        invokeBase44Function<ImportStepResponse>({
+          fn: 'transcriptImportWorkerStep',
+          authToken: auth_token,
+          payload: { project_id, transcript_import_run_id },
+          timeoutMs: FUNCTION_CALL_TIMEOUT_MS,
+          signal,
+        }),
+      );
       lastStep = step;
       const tickMs = Date.now() - tickT0;
 
@@ -172,27 +165,28 @@ export async function processTranscriptImport(job: Job<TranscriptImportJobData>)
       ...baseCtx,
       total_duration_ms: Date.now() - t0,
       tick_count: tickCount,
-      heartbeat_ticks: heartbeatTicks,
       already_terminal: !!lastStep.already_terminal,
     }, `Job complete — stage-then-flip finished (${Date.now() - t0}ms total).`);
 
     return lastStep.result ?? { ok: true, phase: 'done', tick_count: tickCount };
   } catch (err) {
     const e = err as Error;
-    console.error(`[bullmq:transcript-import] transcript_import_failure job=${job.id} run=${transcript_import_run_id} attempt=${job.attemptsMade + 1} duration_ms=${Date.now() - t0} error_kind=${e.name} message=${String(e.message || '').slice(0, 500)}`);
-    if (e.stack) {
+    // WorkerLockLostError = clean reclaim exit (the heartbeat aborted us because
+    // BullMQ took the job), NOT a real failure. Log warn + re-throw so the SINGLE
+    // BullMQ reclaim owns the re-run — transcriptImportWorkerStep is idempotent +
+    // resumable (short-circuits on terminal run, resumes from checkpoint cursor),
+    // so the reclaim re-runs safely. SOC 2 CC7.2.
+    const lockLost = e instanceof WorkerLockLostError;
+    console.error(`[bullmq:transcript-import] transcript_import_failure job=${job.id} run=${transcript_import_run_id} attempt=${job.attemptsMade + 1} duration_ms=${Date.now() - t0} error_kind=${lockLost ? 'lock_lost' : e.name} message=${String(e.message || '').slice(0, 500)}`);
+    if (e.stack && !lockLost) {
       console.error(`[bullmq:transcript-import] stack: ${e.stack.split('\n').slice(0, 5).join(' | ')}`);
     }
-    await _log('error', 'transcript_import_failed', {
+    await _log(lockLost ? 'warn' : 'error', lockLost ? 'transcript_import_lock_lost' : 'transcript_import_failed', {
       ...baseCtx,
       total_duration_ms: Date.now() - t0,
-      heartbeat_ticks: heartbeatTicks,
-      error_kind: e.name,
+      error_kind: lockLost ? 'lock_lost' : e.name,
     }, e.message);
     console.error(`[bullmq:transcript-import] throwing_to_bullmq job=${job.id} attempt=${job.attemptsMade + 1} — BullMQ will retry or DLQ per default policy.`);
     throw err;
-  } finally {
-    heartbeatActive = false;
-    await heartbeat.catch(() => {});
   }
 }
