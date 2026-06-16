@@ -202,6 +202,15 @@ export const env = {
   // — comfortable for 100+ concurrent API customers without amplifying Base44
   // write pressure. Env-overridable via GLTV_CASCADE_CONCURRENCY.
   CONCURRENCY_GLTV_CASCADE: intEnv('GLTV_CASCADE_CONCURRENCY', 5),
+  // Simple Translation (SRT) async translate (2026-06-16). ISOLATED concurrency
+  // lane for the Translation module — its OWN budget so a bulk-translate burst
+  // never starves human Media Creator editors or the AI-Dubbing translate
+  // pipeline. Each in-flight job loops srtTranslateWorkerStep ticks against ONE
+  // SimpleTranslationRun; between provider batches the slot is mostly idle.
+  // Default 4 — comfortable for 100+ concurrent translators without amplifying
+  // Base44 write pressure (the per-tick write-back is the bottleneck, bounded by
+  // TICK_BATCH on the function side). Env-overridable.
+  CONCURRENCY_SRT_TRANSLATE: intEnv('WORKER_CONCURRENCY_SRT_TRANSLATE', 4),
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
