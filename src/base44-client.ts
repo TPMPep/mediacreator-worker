@@ -21,6 +21,7 @@
 // model and TPN/SOC2 rationale.
 // =============================================================================
 
+import type { Job } from 'bullmq';
 import { env } from './env.js';
 
 interface InvokeOpts {
@@ -37,6 +38,29 @@ interface InvokeOpts {
    * executing.
    */
   authToken?: string;
+  /**
+   * Optional EXTERNAL abort signal (zombie-kill, 2026-06-16). When the
+   * heartbeat detects a lost BullMQ lock (extendLock threw), it aborts THIS
+   * signal so the in-flight fetch cancels immediately and the processor
+   * invocation exits instead of running as a zombie alongside the reclaim.
+   * Linked to the internal timeout controller — whichever fires first wins.
+   * Independent of timeoutMs: this is "BullMQ already took the job from us",
+   * not "the call is slow". See runWithLockHeartbeat below.
+   */
+  signal?: AbortSignal;
+}
+
+/**
+ * Distinctive error thrown when an invocation is aborted because the worker
+ * LOST ITS BULLMQ LOCK (not a timeout). The processor's catch can classify
+ * this as `lock_lost` so the harvest/audit trail records WHY the invocation
+ * ended — a reclaim, not a provider failure. SOC 2 CC7.2.
+ */
+export class WorkerLockLostError extends Error {
+  constructor(fn: string) {
+    super(`base44 ${fn} → aborted: BullMQ lock lost (job reclaimed). Invocation cancelled to prevent a zombie running parallel to the reclaim.`);
+    this.name = 'WorkerLockLostError';
+  }
 }
 
 // =============================================================================
@@ -178,9 +202,19 @@ export async function invokeBase44Function<T = unknown>(opts: InvokeOpts): Promi
   // Cap total iterations defensively so a pathological alternation between
   // 403 and 429 can't loop forever.
   const TOTAL_ITERATION_CAP = GATEWAY_AUTH_RETRY_MAX + RATE_LIMIT_RETRY_MAX + 2;
+  // If the caller already lost its lock before we even started, fail fast.
+  if (opts.signal?.aborted) throw new WorkerLockLostError(opts.fn);
+
   for (let iter = 0; iter < TOTAL_ITERATION_CAP; iter++) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 5 * 60 * 1000);
+    // Link the EXTERNAL lock-loss signal to this fetch's controller. When the
+    // heartbeat aborts opts.signal (lock lost), we abort the in-flight fetch
+    // immediately — no waiting for timeoutMs. We track WHICH cause fired so
+    // the thrown error is classified correctly (lock-loss vs. timeout).
+    let lockLost = false;
+    const onExternalAbort = () => { lockLost = true; ctrl.abort(); };
+    if (opts.signal) opts.signal.addEventListener('abort', onExternalAbort, { once: true });
     try {
       const res = await fetch(url, {
         method: 'POST',
@@ -246,8 +280,17 @@ export async function invokeBase44Function<T = unknown>(opts: InvokeOpts): Promi
 
       // Non-retryable failure — propagate immediately.
       throw new Error(`base44 ${opts.fn} → HTTP ${res.status}: ${body.slice(0, 500)}`);
+    } catch (fetchErr) {
+      // If the abort was caused by the EXTERNAL lock-loss signal, re-classify
+      // it as a WorkerLockLostError so the processor records it as a reclaim,
+      // not a provider/timeout failure. A timeout-driven abort (internal
+      // controller) keeps its normal AbortError shape and is handled by the
+      // caller's existing transient-error path.
+      if (lockLost) throw new WorkerLockLostError(opts.fn);
+      throw fetchErr;
     } finally {
       clearTimeout(timer);
+      if (opts.signal) opts.signal.removeEventListener('abort', onExternalAbort);
     }
   }
   // Retries exhausted. Surface a distinctive error so app-side circuit
@@ -282,4 +325,101 @@ export async function logEvent(payload: {
   if (level === 'error' || level === 'fatal') console.error(line);
   else if (level === 'warn') console.warn(line);
   else console.log(line);
+}
+
+// =============================================================================
+// runWithLockHeartbeat — SHARED ZOMBIE-KILL PRIMITIVE (2026-06-16)
+// -----------------------------------------------------------------------------
+// THE PROBLEM IT SOLVES (root-caused on the GLTV cold-start, run
+// 6a310a7bccefb9a6f14dbe20, chunk job 2701):
+//   Every long-running processor ran a heartbeat loop that called
+//   job.extendLock() every 15s and SWALLOWED any error (`catch {}`). When a
+//   single invocation's fetch hangs longer than BullMQ's stalledInterval (30s)
+//   — a wedged gateway socket, a provider tail-latency spike — the lock is NOT
+//   renewed, BullMQ reclaims the job as `stalled`, and starts a BRAND-NEW
+//   processor invocation for the SAME job. BullMQ does NOT kill the original
+//   invocation. So the old one keeps running as a ZOMBIE: still holding its
+//   provider socket, still counting toward worker concurrency, never logging,
+//   never terminalising. Each reclaim spawns another zombie; because each genuine
+//   re-pickup advances processedOn, the stall counter never reaches
+//   maxStalledCount, so the job loops `active` FOREVER. The orchestrator harvests
+//   nothing, the run parks, the cascade wedges. (attempts_made climbed 1→5 with
+//   ZERO worker logs — the signature of stacked zombies.)
+//
+// THE FIX:
+//   The heartbeat is now the AUTHORITY on lock ownership. The instant
+//   job.extendLock() THROWS (lock already lost = BullMQ reclaimed us or is
+//   about to), we ABORT the in-flight invocation via an AbortController. The
+//   invocation's fetch cancels, invokeBase44Function throws WorkerLockLostError,
+//   the processor exits cleanly with a harvestable terminal/error state, and the
+//   SINGLE BullMQ reclaim owns the re-run. No zombie ever runs parallel to the
+//   reclaim; the active/reclaim loop is bounded by BullMQ's own attempts cap.
+//
+//   Chunk functions are idempotent (the orchestrator is the sole writer and
+//   short-circuits on completed_chunk_keys), so an aborted-then-reclaimed chunk
+//   re-runs safely exactly once.
+//
+// USAGE (every chunk/cascade processor):
+//   return await runWithLockHeartbeat(job, async (signal) => {
+//     return await invokeBase44Function({ fn, authToken, payload, timeoutMs, signal });
+//   });
+//
+// SOC 2 CC7.2 — a hung invocation can no longer strand a job in an unbounded
+// reclaim loop; CC8.1 — the lock-loss cause is a distinct, attributable error
+// class (WorkerLockLostError), not an opaque silent stall.
+// =============================================================================
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const LOCK_EXTEND_MS = 30_000;
+
+export async function runWithLockHeartbeat<T>(
+  job: Job,
+  body: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const abortController = new AbortController();
+  let active = true;
+  let lockLost = false;
+
+  const heartbeat = (async () => {
+    while (active) {
+      await new Promise(r => setTimeout(r, HEARTBEAT_INTERVAL_MS));
+      if (!active) break;
+      try {
+        await job.extendLock(job.token!, LOCK_EXTEND_MS);
+      } catch (lockErr) {
+        // Lock renewal FAILED → BullMQ has reclaimed (or is reclaiming) this
+        // job. Stop being a zombie: abort the in-flight invocation NOW so it
+        // cancels its fetch and the processor exits. This is the whole fix.
+        lockLost = true;
+        active = false;
+        abortController.abort();
+        await logEvent({
+          function_name: 'bullmq:lock-heartbeat',
+          level: 'warn',
+          event: 'worker_lock_lost_abort',
+          message: `extendLock failed — aborting in-flight invocation to prevent a zombie running parallel to the BullMQ reclaim.`,
+          context: {
+            queue: job.queueName,
+            bullmq_job_id: job.id,
+            attempts: job.attemptsMade + 1,
+            reason: String((lockErr as Error)?.message || lockErr).slice(0, 200),
+          },
+        });
+        break;
+      }
+    }
+  })();
+
+  try {
+    return await body(abortController.signal);
+  } catch (err) {
+    // If WE aborted because the lock was lost, normalise to WorkerLockLostError
+    // so the processor's catch classifies it as a reclaim, not a real failure.
+    if (lockLost && !(err instanceof WorkerLockLostError)) {
+      throw new WorkerLockLostError(job.name || job.queueName || 'unknown');
+    }
+    throw err;
+  } finally {
+    active = false;
+    await heartbeat.catch(() => {});
+  }
 }
