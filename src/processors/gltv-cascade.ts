@@ -52,12 +52,11 @@
 import type { Job, Queue } from 'bullmq';
 import type { GltvCascadeJobData } from '../../shared/queue-contracts.js';
 import { QUEUE_NAMES, GLTV_CASCADE_JOB_OPTIONS } from '../../shared/queue-contracts.js';
-import { invokeBase44Function, logEvent } from '../base44-client.js';
+import { invokeBase44Function, logEvent, runWithLockHeartbeat, WorkerLockLostError } from '../base44-client.js';
 import { env } from '../env.js';
 
 const FUNCTION_CALL_TIMEOUT_MS = 90_000;   // One brain step (decide or record).
 const PRODUCER_CALL_TIMEOUT_MS = 120_000;  // One producer POST (e.g. transcription start/poll).
-const HEARTBEAT_MS = 15_000;
 // Delay before the worker re-enqueues the NEXT tick. Approved cadence: 10s.
 const TICK_DELAY_MS = 10_000;
 // Safety cap on how many producer calls a SINGLE tick may chain. The brain
@@ -116,10 +115,19 @@ async function _log(
  * on the wire. Returns the parsed producer response + HTTP status. The worker
  * does NOT interpret the result — it relays it back to the brain in RECORD mode.
  */
-async function executeProducerDirective(directive: CascadeStepResponse): Promise<{ data: unknown; status: number }> {
+async function executeProducerDirective(directive: CascadeStepResponse, lockSignal?: AbortSignal): Promise<{ data: unknown; status: number }> {
   const url = `${env.BASE44_FUNCTION_URL}/${directive.producer_fn}`;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), PRODUCER_CALL_TIMEOUT_MS);
+  // Zombie-kill (2026-06-16): if the BullMQ lock is lost mid-producer-call,
+  // runWithLockHeartbeat aborts lockSignal → we abort this fetch immediately so
+  // the producer POST cancels instead of the invocation running as a zombie
+  // parallel to the reclaim. Whichever fires first (timeout or lock-loss) wins.
+  const onLockLost = () => ctrl.abort();
+  if (lockSignal) {
+    if (lockSignal.aborted) ctrl.abort();
+    else lockSignal.addEventListener('abort', onLockLost, { once: true });
+  }
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -141,6 +149,7 @@ async function executeProducerDirective(directive: CascadeStepResponse): Promise
     return { data, status: res.status };
   } finally {
     clearTimeout(timer);
+    if (lockSignal) lockSignal.removeEventListener('abort', onLockLost);
   }
 }
 
@@ -170,28 +179,22 @@ export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
     await _log('info', 'gltv_cascade_tick_started', baseCtx,
       `Worker picked up cascade tick for DubbingApiJob ${dubbing_api_job_id} (attempt ${job.attemptsMade + 1}).`);
 
-    let heartbeatActive = true;
-    let heartbeatTicks = 0;
-    const heartbeat = (async () => {
-      while (heartbeatActive) {
-        await new Promise(r => setTimeout(r, HEARTBEAT_MS));
-        if (!heartbeatActive) break;
-        try {
-          await job.extendLock(job.token!, 30_000);
-          heartbeatTicks++;
-        } catch (hbErr) {
-          console.warn(`[bullmq:gltv-cascade] heartbeat_lock_extend_failed job=${job.id} reason=${String((hbErr as Error)?.message || hbErr).slice(0, 200)}`);
-        }
-      }
-    })();
-
+    // runWithLockHeartbeat (base44-client) owns the lock-renewal loop AND aborts
+    // the in-flight brain/producer call the instant the BullMQ lock is lost.
+    // This closes the unbounded active/reclaim zombie loop root-caused on the
+    // GLTV cold-start (run 6a310a7b…, chunk 2701): a hung invocation kept
+    // running parallel to BullMQ's stalled-reclaim, never terminalising, so the
+    // job looped `active` forever and wedged the cascade. See the
+    // runWithLockHeartbeat header for the full mechanism + SOC 2 rationale.
     try {
+      return await runWithLockHeartbeat(job, async (signal) => {
       // ─── 1. DECIDE: ask the brain what to do next ──────────────────
       let step: CascadeStepResponse = await invokeBase44Function<CascadeStepResponse>({
         fn: 'gltvCascadeWorkerStep',
         authToken: auth_token,
         payload: { dubbing_api_job_id, project_id, request_id },
         timeoutMs: FUNCTION_CALL_TIMEOUT_MS,
+        signal,
       });
 
       // ─── 2. call_producer: relay the producer call, then RECORD ────
@@ -225,7 +228,7 @@ export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
           contract: step.expected_result_contract,
         }, `Brain directive: call producer ${step.producer_fn} for phase ${step.phase}.`);
 
-        const producerResp = await executeProducerDirective(step);
+        const producerResp = await executeProducerDirective(step, signal);
         const directivePhase = step.phase; // pin before `step` is reassigned by RECORD
 
         await _log('info', 'gltv_cascade_producer_done', {
@@ -251,6 +254,7 @@ export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
             },
           },
           timeoutMs: FUNCTION_CALL_TIMEOUT_MS,
+          signal,
         });
 
         await _log('info', 'gltv_cascade_record_done', {
@@ -293,7 +297,7 @@ export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
       // re-enqueues a fresh tick when the API caller approves.
       if (step.action === 'await_review') {
         await _log('info', 'gltv_cascade_awaiting_review', {
-          ...baseCtx, total_duration_ms: Date.now() - t0, heartbeat_ticks: heartbeatTicks,
+          ...baseCtx, total_duration_ms: Date.now() - t0,
         }, 'Cascade parked at awaiting_review (checkpoint mode) — exiting until approval.');
         return { ok: true, action: 'await_review', status: step.status, duration_ms: Date.now() - t0 };
       }
@@ -302,29 +306,30 @@ export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
       await _log('info', 'gltv_cascade_done', {
         ...baseCtx,
         total_duration_ms: Date.now() - t0,
-        heartbeat_ticks: heartbeatTicks,
         status: step.status,
         already_terminal: !!step.already_terminal,
       }, `Cascade terminal (status=${step.status ?? '?'}).`);
 
       return step.result ?? { ok: true, action: 'done', status: step.status, duration_ms: Date.now() - t0 };
+      }); // end runWithLockHeartbeat body
     } catch (err) {
       const e = err as Error;
-      console.error(`[bullmq:gltv-cascade] gltv_cascade_failure job=${job.id} dubbing_api_job=${dubbing_api_job_id} attempt=${job.attemptsMade + 1} duration_ms=${Date.now() - t0} error_kind=${e.name} message=${String(e.message || '').slice(0, 500)}`);
-      if (e.stack) {
+      const lockLost = e instanceof WorkerLockLostError;
+      console.error(`[bullmq:gltv-cascade] ${lockLost ? 'gltv_cascade_lock_lost' : 'gltv_cascade_failure'} job=${job.id} dubbing_api_job=${dubbing_api_job_id} attempt=${job.attemptsMade + 1} duration_ms=${Date.now() - t0} error_kind=${e.name} message=${String(e.message || '').slice(0, 500)}`);
+      if (e.stack && !lockLost) {
         console.error(`[bullmq:gltv-cascade] stack: ${e.stack.split('\n').slice(0, 5).join(' | ')}`);
       }
-      await _log('error', 'gltv_cascade_failed', {
+      await _log(lockLost ? 'warn' : 'error', lockLost ? 'gltv_cascade_lock_lost' : 'gltv_cascade_failed', {
         ...baseCtx,
         total_duration_ms: Date.now() - t0,
-        heartbeat_ticks: heartbeatTicks,
-        error_kind: e.name,
+        error_kind: lockLost ? 'lock_lost' : e.name,
       }, e.message);
+      // Re-throw so BullMQ owns the SINGLE reclaim. A lock-loss abort is a clean
+      // exit of THIS tick, not a real failure — the brain is the sole status
+      // writer and every step is idempotent/resumable, so the reclaim (or
+      // watchdogGltvCascade) re-runs the tick exactly once with no double-write.
       console.error(`[bullmq:gltv-cascade] throwing_to_bullmq job=${job.id} attempt=${job.attemptsMade + 1} — BullMQ will retry or DLQ per GLTV_CASCADE_JOB_OPTIONS; watchdogGltvCascade resumes a stalled cascade.`);
       throw err;
-    } finally {
-      heartbeatActive = false;
-      await heartbeat.catch(() => {});
     }
   };
 }
