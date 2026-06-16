@@ -171,21 +171,28 @@ export async function processTranscriptImport(job: Job<TranscriptImportJobData>)
     return lastStep.result ?? { ok: true, phase: 'done', tick_count: tickCount };
   } catch (err) {
     const e = err as Error;
+    // Capture name/stack/message BEFORE the instanceof narrowing below. TS
+    // narrows `e` to `never` in the false-branch of a ternary keyed on
+    // `instanceof` a subclass that adds no members (WorkerLockLostError), so
+    // reading e.name inside such a ternary errors (TS2339).
+    const errName = e.name;
+    const errStack = e.stack;
+    const errMessage = e.message;
     // WorkerLockLostError = clean reclaim exit (the heartbeat aborted us because
     // BullMQ took the job), NOT a real failure. Log warn + re-throw so the SINGLE
     // BullMQ reclaim owns the re-run — transcriptImportWorkerStep is idempotent +
     // resumable (short-circuits on terminal run, resumes from checkpoint cursor),
     // so the reclaim re-runs safely. SOC 2 CC7.2.
     const lockLost = e instanceof WorkerLockLostError;
-    console.error(`[bullmq:transcript-import] transcript_import_failure job=${job.id} run=${transcript_import_run_id} attempt=${job.attemptsMade + 1} duration_ms=${Date.now() - t0} error_kind=${lockLost ? 'lock_lost' : e.name} message=${String(e.message || '').slice(0, 500)}`);
-    if (e.stack && !lockLost) {
-      console.error(`[bullmq:transcript-import] stack: ${e.stack.split('\n').slice(0, 5).join(' | ')}`);
+    console.error(`[bullmq:transcript-import] transcript_import_failure job=${job.id} run=${transcript_import_run_id} attempt=${job.attemptsMade + 1} duration_ms=${Date.now() - t0} error_kind=${lockLost ? 'lock_lost' : errName} message=${String(errMessage || '').slice(0, 500)}`);
+    if (errStack && !lockLost) {
+      console.error(`[bullmq:transcript-import] stack: ${errStack.split('\n').slice(0, 5).join(' | ')}`);
     }
     await _log(lockLost ? 'warn' : 'error', lockLost ? 'transcript_import_lock_lost' : 'transcript_import_failed', {
       ...baseCtx,
       total_duration_ms: Date.now() - t0,
-      error_kind: lockLost ? 'lock_lost' : e.name,
-    }, e.message);
+      error_kind: lockLost ? 'lock_lost' : errName,
+    }, errMessage);
     console.error(`[bullmq:transcript-import] throwing_to_bullmq job=${job.id} attempt=${job.attemptsMade + 1} — BullMQ will retry or DLQ per default policy.`);
     throw err;
   }
