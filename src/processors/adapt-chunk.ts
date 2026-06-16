@@ -66,12 +66,16 @@ export async function processAdaptChunk(job: Job<AdaptChunkJobData>) {
   } catch (err) {
     const e = err as Error;
     const lockLost = e instanceof WorkerLockLostError;
+    // Read off the un-narrowed Error — the instanceof check narrows the false
+    // branch to `never` (WorkerLockLostError is structurally identical to Error).
+    const errName: string = e.name;
+    const errMessage: string = e.message;
     await logEvent({
       function_name: 'bullmq:adapt-chunk',
       level: lockLost ? 'warn' : 'error',
       event: lockLost ? 'adapt_chunk_lock_lost' : 'adapt_chunk_failed',
-      message: e.message,
-      error_kind: lockLost ? 'lock_lost' : e.name,
+      message: errMessage,
+      error_kind: lockLost ? 'lock_lost' : errName,
       duration_ms: Date.now() - t0,
       context: {
         project_id, adaptation_run_id, chunk_key, chunk_index,
