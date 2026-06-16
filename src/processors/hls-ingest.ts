@@ -218,6 +218,12 @@ export async function processHlsIngest(job: Job<HlsIngestJobData>) {
     throw new Error(`hls-ingest: phase machine exceeded ${MAX_PHASE_ITERATIONS} iterations (last phase: ${lastPhase ?? 'none'})`);
   } catch (err) {
     const e = err as Error;
+    // Capture name/message BEFORE the instanceof narrowing below. TS narrows
+    // `e` to `never` in the false-branch of a ternary keyed on `instanceof` a
+    // subclass that adds no members (WorkerLockLostError), so reading e.name
+    // inside such a ternary errors (TS2339).
+    const errName = e.name;
+    const errMessage = e.message;
     // WorkerLockLostError = clean reclaim exit (heartbeat aborted us). Logged as
     // warn, not a real failure. We re-throw so BullMQ records the attempt; with
     // no native reclaim on this queue, the HLS watchdog owns dead-pod recovery.
@@ -226,8 +232,8 @@ export async function processHlsIngest(job: Job<HlsIngestJobData>) {
       function_name: 'bullmq:hls-ingest',
       level: lockLost ? 'warn' : 'error',
       event: lockLost ? 'hls_ingest_lock_lost' : 'hls_ingest_failed',
-      message: e.message,
-      error_kind: lockLost ? 'lock_lost' : e.name,
+      message: errMessage,
+      error_kind: lockLost ? 'lock_lost' : errName,
       duration_ms: Date.now() - t0,
       context: {
         project_id, hls_ingest_run_id, user_email, request_id,
