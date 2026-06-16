@@ -36,13 +36,12 @@
 
 import type { Job } from 'bullmq';
 import type { CCFormatRunJobData } from '../../shared/queue-contracts.js';
-import { invokeBase44Function, logEvent } from '../base44-client.js';
+import { invokeBase44Function, logEvent, runWithLockHeartbeat, WorkerLockLostError } from '../base44-client.js';
 
 // The function ceiling on Base44 is 3 min. Give it 5 min of network slack
 // for slow cold starts; if the function genuinely hangs longer than that,
 // BullMQ retries.
 const FUNCTION_CALL_TIMEOUT_MS = 5 * 60 * 1000;
-const HEARTBEAT_MS = 15_000;
 
 interface StepResponse {
   action: 'done';
@@ -107,23 +106,11 @@ export async function processCCFormatRun(job: Job<CCFormatRunJobData>) {
   await _log('info', 'cc_format_run_started', baseCtx,
     `Worker picked up job ${job.id} for format_run ${format_run_id} (attempt ${job.attemptsMade + 1}).`);
 
-  // ─── Heartbeat — keeps job lock alive during the long function call ───
-  let heartbeatActive = true;
-  let heartbeatTicks = 0;
-  const heartbeat = (async () => {
-    while (heartbeatActive) {
-      await new Promise(r => setTimeout(r, HEARTBEAT_MS));
-      if (!heartbeatActive) break;
-      try {
-        await job.extendLock(job.token!, 30_000);
-        heartbeatTicks++;
-      } catch (hbErr) {
-        // Lock may have already advanced (job in terminal state) — not fatal.
-        console.warn(`[bullmq:cc-format-run] heartbeat_lock_extend_failed job=${job.id} reason=${String((hbErr as Error)?.message || hbErr).slice(0, 200)}`);
-      }
-    }
-  })();
-
+  // ZOMBIE-KILL (2026-06-16): runWithLockHeartbeat owns the lock-renewal loop
+  // AND aborts the in-flight Base44 call the instant the BullMQ lock is lost
+  // (extendLock throws = reclaim). Replaces the old swallow-the-error heartbeat
+  // that let a pod-recycle orphan run as a zombie holding worker concurrency
+  // forever. SOC 2 CC7.2.
   try {
     // INSTRUMENTATION (2026-05-19) — function-call START lifecycle log.
     const fnT0 = Date.now();
@@ -137,12 +124,15 @@ export async function processCCFormatRun(job: Job<CCFormatRunJobData>) {
     // plus the platform gateway 403/429 internal retry envelope (see
     // base44-client.ts). If the function genuinely hangs past timeoutMs,
     // the fetch aborts and this await rejects — caught below.
-    const step: StepResponse = await invokeBase44Function<StepResponse>({
-      fn: 'ccFormatRunWorkerStep',
-      authToken: auth_token,
-      payload: { project_id, format_run_id },
-      timeoutMs: FUNCTION_CALL_TIMEOUT_MS,
-    });
+    const step: StepResponse = await runWithLockHeartbeat<StepResponse>(job, (signal) =>
+      invokeBase44Function<StepResponse>({
+        fn: 'ccFormatRunWorkerStep',
+        authToken: auth_token,
+        payload: { project_id, format_run_id },
+        timeoutMs: FUNCTION_CALL_TIMEOUT_MS,
+        signal,
+      }),
+    );
 
     const fnDurationMs = Date.now() - fnT0;
 
@@ -165,7 +155,6 @@ export async function processCCFormatRun(job: Job<CCFormatRunJobData>) {
       ...baseCtx,
       total_duration_ms: Date.now() - t0,
       function_duration_ms: fnDurationMs,
-      heartbeat_ticks: heartbeatTicks,
       phase: step.phase,
       already_terminal: !!step.already_terminal,
       result: step.result,
@@ -174,27 +163,28 @@ export async function processCCFormatRun(job: Job<CCFormatRunJobData>) {
     return step.result ?? { ok: true, phase: step.phase };
   } catch (err) {
     const e = err as Error;
+    // WorkerLockLostError = clean reclaim exit (the heartbeat aborted us because
+    // BullMQ took the job), NOT a real failure. Log warn + re-throw so the SINGLE
+    // BullMQ reclaim owns the re-run — ccFormatRunWorkerStep short-circuits on a
+    // terminal CCFormatRun, so the reclaim re-runs safely. SOC 2 CC7.2.
+    const lockLost = e instanceof WorkerLockLostError;
     // INSTRUMENTATION (2026-05-19) — function-call FAILURE lifecycle log.
     // First channel: console.error (Railway-guaranteed evidence trail).
-    console.error(`[bullmq:cc-format-run] cc_format_run_function_call_failure job=${job.id} format_run=${format_run_id} attempt=${job.attemptsMade + 1} duration_ms=${Date.now() - t0} error_kind=${e.name} message=${String(e.message || '').slice(0, 500)}`);
-    if (e.stack) {
+    console.error(`[bullmq:cc-format-run] cc_format_run_function_call_failure job=${job.id} format_run=${format_run_id} attempt=${job.attemptsMade + 1} duration_ms=${Date.now() - t0} error_kind=${lockLost ? 'lock_lost' : e.name} message=${String(e.message || '').slice(0, 500)}`);
+    if (e.stack && !lockLost) {
       console.error(`[bullmq:cc-format-run] stack: ${e.stack.split('\n').slice(0, 5).join(' | ')}`);
     }
     // Second channel: StructuredLog (best-effort — may itself fail under
     // gateway storm, which is exactly why the console.error above exists).
-    await _log('error', 'cc_format_run_failed', {
+    await _log(lockLost ? 'warn' : 'error', lockLost ? 'cc_format_run_lock_lost' : 'cc_format_run_failed', {
       ...baseCtx,
       total_duration_ms: Date.now() - t0,
-      heartbeat_ticks: heartbeatTicks,
-      error_kind: e.name,
+      error_kind: lockLost ? 'lock_lost' : e.name,
     }, e.message);
     // INSTRUMENTATION (2026-05-19) — explicit THROW lifecycle log so the
     // BullMQ retry decision is auditable. We re-throw to let BullMQ apply
     // its DEFAULT_JOB_OPTIONS retry policy (3 attempts → DLQ).
     console.error(`[bullmq:cc-format-run] cc_format_run_throwing_to_bullmq job=${job.id} attempt=${job.attemptsMade + 1}/3 — BullMQ will retry or DLQ per default policy.`);
     throw err;
-  } finally {
-    heartbeatActive = false;
-    await heartbeat.catch(() => {});
   }
 }
