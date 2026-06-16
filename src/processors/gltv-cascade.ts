@@ -315,15 +315,21 @@ export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
     } catch (err) {
       const e = err as Error;
       const lockLost = e instanceof WorkerLockLostError;
-      console.error(`[bullmq:gltv-cascade] ${lockLost ? 'gltv_cascade_lock_lost' : 'gltv_cascade_failure'} job=${job.id} dubbing_api_job=${dubbing_api_job_id} attempt=${job.attemptsMade + 1} duration_ms=${Date.now() - t0} error_kind=${e.name} message=${String(e.message || '').slice(0, 500)}`);
-      if (e.stack && !lockLost) {
-        console.error(`[bullmq:gltv-cascade] stack: ${e.stack.split('\n').slice(0, 5).join(' | ')}`);
+      // Read .name/.stack/.message off the un-narrowed Error. (Narrowing `e` via
+      // `instanceof WorkerLockLostError` makes the false branch `never` because
+      // WorkerLockLostError is structurally identical to Error.)
+      const errName: string = e.name;
+      const errStack: string | undefined = e.stack;
+      const errMessage: string = e.message;
+      console.error(`[bullmq:gltv-cascade] ${lockLost ? 'gltv_cascade_lock_lost' : 'gltv_cascade_failure'} job=${job.id} dubbing_api_job=${dubbing_api_job_id} attempt=${job.attemptsMade + 1} duration_ms=${Date.now() - t0} error_kind=${errName} message=${String(errMessage || '').slice(0, 500)}`);
+      if (errStack && !lockLost) {
+        console.error(`[bullmq:gltv-cascade] stack: ${errStack.split('\n').slice(0, 5).join(' | ')}`);
       }
       await _log(lockLost ? 'warn' : 'error', lockLost ? 'gltv_cascade_lock_lost' : 'gltv_cascade_failed', {
         ...baseCtx,
         total_duration_ms: Date.now() - t0,
-        error_kind: lockLost ? 'lock_lost' : e.name,
-      }, e.message);
+        error_kind: lockLost ? 'lock_lost' : errName,
+      }, errMessage);
       // Re-throw so BullMQ owns the SINGLE reclaim. A lock-loss abort is a clean
       // exit of THIS tick, not a real failure — the brain is the sole status
       // writer and every step is idempotent/resumable, so the reclaim (or
