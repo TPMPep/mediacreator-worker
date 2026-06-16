@@ -94,7 +94,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-06-16-worker-lock-heartbeat-zombie-kill-2',
+  build_tag: '2026-06-16-single-shot-zombie-kill-sweep-4',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -223,8 +223,17 @@ const workers: Worker[] = [
     ...baseOpts, concurrency: env.CONCURRENCY_HLS_INGEST,
   }),
   // CC Creation rules-engine re-apply pipeline (single-shot, ISOLATED to CC).
+  // STALLED-JOB RECLAIM (2026-06-16): SAFE to native-reclaim because
+  // ccFormatRunWorkerStep short-circuits on a terminal CCFormatRun (idempotent)
+  // and the processor now runs its call inside runWithLockHeartbeat (a lost lock
+  // aborts the prior invocation, so a reclaim never runs parallel to a zombie).
+  // A dead pod self-heals on BullMQ's sub-minute clock instead of waiting for
+  // watchdogCCFormatRuns. Mirrors CC_CUE_SUPERSEDE. SOC 2 CC7.2.
   new Worker(QUEUE_NAMES.CC_FORMAT_RUN, processCCFormatRun, {
-    ...baseOpts, concurrency: env.CONCURRENCY_CC_FORMAT_RUN,
+    ...baseOpts,
+    concurrency: env.CONCURRENCY_CC_FORMAT_RUN,
+    stalledInterval: 30_000,
+    maxStalledCount: 2,
   }),
   // v2 proxy-generation pipeline (replaces the legacy fire-and-forget
   // /generate-proxy + webhook callback architecture). Concurrency held at 1
@@ -288,8 +297,18 @@ const workers: Worker[] = [
   // budget, not parallelism — bumping higher would amplify 429 pressure
   // without shortening any single run. SOC 2 CC7.2 — resumable: a pod death
   // mid-stage re-creates ZERO already-staged rows (checkpoint tracks it).
+  // STALLED-JOB RECLAIM (2026-06-16): SAFE to native-reclaim because
+  // transcriptImportWorkerStep is idempotent + resumable (short-circuits on a
+  // terminal TranscriptImportRun, resumes staging from checkpoint.stage_cursor)
+  // and the processor now runs every call inside runWithLockHeartbeat (a lost
+  // lock aborts the prior invocation, so a reclaim never runs parallel to a
+  // zombie). A dead pod self-heals on BullMQ's sub-minute clock instead of
+  // waiting for watchdogTranscriptImportRuns. Mirrors CC_CUE_SUPERSEDE. SOC 2 CC7.2.
   new Worker(QUEUE_NAMES.TRANSCRIPT_IMPORT, processTranscriptImport, {
-    ...baseOpts, concurrency: env.CONCURRENCY_TRANSCRIPT_IMPORT,
+    ...baseOpts,
+    concurrency: env.CONCURRENCY_TRANSCRIPT_IMPORT,
+    stalledInterval: 30_000,
+    maxStalledCount: 2,
   }),
   // GLTV API cascade (Phase 2, 2026-06-12). ISOLATED lane — default 5
   // concurrent cascades (GLTV_CASCADE_CONCURRENCY) so an API burst can never
