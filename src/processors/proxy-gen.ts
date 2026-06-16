@@ -50,7 +50,7 @@
 
 import { UnrecoverableError, type Job } from 'bullmq';
 import type { ProxyGenJobData } from '../../shared/queue-contracts.js';
-import { invokeBase44Function, logEvent } from '../base44-client.js';
+import { invokeBase44Function, logEvent, runWithLockHeartbeat, WorkerLockLostError } from '../base44-client.js';
 
 // Per-call budgets.
 const FINALIZER_TIMEOUT_MS = 90_000;
@@ -59,8 +59,7 @@ const FINALIZER_TIMEOUT_MS = 90_000;
 // The legacy code held a 4hr ffmpeg ceiling; we hold the HTTP call at 3.5hr
 // to give Railway some headroom for the S3 upload after ffmpeg returns.
 const RAILWAY_CALL_TIMEOUT_MS = 3.5 * 60 * 60 * 1000;
-// Lock heartbeat — Railway calls dwarf BullMQ's 30s default stalled detection.
-const HEARTBEAT_MS = 15_000;
+// Lock heartbeat cadence is owned by runWithLockHeartbeat (base44-client.ts).
 
 interface RailwayProxyResponse {
   proxy_video_key: string;
@@ -73,27 +72,55 @@ interface RailwayProxyResponse {
 
 async function callRailway(
   data: ProxyGenJobData,
-  signal: AbortSignal,
+  timeoutSignal: AbortSignal,
+  lockSignal?: AbortSignal,
 ): Promise<RailwayProxyResponse> {
+  // ZOMBIE-KILL: fetch aborts on EITHER the timeout signal OR a lost-lock
+  // signal. A lost lock cancels the in-flight transcode fetch immediately so
+  // the orphaned invocation exits instead of holding the worker slot. NO native
+  // reclaim on this queue (index.ts) — a reclaim would start a SECOND ffmpeg
+  // transcode (double compute + double S3 write). The transcode keeps running
+  // Railway-side; we just stop being a zombie. watchdogProxyGeneration owns
+  // dead-pod recovery. SOC 2 CC7.2.
+  const ctrl = new AbortController();
+  let lockLost = false;
+  const onTimeout = () => ctrl.abort();
+  const onLock = () => { lockLost = true; ctrl.abort(); };
+  if (timeoutSignal.aborted) ctrl.abort();
+  else timeoutSignal.addEventListener('abort', onTimeout, { once: true });
+  if (lockSignal) {
+    if (lockSignal.aborted) { lockLost = true; ctrl.abort(); }
+    else lockSignal.addEventListener('abort', onLock, { once: true });
+  }
+
   const url = `${data.railway_url.replace(/\/+$/, '')}/generate-proxy-sync`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${data.railway_api_key}`,
-      'X-Request-Id': data.request_id,
-    },
-    body: JSON.stringify({
-      project_id: data.project_id,
-      source_url: data.source_url,
-      bucket: data.bucket,
-      region: data.region,
-      proxy_video_key: data.proxy_video_key,
-      proxy_audio_key: data.proxy_audio_key,
-      credential_secret_prefix: data.credential_secret_prefix || '',
-    }),
-    signal,
-  });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${data.railway_api_key}`,
+        'X-Request-Id': data.request_id,
+      },
+      body: JSON.stringify({
+        project_id: data.project_id,
+        source_url: data.source_url,
+        bucket: data.bucket,
+        region: data.region,
+        proxy_video_key: data.proxy_video_key,
+        proxy_audio_key: data.proxy_audio_key,
+        credential_secret_prefix: data.credential_secret_prefix || '',
+      }),
+      signal: ctrl.signal,
+    });
+  } catch (fetchErr) {
+    if (lockLost) throw new WorkerLockLostError('proxy-gen:railway');
+    throw fetchErr;
+  } finally {
+    timeoutSignal.removeEventListener('abort', onTimeout);
+    if (lockSignal) lockSignal.removeEventListener('abort', onLock);
+  }
 
   // Bad input → don't retry. ffmpeg non-zero exit, malformed source media,
   // missing S3 keys: all deterministic, retry wastes another 5-15min of
@@ -138,21 +165,8 @@ export async function processProxyGen(job: Job<ProxyGenJobData>) {
     );
   }
 
-  // ─── Heartbeat — keeps job lock alive during the long Railway call ───
-  let heartbeatActive = true;
-  const heartbeat = (async () => {
-    while (heartbeatActive) {
-      await new Promise((r) => setTimeout(r, HEARTBEAT_MS));
-      if (!heartbeatActive) break;
-      try {
-        await job.extendLock(job.token!, 30_000);
-      } catch {
-        /* lock may have already advanced */
-      }
-    }
-  })();
-
-  // AbortController so the heartbeat can abort the Railway fetch on shutdown.
+  // Timeout controller for the Railway fetch (callRailway also links the
+  // lock-loss signal from runWithLockHeartbeat below so a lost lock aborts it).
   const ctrl = new AbortController();
   const railwayTimer = setTimeout(() => ctrl.abort(), RAILWAY_CALL_TIMEOUT_MS);
 
@@ -171,7 +185,11 @@ export async function processProxyGen(job: Job<ProxyGenJobData>) {
     });
 
     // ─── 1. Long synchronous call to Railway ───
-    const railwayRes = await callRailway(data, ctrl.signal);
+    // runWithLockHeartbeat extends the BullMQ lock every 15s AND, on lost lock,
+    // aborts the transcode fetch (via the signal it passes to callRailway).
+    const railwayRes = await runWithLockHeartbeat<RailwayProxyResponse>(job, (signal) =>
+      callRailway(data, ctrl.signal, signal),
+    );
 
     await logEvent({
       function_name: 'bullmq:proxy-gen',
@@ -188,19 +206,22 @@ export async function processProxyGen(job: Job<ProxyGenJobData>) {
     });
 
     // ─── 2. Finalize on Base44 — write proxy_status='ready' + keys ───
-    const finalizeRes = await invokeBase44Function<{ ok: boolean }>({
-      fn: 'proxyGenWorkerStep',
-      authToken: auth_token,
-      payload: {
-        project_id,
-        action: 'complete',
-        proxy_video_key: railwayRes.proxy_video_key,
-        proxy_audio_key: railwayRes.proxy_audio_key,
-        bytes_video: railwayRes.bytes_video || null,
-        bytes_audio: railwayRes.bytes_audio || null,
-      },
-      timeoutMs: FINALIZER_TIMEOUT_MS,
-    });
+    const finalizeRes = await runWithLockHeartbeat<{ ok: boolean }>(job, (signal) =>
+      invokeBase44Function<{ ok: boolean }>({
+        fn: 'proxyGenWorkerStep',
+        authToken: auth_token,
+        payload: {
+          project_id,
+          action: 'complete',
+          proxy_video_key: railwayRes.proxy_video_key,
+          proxy_audio_key: railwayRes.proxy_audio_key,
+          bytes_video: railwayRes.bytes_video || null,
+          bytes_audio: railwayRes.bytes_audio || null,
+        },
+        timeoutMs: FINALIZER_TIMEOUT_MS,
+        signal,
+      }),
+    );
 
     await logEvent({
       function_name: 'bullmq:proxy-gen',
@@ -223,6 +244,24 @@ export async function processProxyGen(job: Job<ProxyGenJobData>) {
     };
   } catch (err) {
     const e = err as Error;
+    // WorkerLockLostError = clean reclaim exit (heartbeat aborted us because the
+    // BullMQ lock was lost). It is NOT a real failure — we must NOT mark the
+    // Project proxy_status='failed' (the transcode may still be running Railway-
+    // side, and watchdogProxyGeneration owns dead-pod recovery). Log warn +
+    // re-throw so BullMQ records the attempt. SOC 2 CC7.2.
+    const lockLost = e instanceof WorkerLockLostError;
+    if (lockLost) {
+      await logEvent({
+        function_name: 'bullmq:proxy-gen',
+        level: 'warn',
+        event: 'proxy_gen_lock_lost',
+        message: e.message,
+        error_kind: 'lock_lost',
+        duration_ms: Date.now() - t0,
+        context: { project_id, user_email, request_id, attempts: job.attemptsMade + 1 },
+      });
+      throw err;
+    }
     const isUnrecoverable = e instanceof UnrecoverableError;
     const willRetry = !isUnrecoverable && job.attemptsMade + 1 < (job.opts.attempts ?? 1);
 
@@ -276,7 +315,5 @@ export async function processProxyGen(job: Job<ProxyGenJobData>) {
     throw err; // BullMQ retries per PROXY_GEN_JOB_OPTIONS, or DLQs.
   } finally {
     clearTimeout(railwayTimer);
-    heartbeatActive = false;
-    await heartbeat.catch(() => {});
   }
 }
