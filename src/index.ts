@@ -81,6 +81,14 @@ import { processTranscriptImport } from './processors/transcript-import.js';
 // Media Creator pipeline. Factory-built because the processor re-enqueues its
 // own next tick and needs a handle to the lazily-initialised queue registry.
 import { makeGltvCascadeProcessor } from './processors/gltv-cascade.js';
+// Simple Translation (SRT) async translate (2026-06-16). FULLY ISOLATED to the
+// Translation module — its own queue + concurrency lane; never shares state with
+// the AI-Dubbing translate pipeline. Moves the heavy bulk SRT translate out of
+// translateSrtProject's gateway-timeout window using a tick-resumable worker
+// step. Producer is Base44 fn `translateSrtProject` (mode='translate'); each
+// tick calls back into `srtTranslateWorkerStep` to translate ~120 cues; the
+// processor loops until the run finalizes.
+import { processSrtTranslate } from './processors/srt-translate.js';
 
 initSentry();
 
@@ -94,7 +102,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-06-16-zombie-kill-ts2339-fix-5',
+  build_tag: '2026-06-16-srt-translate-async-1',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -327,6 +335,24 @@ const workers: Worker[] = [
   new Worker(QUEUE_NAMES.GLTV_CASCADE, makeGltvCascadeProcessor(getQueue), {
     ...baseOpts,
     concurrency: env.CONCURRENCY_GLTV_CASCADE,
+    stalledInterval: 30_000,
+    maxStalledCount: 2,
+  }),
+  // Simple Translation (SRT) async translate (2026-06-16). ISOLATED lane —
+  // default 4 concurrent runs so a translation burst never starves any other
+  // pipeline. Each in-flight job loops srtTranslateWorkerStep ticks against ONE
+  // SimpleTranslationRun; between provider batches the slot is mostly idle.
+  // Bottleneck is the per-tick Base44 write budget, not parallelism.
+  // STALLED-JOB RECLAIM: SAFE to native-reclaim — srtTranslateWorkerStep is
+  // idempotent + resumable (short-circuits on a terminal run, resumes from
+  // checkpoint.cursor, translates 'pending' cues only) and every call runs
+  // inside runWithLockHeartbeat (a lost lock aborts the prior invocation, so a
+  // reclaim never runs parallel to a zombie). A dead pod self-heals on BullMQ's
+  // sub-minute clock instead of waiting for watchdogSimpleTranslationRuns.
+  // Mirrors CC_CUE_SUPERSEDE. SOC 2 CC7.2.
+  new Worker(QUEUE_NAMES.SRT_TRANSLATE, processSrtTranslate, {
+    ...baseOpts,
+    concurrency: env.CONCURRENCY_SRT_TRANSLATE,
     stalledInterval: 30_000,
     maxStalledCount: 2,
   }),
