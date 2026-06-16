@@ -37,15 +37,14 @@
 
 import type { Job } from 'bullmq';
 import type { HlsIngestJobData } from '../../shared/queue-contracts.js';
-import { invokeBase44Function, logEvent } from '../base44-client.js';
+import { invokeBase44Function, logEvent, runWithLockHeartbeat, WorkerLockLostError } from '../base44-client.js';
 
 // Per-tick budgets. Base44 fn aims for ≤45s; this is the network-side ceiling.
 const FUNCTION_CALL_TIMEOUT_MS = 90_000;
 // Railway remux ceiling: 15 min for a 90-min source with `-c copy` is generous.
 // If Railway exceeds this, we treat it as a hard failure and BullMQ retries.
 const RAILWAY_CALL_TIMEOUT_MS = 15 * 60 * 1000;
-// Lock heartbeat — Railway calls dwarf BullMQ's 30s default stalled-detection.
-const HEARTBEAT_MS = 15_000;
+// Lock heartbeat cadence is owned by runWithLockHeartbeat (base44-client.ts).
 // Safety: cap the number of phase-machine iterations we'll do in one job.
 // Real runs need 3 iterations (queued → codecs_validated → railway_dispatched
 // → done). 8 is a generous stuck-loop guard.
@@ -73,9 +72,24 @@ interface RailwayHlsIngestResponse {
   project_id?: string;
 }
 
-async function callRailway(railway: NonNullable<PhaseStepResponse['railway']>, requestId: string): Promise<RailwayHlsIngestResponse> {
+async function callRailway(
+  railway: NonNullable<PhaseStepResponse['railway']>,
+  requestId: string,
+  lockSignal?: AbortSignal,
+): Promise<RailwayHlsIngestResponse> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), RAILWAY_CALL_TIMEOUT_MS);
+  // ZOMBIE-KILL: link the lock-loss signal so a lost BullMQ lock cancels the
+  // in-flight remux fetch immediately (no waiting for the 15-min timeout) —
+  // the orphaned invocation exits instead of holding the worker slot. The
+  // Railway remux itself keeps running server-side, but we stop being a zombie
+  // here; no SECOND Railway job is ever started (no native reclaim on this queue).
+  let lockLost = false;
+  const onLockAbort = () => { lockLost = true; ctrl.abort(); };
+  if (lockSignal) {
+    if (lockSignal.aborted) { lockLost = true; ctrl.abort(); }
+    else lockSignal.addEventListener('abort', onLockAbort, { once: true });
+  }
   try {
     const res = await fetch(railway.url, {
       method: 'POST',
@@ -96,8 +110,12 @@ async function callRailway(railway: NonNullable<PhaseStepResponse['railway']>, r
       throw new Error(`railway /hls-ingest → malformed response: ${JSON.stringify(json).slice(0, 300)}`);
     }
     return json;
+  } catch (fetchErr) {
+    if (lockLost) throw new WorkerLockLostError('hls-ingest:railway');
+    throw fetchErr;
   } finally {
     clearTimeout(timer);
+    if (lockSignal) lockSignal.removeEventListener('abort', onLockAbort);
   }
 }
 
@@ -109,28 +127,28 @@ export async function processHlsIngest(job: Job<HlsIngestJobData>) {
     throw new Error('hls-ingest: missing auth_token (job from a stale schema — re-enqueue required)');
   }
 
-  // ─── Heartbeat — keeps job lock alive during the long Railway call ───
-  let heartbeatActive = true;
-  const heartbeat = (async () => {
-    while (heartbeatActive) {
-      await new Promise(r => setTimeout(r, HEARTBEAT_MS));
-      if (!heartbeatActive) break;
-      try { await job.extendLock(job.token!, 30_000); } catch { /* lock may have already advanced */ }
-    }
-  })();
-
+  // ZOMBIE-KILL (2026-06-16): runWithLockHeartbeat owns the lock-renewal loop
+  // AND aborts the in-flight call (Base44 tick OR Railway remux fetch) the
+  // instant the BullMQ lock is lost — the orphaned invocation exits instead of
+  // running as a zombie holding a worker slot. NO native stalled reclaim on this
+  // queue (see index.ts): a second invocation would start a SECOND Railway remux
+  // (double ffmpeg + double S3 write). Genuinely-dead-pod recovery stays with the
+  // HLS watchdog, never with double-compute. SOC 2 CC7.2.
   try {
     let carry: unknown = undefined;
     let lastPhase: string | undefined;
 
     for (let i = 0; i < MAX_PHASE_ITERATIONS; i++) {
       // 1. Tick the phase machine on Base44.
-      const step = await invokeBase44Function<PhaseStepResponse>({
-        fn: 'hlsIngestWorkerStep',
-        authToken: auth_token,
-        payload: { project_id, hls_ingest_run_id, carry },
-        timeoutMs: FUNCTION_CALL_TIMEOUT_MS,
-      });
+      const step = await runWithLockHeartbeat<PhaseStepResponse>(job, (signal) =>
+        invokeBase44Function<PhaseStepResponse>({
+          fn: 'hlsIngestWorkerStep',
+          authToken: auth_token,
+          payload: { project_id, hls_ingest_run_id, carry },
+          timeoutMs: FUNCTION_CALL_TIMEOUT_MS,
+          signal,
+        }),
+      );
 
       lastPhase = step.phase;
 
@@ -180,7 +198,9 @@ export async function processHlsIngest(job: Job<HlsIngestJobData>) {
             output_key: step.railway.body?.output_key,
           },
         });
-        const railwayRes = await callRailway(step.railway, request_id);
+        const railwayRes = await runWithLockHeartbeat<RailwayHlsIngestResponse>(job, (signal) =>
+          callRailway(step.railway!, request_id, signal),
+        );
         carry = { railway_response: railwayRes };
         continue;
       }
@@ -198,12 +218,16 @@ export async function processHlsIngest(job: Job<HlsIngestJobData>) {
     throw new Error(`hls-ingest: phase machine exceeded ${MAX_PHASE_ITERATIONS} iterations (last phase: ${lastPhase ?? 'none'})`);
   } catch (err) {
     const e = err as Error;
+    // WorkerLockLostError = clean reclaim exit (heartbeat aborted us). Logged as
+    // warn, not a real failure. We re-throw so BullMQ records the attempt; with
+    // no native reclaim on this queue, the HLS watchdog owns dead-pod recovery.
+    const lockLost = e instanceof WorkerLockLostError;
     await logEvent({
       function_name: 'bullmq:hls-ingest',
-      level: 'error',
-      event: 'hls_ingest_failed',
+      level: lockLost ? 'warn' : 'error',
+      event: lockLost ? 'hls_ingest_lock_lost' : 'hls_ingest_failed',
       message: e.message,
-      error_kind: e.name,
+      error_kind: lockLost ? 'lock_lost' : e.name,
       duration_ms: Date.now() - t0,
       context: {
         project_id, hls_ingest_run_id, user_email, request_id,
@@ -211,8 +235,5 @@ export async function processHlsIngest(job: Job<HlsIngestJobData>) {
       },
     });
     throw err; // BullMQ will retry per DEFAULT_JOB_OPTIONS (3 attempts → DLQ).
-  } finally {
-    heartbeatActive = false;
-    await heartbeat.catch(() => {});
   }
 }
