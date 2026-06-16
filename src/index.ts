@@ -94,7 +94,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-06-15-gltv-cascade-record-directive-chain',
+  build_tag: '2026-06-16-worker-lock-heartbeat-zombie-kill',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -297,8 +297,19 @@ const workers: Worker[] = [
   // transition against ONE DubbingApiJob; the processor re-enqueues its own
   // next tick (10s delay), so the slot is idle between ticks. Built via a
   // factory so it can re-enqueue through the hoisted getQueue handle.
+  // STALLED-JOB RECLAIM (2026-06-16): a cascade tick whose pod is killed mid-
+  // flight (Railway recycle / OOM) leaves a BullMQ job wedged `active` with no
+  // owner. Without these settings BullMQ never reclaims it and the cascade
+  // stalls until watchdogGltvCascade fires. Now SAFE to native-reclaim because
+  // (a) the tick is idempotent + resumable (brain is the sole status writer) and
+  // (b) runWithLockHeartbeat aborts the prior invocation the instant its lock is
+  // lost, so a reclaim never runs parallel to a zombie. SOC 2 CC7.2 — a dead pod
+  // can no longer strand a cascade. Mirrors AIREWRITE_CHUNK's reclaim posture.
   new Worker(QUEUE_NAMES.GLTV_CASCADE, makeGltvCascadeProcessor(getQueue), {
-    ...baseOpts, concurrency: env.CONCURRENCY_GLTV_CASCADE,
+    ...baseOpts,
+    concurrency: env.CONCURRENCY_GLTV_CASCADE,
+    stalledInterval: 30_000,
+    maxStalledCount: 2,
   }),
 ];
 
