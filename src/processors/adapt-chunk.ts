@@ -14,9 +14,8 @@
 
 import type { Job } from 'bullmq';
 import type { AdaptChunkJobData } from '../../shared/queue-contracts.js';
-import { invokeBase44Function, logEvent } from '../base44-client.js';
+import { invokeBase44Function, logEvent, runWithLockHeartbeat, WorkerLockLostError } from '../base44-client.js';
 
-const HEARTBEAT_MS = 15_000;
 const CHUNK_TIMEOUT_MS = 90_000;
 
 export async function processAdaptChunk(job: Job<AdaptChunkJobData>) {
@@ -31,30 +30,26 @@ export async function processAdaptChunk(job: Job<AdaptChunkJobData>) {
     throw new Error('adapt-chunk: missing auth_token (re-enqueue required)');
   }
 
-  let heartbeatActive = true;
-  const heartbeat = (async () => {
-    while (heartbeatActive) {
-      await new Promise(r => setTimeout(r, HEARTBEAT_MS));
-      if (!heartbeatActive) break;
-      try { await job.extendLock(job.token!, 30_000); } catch { /* swallow */ }
-    }
-  })();
-
   try {
-    const result = await invokeBase44Function({
-      fn: 'adaptChunk',
-      authToken: auth_token,
-      payload: {
-        project_id,
-        adaptation_run_id,
-        chunk_key,
-        chunk_index,
-        source_segment_ids,
-        adaptation_segment_ids,
-        request_id,
-      },
-      timeoutMs: CHUNK_TIMEOUT_MS,
-    });
+    // runWithLockHeartbeat owns the lock-renewal loop and aborts the invocation
+    // the instant the BullMQ lock is lost — no zombie parallel to a reclaim.
+    const result = await runWithLockHeartbeat(job, (signal) =>
+      invokeBase44Function({
+        fn: 'adaptChunk',
+        authToken: auth_token,
+        payload: {
+          project_id,
+          adaptation_run_id,
+          chunk_key,
+          chunk_index,
+          source_segment_ids,
+          adaptation_segment_ids,
+          request_id,
+        },
+        timeoutMs: CHUNK_TIMEOUT_MS,
+        signal,
+      }),
+    );
 
     await logEvent({
       function_name: 'bullmq:adapt-chunk',
@@ -70,12 +65,13 @@ export async function processAdaptChunk(job: Job<AdaptChunkJobData>) {
     return result;
   } catch (err) {
     const e = err as Error;
+    const lockLost = e instanceof WorkerLockLostError;
     await logEvent({
       function_name: 'bullmq:adapt-chunk',
-      level: 'error',
-      event: 'adapt_chunk_failed',
+      level: lockLost ? 'warn' : 'error',
+      event: lockLost ? 'adapt_chunk_lock_lost' : 'adapt_chunk_failed',
       message: e.message,
-      error_kind: e.name,
+      error_kind: lockLost ? 'lock_lost' : e.name,
       duration_ms: Date.now() - t0,
       context: {
         project_id, adaptation_run_id, chunk_key, chunk_index,
@@ -85,8 +81,5 @@ export async function processAdaptChunk(job: Job<AdaptChunkJobData>) {
       },
     });
     throw err;
-  } finally {
-    heartbeatActive = false;
-    await heartbeat.catch(() => {});
   }
 }
