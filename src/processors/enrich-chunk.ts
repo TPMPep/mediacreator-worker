@@ -21,9 +21,8 @@
 
 import type { Job } from 'bullmq';
 import type { EnrichChunkJobData } from '../../shared/queue-contracts.js';
-import { invokeBase44Function, logEvent } from '../base44-client.js';
+import { invokeBase44Function, logEvent, runWithLockHeartbeat, WorkerLockLostError } from '../base44-client.js';
 
-const HEARTBEAT_MS = 15_000;
 // Chunks can take up to ~60s on master tier (enrichment + verification +
 // canon resolution). 90s timeout is the network ceiling.
 const CHUNK_TIMEOUT_MS = 90_000;
@@ -39,30 +38,26 @@ export async function processEnrichChunk(job: Job<EnrichChunkJobData>) {
     throw new Error('enrich-chunk: missing auth_token (re-enqueue required)');
   }
 
-  let heartbeatActive = true;
-  const heartbeat = (async () => {
-    while (heartbeatActive) {
-      await new Promise(r => setTimeout(r, HEARTBEAT_MS));
-      if (!heartbeatActive) break;
-      try { await job.extendLock(job.token!, 30_000); } catch { /* swallow */ }
-    }
-  })();
-
   try {
-    const result = await invokeBase44Function({
-      fn: 'enrichChunk',
-      authToken: auth_token,
-      payload: {
-        project_id,
-        enrichment_run_id,
-        chunk_key,
-        scene_id,
-        chunk_index,
-        record_ids,
-        request_id,
-      },
-      timeoutMs: CHUNK_TIMEOUT_MS,
-    });
+    // runWithLockHeartbeat owns the lock-renewal loop and aborts the invocation
+    // the instant the BullMQ lock is lost — no zombie parallel to a reclaim.
+    const result = await runWithLockHeartbeat(job, (signal) =>
+      invokeBase44Function({
+        fn: 'enrichChunk',
+        authToken: auth_token,
+        payload: {
+          project_id,
+          enrichment_run_id,
+          chunk_key,
+          scene_id,
+          chunk_index,
+          record_ids,
+          request_id,
+        },
+        timeoutMs: CHUNK_TIMEOUT_MS,
+        signal,
+      }),
+    );
 
     await logEvent({
       function_name: 'bullmq:enrich-chunk',
@@ -78,12 +73,13 @@ export async function processEnrichChunk(job: Job<EnrichChunkJobData>) {
     return result;
   } catch (err) {
     const e = err as Error;
+    const lockLost = e instanceof WorkerLockLostError;
     await logEvent({
       function_name: 'bullmq:enrich-chunk',
-      level: 'error',
-      event: 'enrich_chunk_failed',
+      level: lockLost ? 'warn' : 'error',
+      event: lockLost ? 'enrich_chunk_lock_lost' : 'enrich_chunk_failed',
       message: e.message,
-      error_kind: e.name,
+      error_kind: lockLost ? 'lock_lost' : e.name,
       duration_ms: Date.now() - t0,
       context: {
         project_id, enrichment_run_id, chunk_key, scene_id,
@@ -93,8 +89,5 @@ export async function processEnrichChunk(job: Job<EnrichChunkJobData>) {
       },
     });
     throw err;
-  } finally {
-    heartbeatActive = false;
-    await heartbeat.catch(() => {});
   }
 }
