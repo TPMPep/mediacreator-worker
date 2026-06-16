@@ -163,6 +163,13 @@ export async function processCCFormatRun(job: Job<CCFormatRunJobData>) {
     return step.result ?? { ok: true, phase: step.phase };
   } catch (err) {
     const e = err as Error;
+    // Capture name/stack BEFORE the instanceof narrowing below. TS narrows `e`
+    // to `never` in the false-branch of a ternary keyed on `instanceof` a
+    // subclass that adds no members (WorkerLockLostError), so reading e.name
+    // inside such a ternary errors (TS2339). Reading it here keeps it a string.
+    const errName = e.name;
+    const errStack = e.stack;
+    const errMessage = e.message;
     // WorkerLockLostError = clean reclaim exit (the heartbeat aborted us because
     // BullMQ took the job), NOT a real failure. Log warn + re-throw so the SINGLE
     // BullMQ reclaim owns the re-run — ccFormatRunWorkerStep short-circuits on a
@@ -170,17 +177,17 @@ export async function processCCFormatRun(job: Job<CCFormatRunJobData>) {
     const lockLost = e instanceof WorkerLockLostError;
     // INSTRUMENTATION (2026-05-19) — function-call FAILURE lifecycle log.
     // First channel: console.error (Railway-guaranteed evidence trail).
-    console.error(`[bullmq:cc-format-run] cc_format_run_function_call_failure job=${job.id} format_run=${format_run_id} attempt=${job.attemptsMade + 1} duration_ms=${Date.now() - t0} error_kind=${lockLost ? 'lock_lost' : e.name} message=${String(e.message || '').slice(0, 500)}`);
-    if (e.stack && !lockLost) {
-      console.error(`[bullmq:cc-format-run] stack: ${e.stack.split('\n').slice(0, 5).join(' | ')}`);
+    console.error(`[bullmq:cc-format-run] cc_format_run_function_call_failure job=${job.id} format_run=${format_run_id} attempt=${job.attemptsMade + 1} duration_ms=${Date.now() - t0} error_kind=${lockLost ? 'lock_lost' : errName} message=${String(errMessage || '').slice(0, 500)}`);
+    if (errStack && !lockLost) {
+      console.error(`[bullmq:cc-format-run] stack: ${errStack.split('\n').slice(0, 5).join(' | ')}`);
     }
     // Second channel: StructuredLog (best-effort — may itself fail under
     // gateway storm, which is exactly why the console.error above exists).
     await _log(lockLost ? 'warn' : 'error', lockLost ? 'cc_format_run_lock_lost' : 'cc_format_run_failed', {
       ...baseCtx,
       total_duration_ms: Date.now() - t0,
-      error_kind: lockLost ? 'lock_lost' : e.name,
-    }, e.message);
+      error_kind: lockLost ? 'lock_lost' : errName,
+    }, errMessage);
     // INSTRUMENTATION (2026-05-19) — explicit THROW lifecycle log so the
     // BullMQ retry decision is auditable. We re-throw to let BullMQ apply
     // its DEFAULT_JOB_OPTIONS retry policy (3 attempts → DLQ).
