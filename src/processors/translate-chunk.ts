@@ -20,9 +20,8 @@
 
 import type { Job } from 'bullmq';
 import type { TranslateChunkJobData, TranslateChunkResult } from '../../shared/queue-contracts.js';
-import { invokeBase44Function, logEvent } from '../base44-client.js';
+import { invokeBase44Function, logEvent, runWithLockHeartbeat, WorkerLockLostError } from '../base44-client.js';
 
-const HEARTBEAT_MS = 15_000;
 const CHUNK_TIMEOUT_MS = 90_000;
 
 export async function processTranslateChunk(job: Job<TranslateChunkJobData>): Promise<TranslateChunkResult> {
@@ -38,35 +37,32 @@ export async function processTranslateChunk(job: Job<TranslateChunkJobData>): Pr
     throw new Error('translate-chunk: missing auth_token (re-enqueue required)');
   }
 
-  let heartbeatActive = true;
-  const heartbeat = (async () => {
-    while (heartbeatActive) {
-      await new Promise(r => setTimeout(r, HEARTBEAT_MS));
-      if (!heartbeatActive) break;
-      try { await job.extendLock(job.token!, 30_000); } catch { /* swallow */ }
-    }
-  })();
-
   try {
-    const result = await invokeBase44Function<TranslateChunkResult>({
-      fn: 'translateChunk',
-      authToken: auth_token,
-      payload: {
-        project_id,
-        translation_run_id,
-        chunk_key,
-        chunk_index,
-        segments,
-        provider,
-        source_language_code,
-        target_language_code,
-        target_language_label,
-        formality,
-        context,
-        request_id,
-      },
-      timeoutMs: CHUNK_TIMEOUT_MS,
-    });
+    // runWithLockHeartbeat owns the lock-renewal loop and aborts the invocation
+    // via `signal` the instant the BullMQ lock is lost — no zombie can run
+    // parallel to a reclaim. See base44-client.ts for the full rationale.
+    const result = await runWithLockHeartbeat<TranslateChunkResult>(job, (signal) =>
+      invokeBase44Function<TranslateChunkResult>({
+        fn: 'translateChunk',
+        authToken: auth_token,
+        payload: {
+          project_id,
+          translation_run_id,
+          chunk_key,
+          chunk_index,
+          segments,
+          provider,
+          source_language_code,
+          target_language_code,
+          target_language_label,
+          formality,
+          context,
+          request_id,
+        },
+        timeoutMs: CHUNK_TIMEOUT_MS,
+        signal,
+      }),
+    );
 
     await logEvent({
       function_name: 'bullmq:translate-chunk',
@@ -91,12 +87,13 @@ export async function processTranslateChunk(job: Job<TranslateChunkJobData>): Pr
     return result;
   } catch (err) {
     const e = err as Error;
+    const lockLost = e instanceof WorkerLockLostError;
     await logEvent({
       function_name: 'bullmq:translate-chunk',
-      level: 'error',
-      event: 'translate_chunk_failed',
+      level: lockLost ? 'warn' : 'error',
+      event: lockLost ? 'translate_chunk_lock_lost' : 'translate_chunk_failed',
       message: e.message,
-      error_kind: e.name,
+      error_kind: lockLost ? 'lock_lost' : e.name,
       duration_ms: Date.now() - t0,
       context: {
         project_id, translation_run_id, chunk_key, chunk_index,
@@ -105,9 +102,9 @@ export async function processTranslateChunk(job: Job<TranslateChunkJobData>): Pr
         request_id, user_email,
       },
     });
+    // Re-throw so BullMQ owns the single reclaim. A lock-loss abort is a clean
+    // exit of THIS invocation, not a provider failure — the chunk is idempotent
+    // and the reclaim re-runs it exactly once.
     throw err;
-  } finally {
-    heartbeatActive = false;
-    await heartbeat.catch(() => {});
   }
 }
