@@ -244,6 +244,10 @@ export async function processProxyGen(job: Job<ProxyGenJobData>) {
     };
   } catch (err) {
     const e = err as Error;
+    // Capture name BEFORE the instanceof narrowing below. The early-return on
+    // WorkerLockLostError narrows `e` to `never` afterward (the subclass adds no
+    // members), so reading e.name past that point errors (TS2339).
+    const errName = e.name;
     // WorkerLockLostError = clean reclaim exit (heartbeat aborted us because the
     // BullMQ lock was lost). It is NOT a real failure — we must NOT mark the
     // Project proxy_status='failed' (the transcode may still be running Railway-
@@ -270,7 +274,7 @@ export async function processProxyGen(job: Job<ProxyGenJobData>) {
       level: 'error',
       event: 'proxy_gen_failed',
       message: e.message,
-      error_kind: isUnrecoverable ? 'UnrecoverableError' : e.name,
+      error_kind: isUnrecoverable ? 'UnrecoverableError' : errName,
       duration_ms: Date.now() - t0,
       context: {
         project_id,
