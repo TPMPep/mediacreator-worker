@@ -84,6 +84,14 @@ interface CascadeStepResponse {
   system_jwt?: string;
   gateway_jwt?: string;
   expected_result_contract?: string;
+  // Fix A′ (2026-06-17): a FRESH worker auth_token the brain mints on every
+  // non-terminal response (continue/advance/await_review). The worker uses it
+  // for the NEXT re-enqueue so a long-running cascade never carries a stale,
+  // about-to-expire token across ticks (root cause of the rewriting_cps freeze
+  // with `jwt: expired`). Absent on terminal/done and on call_producer
+  // directives (the in-tick RECORD reuses the token already held; the RECORD's
+  // final non-directive response carries the renewed token forward).
+  next_auth_token?: string;
 }
 
 async function _log(
@@ -277,20 +285,28 @@ export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
 
       // ─── 3. Re-enqueue / exit per the (final) action ───────────────
       if (step.action === 'continue' || step.action === 'advance') {
+        // Fix A′ (2026-06-17): use the FRESH token the brain minted on THIS
+        // response for the next tick. Falls back to the current token only if
+        // the brain didn't supply one (older brain build) — that fallback keeps
+        // the cascade running on a pre-A′ brain, it just can't self-renew. With
+        // the A′ brain, every re-enqueued tick starts its own fresh 30-min clock
+        // so a slow cascade can never expire its own auth mid-run.
+        const renewed = !!step.next_auth_token;
+        const nextAuthToken = step.next_auth_token || auth_token;
         const q = getQueue(QUEUE_NAMES.GLTV_CASCADE);
         await q.add(QUEUE_NAMES.GLTV_CASCADE, {
           schema_version: job.data.schema_version,
           dubbing_api_job_id,
           project_id,
           request_id,
-          auth_token,
+          auth_token: nextAuthToken,
         }, { ...GLTV_CASCADE_JOB_OPTIONS, delay: TICK_DELAY_MS });
 
-        await _log('info', 'gltv_cascade_next_tick_enqueued', {
-          ...baseCtx, action: step.action, delay_ms: TICK_DELAY_MS,
-        }, `Re-enqueued next cascade tick (delay ${TICK_DELAY_MS}ms).`);
+        await _log('info', renewed ? 'gltv_cascade_auth_renewed' : 'gltv_cascade_next_tick_enqueued', {
+          ...baseCtx, action: step.action, delay_ms: TICK_DELAY_MS, auth_token_renewed: renewed,
+        }, `Re-enqueued next cascade tick (delay ${TICK_DELAY_MS}ms${renewed ? ', with renewed auth token' : ''}).`);
 
-        return { ok: true, action: step.action, status: step.status, duration_ms: Date.now() - t0 };
+        return { ok: true, action: step.action, status: step.status, auth_token_renewed: renewed, duration_ms: Date.now() - t0 };
       }
 
       // await_review (checkpoint mode) — EXIT cleanly. gltvApproveDubbingJob
