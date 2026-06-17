@@ -6,13 +6,17 @@
 // concurrency lane with the AI-Dubbing translate pipeline.
 //
 // PIPELINE:
-//   1. Producer (Base44 fn `translateSrtProject` mode='translate') resets every
-//      cue to 'pending', creates a SimpleTranslationRun, mints a scoped JWT,
-//      enqueues ONE job to this queue, returns 202 with { run_id }.
+//   1. Producer (Base44 fn `translateSrtProject` mode='translate') creates a
+//      SimpleTranslationRun, mints a scoped JWT, enqueues ONE job to this queue,
+//      and returns immediately with { run_id }. It does NOT touch the cues — no
+//      synchronous reset burst (resetting 1000+ cues up front trips the platform
+//      write limiter, the bug that froze NBC Test Ep5 at 150).
 //   2. Worker (this processor) calls `srtTranslateWorkerStep` on Base44 in a
-//      LOOP. Each tick translates a bounded batch (~120 cues) in parallel via
-//      the run's pinned provider and writes the results back inside its own
-//      ~22s budget, then returns:
+//      LOOP. The step is a single FORWARD PASS over ALL cues driven by
+//      checkpoint.cursor: each tick translates a bounded batch (~120 cues) in
+//      parallel via the run's pinned provider and OVERWRITES the results in
+//      place inside its own ~22s budget (re-translate semantics with no separate
+//      destructive reset phase), then returns:
 //        • action='continue' → more cues remain; this processor calls again
 //        • action='done'     → all cues processed; SimpleTranslationRun finalized
 //   3. watchdogSimpleTranslationRuns (every 2 min) re-enqueues a stalled run.
@@ -24,9 +28,10 @@
 // ceiling — it exits and the watchdog/native-reclaim resumes from the cursor.
 //
 // IDEMPOTENCY: srtTranslateWorkerStep short-circuits on a terminal
-// SimpleTranslationRun (returns action='done', already_terminal) and only
-// translates 'pending' cues past checkpoint.cursor, so a reclaimed/retried job
-// re-runs safely exactly where it left off.
+// SimpleTranslationRun (returns action='done', already_terminal) and resumes the
+// forward pass from checkpoint.cursor (cue_index high-water mark), so a
+// reclaimed/retried job re-runs safely from the exact next batch — never
+// re-touching a cue already processed this pass.
 //
 // ZOMBIE-KILL: every Base44 call runs inside runWithLockHeartbeat — the instant
 // the BullMQ lock is lost (reclaim), the in-flight invocation is aborted so no
