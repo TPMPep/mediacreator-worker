@@ -102,7 +102,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-06-16-srt-translate-async-1',
+  build_tag: '2026-06-17-srt-translate-forward-pass-2',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -345,7 +345,7 @@ const workers: Worker[] = [
   // Bottleneck is the per-tick Base44 write budget, not parallelism.
   // STALLED-JOB RECLAIM: SAFE to native-reclaim — srtTranslateWorkerStep is
   // idempotent + resumable (short-circuits on a terminal run, resumes from
-  // checkpoint.cursor, translates 'pending' cues only) and every call runs
+  // checkpoint.cursor as a forward pass over all cues) and every call runs
   // inside runWithLockHeartbeat (a lost lock aborts the prior invocation, so a
   // reclaim never runs parallel to a zombie). A dead pod self-heals on BullMQ's
   // sub-minute clock instead of waiting for watchdogSimpleTranslationRuns.
