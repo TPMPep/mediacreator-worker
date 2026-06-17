@@ -102,7 +102,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-06-17-srt-translate-forward-pass-2',
+  build_tag: '2026-06-17-gltv-cascade-jwt-renewal-and-chunk-lock-ghost',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -552,7 +552,23 @@ const server = http.createServer(async (req, res) => {
         processed_on?: number | null;
         timestamp?: number | null;
         attempts_made?: number | null;
+        lock_present?: boolean | null;
       }> = {};
+      // Live-lock probe (2026-06-17 — chunk lock-ghost fix). BullMQ holds a
+      // per-job lock at the Redis key `bull:<queue>:<jobId>:lock` for as long
+      // as the worker that picked the job up is alive and heart-beating its
+      // lock. When a worker pod is HARD-KILLED mid-execution (Railway recycle /
+      // OOM), the lock key's TTL expires within ~30s and the key DISAPPEARS —
+      // but the job can remain in BullMQ state `active` (with processed_on SET,
+      // attempts_made still low) until BullMQ's stalled-checker reclaims it.
+      // That window is exactly the chunk-ghost strand: processed_on says
+      // "a worker ran this" so the orchestrator's processed_on discriminator
+      // treats it as live-but-slow and waits the 15-min backstop. Reading the
+      // lock key tells us the truth: active + NO lock = the owning worker is
+      // dead, reclaim it on the SHORT ghost ceiling, not the 15-min one.
+      // SOC 2 CC7.2 — reclaim acts on real lock presence, never an inferred timer.
+      const redis = getRedis();
+      const lockKey = (jobId: string) => `bull:${queue}:${jobId}:lock`;
       // Lookups are independent — fan out in parallel.
       await Promise.all(ids.map(async (id) => {
         try {
@@ -563,6 +579,21 @@ const server = http.createServer(async (req, res) => {
             return;
           }
           const state = await job.getState();
+          // Only probe the lock for ACTIVE jobs — that's the only state where
+          // lock presence is meaningful (waiting/delayed never hold a lock;
+          // completed/failed already terminalised). One cheap EXISTS per active
+          // job. null = not probed (non-active state); true/false = probed.
+          let lockPresent: boolean | null = null;
+          if (state === 'active') {
+            try {
+              lockPresent = (await redis.exists(lockKey(id))) === 1;
+            } catch (lockErr) {
+              // Redis EXISTS failed — leave null so the orchestrator falls back
+              // to its existing processed_on/attempts/age logic (never reclaim
+              // on a failed probe). Best-effort, never poisons the response.
+              console.warn(`[job-status] lock probe ${id} failed: ${(lockErr as Error).message}`);
+            }
+          }
           results[id] = {
             state,
             returnvalue: state === 'completed' ? job.returnvalue : undefined,
@@ -581,6 +612,11 @@ const server = http.createServer(async (req, res) => {
             processed_on: job.processedOn ?? null,
             timestamp: job.timestamp ?? null,
             attempts_made: job.attemptsMade ?? null,
+            // Live-lock presence (active jobs only; null otherwise). A
+            // processed_on-SET active job with lock_present=false is a TRUE
+            // GHOST (owning worker died, lock TTL lapsed) the orchestrator may
+            // reclaim on the short ghost ceiling. SOC 2 CC7.2.
+            lock_present: lockPresent,
           };
         } catch (e) {
           // Per-id failure shouldn't poison the whole response.
