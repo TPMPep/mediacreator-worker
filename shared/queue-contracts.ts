@@ -834,7 +834,18 @@ export interface AIRewriteChunkResult {
   terminal_error: { code: string; message: string } | null;
   /** Per-line failure detail to bubble up into AIRewriteRun.chunk_failures. */
   failed_record_ids: string[];
+  /** Total worker-side wall-clock for this chunk invocation (JWT verify ->
+   *  provider call(s) -> response build). The orchestrator aggregates this as
+   *  the run-level worker_execution_ms summary. */
   duration_ms: number;
+  /** PILOT TELEMETRY (2026-06-19, additive). Isolated time spent inside the LLM
+   *  provider call loop (Gemini/OpenAI REST), in ms — measured by rewriteChunk
+   *  around the rewriteBatch* call, distinct from total worker duration_ms.
+   *  The orchestrator aggregates this as the run-level provider_latency_ms
+   *  summary AND logs it per-chunk to the airewrite_chunk_timing StructuredLog
+   *  stream. Isolating provider latency from worker overhead is what answers
+   *  'is the provider the bottleneck, or our orchestration?'. */
+  provider_latency_ms?: number;
   request_id: string;
 }
 
