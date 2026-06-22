@@ -102,7 +102,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-06-19-airewrite-pilot-telemetry-option-c',
+  build_tag: '2026-06-19-airewrite-drain-delay-harvest-poll',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -222,6 +222,22 @@ const workers: Worker[] = [
     limiter: { max: 100, duration: 60_000 },
     stalledInterval: 30_000,
     maxStalledCount: 2,
+    // QUEUE-DRAIN LATENCY FIX (2026-06-19). BullMQ's default drainDelay is 5s:
+    // when no job is waiting, an idle worker slot blocks on Redis for up to 5s
+    // before re-polling. On a LOW-depth chunk run (e.g. a 2-chunk rewrite for a
+    // short clip) a freshly-enqueued chunk can therefore sit in `waiting` for
+    // nearly the full drainDelay per idle slot before pickup — the dominant
+    // contributor to the ~8 min queue_wait observed on run 6a389a1f (rewrite
+    // telemetry: queue_wait_ms.total ≈ 495,677 vs worker_execution_ms ≈ 39,386).
+    // drainDelay:1 makes idle slots re-check the queue every 1s, collapsing
+    // pickup latency to ~1s without touching concurrency, the limiter, retry
+    // budget, or any reliability safeguard. AIREWRITE_CHUNK ONLY — scoped so no
+    // other pipeline's drain posture changes. Bounded by the existing
+    // limiter:{max:100,duration:60_000}, so faster polling can never over-dispatch
+    // to the provider. SOC 2 CC7.4 — subprocessor protection unchanged; this only
+    // affects how fast an idle slot notices already-admitted work. Revertable in
+    // <60s by removing this line. Build tag bumped to prove the deploy landed.
+    drainDelay: 1,
   }),
   new Worker(QUEUE_NAMES.SRT_IMPORT, processSrtImport, {
     ...baseOpts, concurrency: env.CONCURRENCY_SRT_IMPORT,
