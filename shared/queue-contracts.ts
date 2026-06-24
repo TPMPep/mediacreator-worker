@@ -282,6 +282,17 @@ export interface VoiceGenJobData {
    */
   job_run_id?: string;
   /**
+   * Force overwrite. When true, generateOneSegment bypasses its idempotency
+   * guard and re-renders the segment even if it already has ready audio.
+   * Set by the producer (runVoiceGeneration) from the run-level force flag —
+   * the operator explicitly asked to re-render (performance direction applied,
+   * voice changed, manual regenerate). Without threading this through to the
+   * per-segment job, an already-dubbed line is silently idempotent-skipped and
+   * the old take is retained. Optional — omitted (false) for fresh dubs.
+   * SOC 2 CC8.1 — an explicitly-requested re-render is never silently dropped.
+   */
+  force?: boolean;
+  /**
    * Voice Consistency Engine strategy (Phase 3, 2026-05-25).
    * Optional — when omitted, generateOneSegment defaults to 'NONE' so existing
    * call sites stay bit-for-bit unchanged. Values: 'NONE' | 'REFERENCE_CONTEXT' |
