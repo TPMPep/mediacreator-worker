@@ -16,6 +16,11 @@ export async function processVoiceGen(job: Job<VoiceGenJobData>) {
     performance_prompt, cue_stability,
     user_email, request_id, auth_token,
     job_run_id,
+    // Force overwrite — when the producer set this (operator explicitly asked
+    // to re-render: performance direction, voice change, manual regenerate),
+    // forward it so generateOneSegment bypasses its already-ready idempotency
+    // guard. Omitted/false for fresh dubs. SOC 2 CC8.1.
+    force,
     // Phase 3 Voice Consistency Engine: optional, additive, never throws.
     // When omitted the producer didn't request a consistency posture and
     // generateOneSegment will default to 'NONE' — bit-for-bit identical to
@@ -55,6 +60,9 @@ export async function processVoiceGen(job: Job<VoiceGenJobData>) {
         // when all segments in the run reach a terminal state. Closes the
         // SOC 2 CC7.2 zombie-JobRun gap.
         job_run_id: job_run_id ?? null,
+        // Bypass generateOneSegment's already-ready idempotency guard when the
+        // operator explicitly requested a re-render. Defaults false for fresh dubs.
+        force: !!force,
         // Phase 3 Voice Consistency Engine. Forwarded verbatim. Undefined
         // when the producer didn't set it (the common case — manual segment
         // regen with the toggle OFF, and ALL bulk runs).
