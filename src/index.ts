@@ -89,6 +89,16 @@ import { makeGltvCascadeProcessor } from './processors/gltv-cascade.js';
 // tick calls back into `srtTranslateWorkerStep` to translate ~120 cues; the
 // processor loops until the run finalizes.
 import { processSrtTranslate } from './processors/srt-translate.js';
+// M&E extraction harvester (2026-06-25). PORTABILITY anchor — the perpetual
+// self-rescheduling heartbeat that drives every in-flight LALAL.AI M&E
+// extraction to completion independent of any browser tab, with the scheduler
+// living HERE (git-versioned, on Railway) instead of a Base44-platform cron.
+// Factory-built because it re-enqueues its own next tick via the queue registry.
+// The per-tick step calls pollMEStatus in sweep mode (the single shared finalize
+// path); this processor holds NO harvest logic. Producer is `enqueueMEPoll`.
+import { makeMEPollProcessor } from './processors/me-poll.js';
+// Boot-seeds the perpetual M&E poll heartbeat (self-starting, no Base44 cron).
+import { seedMEPollHeartbeat } from './me-poll-seed.js';
 
 initSentry();
 
@@ -102,7 +112,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-06-24-voicegen-force-thread-through',
+  build_tag: '2026-06-25-me-poll-heartbeat',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -372,6 +382,22 @@ const workers: Worker[] = [
     stalledInterval: 30_000,
     maxStalledCount: 2,
   }),
+  // M&E poll heartbeat (2026-06-25). PERPETUAL self-rescheduling single job —
+  // concurrency=1 (only ever one heartbeat). Each tick calls pollMEStatus in
+  // sweep mode then re-enqueues itself (deterministic jobId 'me-poll-singleton')
+  // after 60s. Built via the factory so it re-enqueues through the hoisted
+  // getQueue handle. STALLED-JOB RECLAIM: SAFE — the tick is idempotent (the
+  // sweep is a stateless harvest of whatever is currently active; pollMEStatus
+  // is itself idempotent per project) and runWithLockHeartbeat aborts the prior
+  // invocation on lock loss, so a reclaim never runs parallel to a zombie. A
+  // dead pod self-heals on BullMQ's sub-minute clock; a lost loop is restored by
+  // the next enqueueMEPoll reseed. SOC 2 CC7.2.
+  new Worker(QUEUE_NAMES.ME_POLL, makeMEPollProcessor(getQueue), {
+    ...baseOpts,
+    concurrency: env.CONCURRENCY_ME_POLL,
+    stalledInterval: 30_000,
+    maxStalledCount: 2,
+  }),
 ];
 
 for (const w of workers) {
@@ -402,6 +428,12 @@ void logEvent({
     s3_creds_missing: s3Creds.missing,
   },
 });
+
+// Self-start the perpetual M&E poll heartbeat (PORTABILITY anchor — no Base44
+// cron). Best-effort + deterministic jobId, so a re-seed across restarts is a
+// BullMQ no-op while a tick is pending. The Base44 enqueueMEPoll fn remains the
+// admin reseed path. Fire-and-forget so a seed hiccup never blocks boot.
+void seedMEPollHeartbeat(getQueue);
 
 import { DEFAULT_JOB_OPTIONS } from '../shared/queue-contracts.js';
 
