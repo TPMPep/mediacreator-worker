@@ -64,6 +64,8 @@ interface SweepResponse {
     harvested?: number;
     still_processing?: number;
     failed?: number;
+    orphaned?: number;
+    reaped?: number;
   };
 }
 
@@ -101,7 +103,7 @@ export function makeMEPollProcessor(getQueue: (name: string) => Queue) {
           function_name: 'bullmq:me-poll',
           level: 'info',
           event: 'me_poll_tick_done',
-          message: `M&E sweep: scanned=${s.scanned ?? 0} harvested=${s.harvested ?? 0} processing=${s.still_processing ?? 0} failed=${s.failed ?? 0}`,
+          message: `M&E sweep: scanned=${s.scanned ?? 0} harvested=${s.harvested ?? 0} processing=${s.still_processing ?? 0} failed=${s.failed ?? 0} orphaned=${s.orphaned ?? 0} reaped=${s.reaped ?? 0}`,
           duration_ms: Date.now() - t0,
           context: { ...baseCtx, ...s },
         });
