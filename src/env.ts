@@ -211,6 +211,12 @@ export const env = {
   // Base44 write pressure (the per-tick write-back is the bottleneck, bounded by
   // TICK_BATCH on the function side). Env-overridable.
   CONCURRENCY_SRT_TRANSLATE: intEnv('WORKER_CONCURRENCY_SRT_TRANSLATE', 4),
+  // M&E poll heartbeat (2026-06-25). Held at 1 — this is a SINGLE perpetual
+  // self-rescheduling job (deterministic jobId), so concurrency >1 would be
+  // meaningless (only one heartbeat ever exists). Each tick is a bounded sweep
+  // that calls pollMEStatus once per active extraction; between ticks the slot
+  // is idle. Bottleneck is the per-tick Base44 invoke budget, not parallelism.
+  CONCURRENCY_ME_POLL: intEnv('WORKER_CONCURRENCY_ME_POLL', 1),
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
