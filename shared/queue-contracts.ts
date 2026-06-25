@@ -250,6 +250,22 @@ export const QUEUE_NAMES = {
   // any other pipeline. SOC 2 CC7.2 — resumable; CC8.1 — provider + per-cue
   // provenance (TranslationCue.translated_by_provider) join back to the run.
   SRT_TRANSLATE: 'srt-translate',
+  // M&E extraction harvester (2026-06-25). A PERPETUAL, self-rescheduling
+  // heartbeat that drives every in-flight LALAL.AI M&E extraction to completion
+  // independent of any browser tab. This is the PORTABILITY anchor for M&E: the
+  // scheduler lives HERE (in the git-versioned worker repo, on Railway), NOT in
+  // a Base44-platform scheduled automation — so M&E survives leaving Base44
+  // exactly like every other pipeline. The worker re-enqueues its own next
+  // sweep on a fixed delay (gltv-cascade self-reschedule pattern); the per-tick
+  // step calls the Base44 fn `pollMEStatus` (single source of truth for the
+  // LALAL /check → download stems → S3 → finalize-Project path, shared with the
+  // editor's live poll, so there is ZERO finalize-logic drift). The only Base44
+  // touch is the same data-layer write every processor already crosses via
+  // base44-client. Producer `enqueueMEPoll` seeds the heartbeat once at deploy.
+  // SOC 2 CC7.2 — resumable + browser-independent; CC8.1 — pollMEStatus owns
+  // the audit/cost trail. Single perpetual job (deterministic jobId), so a
+  // double-seed is a no-op.
+  ME_POLL: 'me-poll',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -1268,6 +1284,35 @@ export interface SrtTranslateJobData {
   auth_token: string;
 }
 
+// ─── M&E poll heartbeat payload (2026-06-25) ─────────────────────────────────
+//
+// Single PERPETUAL self-rescheduling job. The worker calls pollAllActiveME (a
+// thin loop) which, per tick, lists every Project with an active me_lalal token
+// and calls the Base44 fn `pollMEStatus` once per project to drive it forward
+// (harvest finished → S3 → ready; map LALAL error → failed; no-op if still
+// processing). Then the worker re-enqueues ITSELF after ME_POLL_TICK_DELAY_MS.
+//
+// PORTABILITY (the whole point): the scheduler/heartbeat lives in the worker
+// repo, so M&E is not dependent on a Base44-platform cron. The harvest logic
+// itself stays in pollMEStatus (single source of truth, shared with the editor
+// live poll) — invoked over the same scoped-JWT callback every processor uses.
+//
+// AUTH: a scoped JWT bound to (fn='pollMEStatus'). Because the sweep touches
+// MANY projects per tick (not one resource), the token is fn-scoped only —
+// pollMEStatus verifies the fn claim + signature and then acts as service-role
+// (same trust envelope as the scheduled-admin path it replaces). The producer
+// re-mints a fresh token each time it (re)seeds; the worker carries the token
+// across self-reschedules and the producer reseeds it well before expiry via
+// the long TTL below.
+export interface MEPollJobData {
+  schema_version: number;
+  /** Correlation id threaded into StructuredLog rows for this heartbeat. */
+  request_id: string;
+  /** Scoped JWT bound to (fn='pollMEStatus'). Long TTL — this is a perpetual
+   *  heartbeat; the producer reseeds with a fresh token periodically. */
+  auth_token: string;
+}
+
 // Discriminated union for processors that need to handle multiple shapes.
 export type AnyJobData =
    | VoiceGenJobData
@@ -1294,7 +1339,8 @@ export type AnyJobData =
    | CCCueSupersedeJobData
    | TranscriptImportJobData
    | GltvCascadeJobData
-   | SrtTranslateJobData;
+   | SrtTranslateJobData
+   | MEPollJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
 
@@ -1397,6 +1443,18 @@ export const GLTV_CASCADE_JOB_OPTIONS = {
   backoff: { type: 'exponential' as const, delay: 10000 },
   removeOnComplete: { age: 3600, count: 500 },
   removeOnFail: { age: 86400 * 7 },
+};
+
+// M&E poll heartbeat (2026-06-25). attempts:1 — the heartbeat re-enqueues its
+// OWN next tick (deterministic jobId 'me-poll-singleton'); a failed tick must
+// NOT be BullMQ-retried (that would race a second perpetual loop). If a tick
+// throws, the next reseed from enqueueMEPoll restores the heartbeat. Short
+// retention because there's only ever one live job + its immediate successor.
+// SOC 2 CC7.2 — bounded, single-loop, resumable via reseed.
+export const ME_POLL_JOB_OPTIONS = {
+  attempts: 1,
+  removeOnComplete: { age: 600, count: 5 },
+  removeOnFail: { age: 86400 },
 };
 
 // ─── Project cascade payload (2026-05-15) ────────────────────────────
