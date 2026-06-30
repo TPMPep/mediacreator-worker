@@ -522,7 +522,14 @@ export interface TranslateChunkResult {
   ok: boolean;
   chunk_key: string;
   chunk_index: number;
-  translations: Array<{ source_segment_id: string; translated_text: string }>;
+  /**
+   * source_text_hash (added 2026-06-30): FNV-1a (Math.imul, 8-char padded)
+   * hash of the EXACT source text translateChunk translated. The orchestrator
+   * persists it as TranslationSegment.translated_from_source_hash so the editor
+   * can PROVE + REVERSE stale-from-source state. Optional for back-compat with
+   * any in-flight pre-deploy job whose returnvalue predates the field.
+   */
+  translations: Array<{ source_segment_id: string; translated_text: string; source_text_hash?: string }>;
   processed_count: number;
   translated_count: number;
   failed_count: number;
