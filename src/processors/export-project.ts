@@ -13,7 +13,9 @@
 import type { Job } from 'bullmq';
 import type { ExportJobData } from '../../shared/queue-contracts.js';
 import { invokeBase44Function, logEvent } from '../base44-client.js';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+// Zero-dependency WebCrypto SigV4 signer (replaces @aws-sdk/@smithy — incident
+// 2026-07-07/08). STS session-token aware. See ../s3-signer.ts.
+import { presignS3Url, putS3Object, storageFromEnv, type StorageHandle } from '../s3-signer.js';
 
 const FUNCTION_CALL_TIMEOUT_MS = 150_000; // 2.5 min per tick (pagination + build)
 const HEARTBEAT_MS = 15_000;
@@ -110,27 +112,21 @@ async function callMixFinal(opts: {
 }
 
 // ─── S3 upload (worker-side) ───
-function buildWorkerS3(region: string, credentialSecretPrefix?: string): S3Client {
-  const accessKeyId = credentialSecretPrefix
-    ? process.env[`${credentialSecretPrefix}_ACCESS_KEY_ID`]
-    : process.env.AWS_ACCESS_KEY_ID;
-  const secretAccessKey = credentialSecretPrefix
-    ? process.env[`${credentialSecretPrefix}_SECRET_ACCESS_KEY`]
-    : process.env.AWS_SECRET_ACCESS_KEY;
-  if (!accessKeyId || !secretAccessKey) throw new Error('Missing S3 credentials in worker env');
-  return new S3Client({ region, credentials: { accessKeyId, secretAccessKey } });
+// buildWorkerS3 now returns a plain storage handle (STS-aware, no SDK client).
+function buildWorkerS3(region: string, credentialSecretPrefix?: string): StorageHandle {
+  return storageFromEnv({ region, bucket: '__unused__', prefix: credentialSecretPrefix || '' });
 }
-async function uploadWav(s3: S3Client, bucket: string, key: string, bytes: Uint8Array, filename: string) {
-  await s3.send(new PutObjectCommand({
-    Bucket: bucket, Key: key, Body: bytes, ContentType: 'audio/wav',
-    ContentDisposition: `attachment; filename="${filename}"`,
-  }));
+async function uploadWav(storage: StorageHandle, bucket: string, key: string, bytes: Uint8Array, filename: string) {
+  await putS3Object({ ...storage, bucket }, key, bytes, {
+    contentType: 'audio/wav',
+    contentDisposition: `attachment; filename="${filename}"`,
+  });
 }
-async function uploadMp4(s3: S3Client, bucket: string, key: string, bytes: Uint8Array, filename: string) {
-  await s3.send(new PutObjectCommand({
-    Bucket: bucket, Key: key, Body: bytes, ContentType: 'video/mp4',
-    ContentDisposition: `attachment; filename="${filename}"`,
-  }));
+async function uploadMp4(storage: StorageHandle, bucket: string, key: string, bytes: Uint8Array, filename: string) {
+  await putS3Object({ ...storage, bucket }, key, bytes, {
+    contentType: 'video/mp4',
+    contentDisposition: `attachment; filename="${filename}"`,
+  });
 }
 
 // ─── Railway /mux-video caller (worker-side — no function ceiling) ───
@@ -168,11 +164,11 @@ async function callMuxVideo(opts: {
 // return a fresh signed GET URL Railway /mux-video can read. The video_mux
 // flow renders audio → uploads it → re-signs → mux. We can't pass raw bytes to
 // /mux-video (it fetches URLs), so the mix WAV gets a short-lived S3 home.
-import { GetObjectCommand } from '@aws-sdk/client-s3';
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-async function uploadAndSign(s3: S3Client, bucket: string, key: string, bytes: Uint8Array): Promise<string> {
-  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: bytes, ContentType: 'audio/wav' }));
-  return getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: key }), { expiresIn: 3600 });
+// 1h expiry preserved — Railway /mux-video needs the full mux window.
+async function uploadAndSign(storage: StorageHandle, bucket: string, key: string, bytes: Uint8Array): Promise<string> {
+  const scoped: StorageHandle = { ...storage, bucket };
+  await putS3Object(scoped, key, bytes, { contentType: 'audio/wav' });
+  return presignS3Url({ method: 'GET', storage: scoped, key, expiresIn: 3600 });
 }
 
 function slugifyLabel(s: string) {
