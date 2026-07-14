@@ -266,6 +266,26 @@ export const QUEUE_NAMES = {
   // the audit/cost trail. Single perpetual job (deterministic jobId), so a
   // double-seed is a no-op.
   ME_POLL: 'me-poll',
+  // Dual-Model Consensus transcription pipeline (Phase 2, 2026-07-13). ISOLATED
+  // lane. Single-shot tick-resumable job per ConsensusTranscriptionRun. The
+  // worker calls consensusTranscriptionWorkerStep in a loop; the step advances
+  // ONE phase transition against the run row and returns action='continue'
+  // (re-tick) / 'done' (settle) / 'failed' (finalized failed). Consensus mode
+  // transcribes ONE source with BOTH providers (AAI primary for diarization +
+  // Scribe v2 secondary for word recovery) then merges at the word level — it
+  // ~doubles provider spend, so the producer (enqueueConsensusTranscription)
+  // enforces a HARD cost-cap gate + producer/manager/admin RBAC BEFORE this job
+  // is ever minted. Phase machine: queued → dispatch (submit AAI async + Scribe
+  // sync, Scribe words stashed to S3) → poll_providers (poll AAI once/tick until
+  // done) → awaiting_merge → arbitrating (timing-anchored alignment + confidence
+  // arbitration per lib/consensus-arbitration.js, pinned policy on the row) →
+  // persisting (re-shape merged words into TranscriptSegments on AAI's diarization
+  // timeline) → done. A Scribe failure degrades gracefully to AAI-only; an AAI
+  // failure hard-fails. Its OWN concurrency lane (CONCURRENCY_CONSENSUS_TRANSCRIPTION,
+  // default 4) so a consensus burst never starves human editors. SOC 2 CC7.2
+  // (resumable), CC7.4 (bounded spend + degrade never re-doubles), CC8.1
+  // (every merged word attributable to the pinned arbitration_policy).
+  CONSENSUS_TRANSCRIPTION: 'consensus-transcription',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -1320,6 +1340,38 @@ export interface MEPollJobData {
   auth_token: string;
 }
 
+// ─── Consensus transcription payload (Phase 1, 2026-07-13) ───────────────────
+//
+// Single-shot tick-resumable job. The worker calls consensusTranscriptionWorkerStep
+// in a loop; the step reads the ConsensusTranscriptionRun off the DB (keyed by
+// consensus_run_id) and advances ONE phase transition. The parsed run config is
+// NEVER in this payload — the step reads it off the row (the reproducibility
+// anchor). FULLY ISOLATED to the consensus pipeline.
+//
+// SECURITY MODEL — identical to cc-cue-supersede:
+//   • Scoped JWT (30-min TTL) bound to (user, project, consensus_run_id,
+//     'consensusTranscriptionWorkerStep'). Worker forwards verbatim as X-Worker-JWT.
+//
+// AUDIT POSTURE (SOC 2 CC7.2 / CC7.4 / CC8.1):
+//   • ConsensusTranscriptionRun is the audit row; status + current_phase +
+//     cost_cap_decision + checkpoint answer "who opted in, was the cap honored,
+//     how far did the run get?" from a single row.
+//   • BullMQ retains failed jobs 7d — every failed run is DLQ-queryable.
+export interface ConsensusTranscriptionJobData {
+  schema_version: number;
+  /** Owning Project.id. */
+  project_id: string;
+  /** ConsensusTranscriptionRun.id — the run this job advances. */
+  consensus_run_id: string;
+  /** Producer/manager/admin that opted into consensus (preserved for attribution). */
+  user_email: string;
+  /** Correlation id threaded into every StructuredLog row for this run. */
+  request_id: string;
+  /** Scoped JWT bound to (user, project, consensus_run_id,
+   *  'consensusTranscriptionWorkerStep'). 30-min TTL. */
+  auth_token: string;
+}
+
 // Discriminated union for processors that need to handle multiple shapes.
 export type AnyJobData =
    | VoiceGenJobData
@@ -1347,7 +1399,8 @@ export type AnyJobData =
    | TranscriptImportJobData
    | GltvCascadeJobData
    | SrtTranslateJobData
-   | MEPollJobData;
+   | MEPollJobData
+   | ConsensusTranscriptionJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
 
