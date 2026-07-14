@@ -217,6 +217,13 @@ export const env = {
   // that calls pollMEStatus once per active extraction; between ticks the slot
   // is idle. Bottleneck is the per-tick Base44 invoke budget, not parallelism.
   CONCURRENCY_ME_POLL: intEnv('WORKER_CONCURRENCY_ME_POLL', 1),
+  // Dual-Model Consensus transcription (Phase 1, 2026-07-13). ISOLATED lane so a
+  // consensus burst never starves human editors. Each in-flight job is one
+  // tick-resumable run against ONE ConsensusTranscriptionRun; between ticks the
+  // slot is idle (the Phase 2 dual-provider legs are mostly waiting on AAI/Scribe
+  // to finish). Default 4 — comfortable for 100+ concurrent users without
+  // amplifying Base44 write pressure. Env-overridable.
+  CONCURRENCY_CONSENSUS_TRANSCRIPTION: intEnv('WORKER_CONCURRENCY_CONSENSUS_TRANSCRIPTION', 4),
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
