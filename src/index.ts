@@ -99,6 +99,11 @@ import { processSrtTranslate } from './processors/srt-translate.js';
 import { makeMEPollProcessor } from './processors/me-poll.js';
 // Boot-seeds the perpetual M&E poll heartbeat (self-starting, no Base44 cron).
 import { seedMEPollHeartbeat } from './me-poll-seed.js';
+// Dual-Model Consensus transcription (Phase 1, 2026-07-13). ISOLATED lane. One
+// tick-resumable job per ConsensusTranscriptionRun; the step advances a phase
+// machine (Phase 1 parks at awaiting_merge). Producer is enqueueConsensusTranscription
+// (hard cost-cap gate + producer/manager/admin RBAC before the job is minted).
+import { processConsensusTranscription } from './processors/consensus-transcription.js';
 
 initSentry();
 
@@ -112,7 +117,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-07-10-webcrypto-sigv4-sts-purge',
+  build_tag: '2026-07-13-consensus-transcription-phase2',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -395,6 +400,21 @@ const workers: Worker[] = [
   new Worker(QUEUE_NAMES.ME_POLL, makeMEPollProcessor(getQueue), {
     ...baseOpts,
     concurrency: env.CONCURRENCY_ME_POLL,
+    stalledInterval: 30_000,
+    maxStalledCount: 2,
+  }),
+  // Dual-Model Consensus transcription (Phase 1, 2026-07-13). ISOLATED lane —
+  // default 4 concurrent runs so a consensus burst never starves human editors.
+  // Each in-flight job is one tick-resumable run against ONE
+  // ConsensusTranscriptionRun; between ticks the slot is idle. Bottleneck is the
+  // per-tick Base44 write budget, not parallelism.
+  // STALLED-JOB RECLAIM: SAFE to native-reclaim — consensusTranscriptionWorkerStep
+  // is idempotent (short-circuits on a terminal run) and every call runs inside
+  // runWithLockHeartbeat (a lost lock aborts the prior invocation, so a reclaim
+  // never runs parallel to a zombie). Mirrors CC_CUE_SUPERSEDE. SOC 2 CC7.2.
+  new Worker(QUEUE_NAMES.CONSENSUS_TRANSCRIPTION, processConsensusTranscription, {
+    ...baseOpts,
+    concurrency: env.CONCURRENCY_CONSENSUS_TRANSCRIPTION,
     stalledInterval: 30_000,
     maxStalledCount: 2,
   }),
