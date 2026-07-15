@@ -16,6 +16,9 @@ export async function processVoiceGen(job: Job<VoiceGenJobData>) {
     performance_prompt, cue_stability,
     user_email, request_id, auth_token,
     job_run_id,
+    // Server-authoritative audit trigger from the producer. Forwarded verbatim;
+    // generateOneSegment validates + trust-gates it (worker-JWT only, enum only).
+    trigger,
     // Force overwrite — when the producer set this (operator explicitly asked
     // to re-render: performance direction, voice change, manual regenerate),
     // forward it so generateOneSegment bypasses its already-ready idempotency
@@ -60,6 +63,11 @@ export async function processVoiceGen(job: Job<VoiceGenJobData>) {
         // when all segments in the run reach a terminal state. Closes the
         // SOC 2 CC7.2 zombie-JobRun gap.
         job_run_id: job_run_id ?? null,
+        // Server-authoritative audit trigger — forwarded verbatim. generateOneSegment
+        // honors it ONLY over the worker-JWT chain from the validated enum, so the
+        // browser can never influence the audit classification. Undefined for legacy
+        // producers → generateOneSegment classifies from server-side signals.
+        trigger: trigger ?? undefined,
         // Bypass generateOneSegment's already-ready idempotency guard when the
         // operator explicitly requested a re-render. Defaults false for fresh dubs.
         force: !!force,
