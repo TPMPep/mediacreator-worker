@@ -318,6 +318,18 @@ export interface VoiceGenJobData {
    */
   job_run_id?: string;
   /**
+   * Server-authoritative audit trigger, classified by the trusted producer
+   * (runVoiceGeneration) from the run's force flag + segment count:
+   *   !force → 'initial_generation'; force + many → 'bulk_regenerate';
+   *   force + one → 'operator_regenerate'.
+   * Forwarded verbatim to generateOneSegment, which honors it ONLY over the
+   * scoped worker-JWT chain and ONLY when it is a member of the
+   * VoiceGenerationRun.trigger enum — the browser can never forge it. Optional:
+   * omitted for legacy/direct callers, which fall back to generateOneSegment's
+   * server-side classification. SOC 2 CC8.1.
+   */
+  trigger?: string;
+  /**
    * Force overwrite. When true, generateOneSegment bypasses its idempotency
    * guard and re-renders the segment even if it already has ready audio.
    * Set by the producer (runVoiceGeneration) from the run-level force flag —
