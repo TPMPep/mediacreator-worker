@@ -66,6 +66,10 @@ interface RailwayProxyResponse {
   proxy_audio_key: string;
   bytes_video?: number;
   bytes_audio?: number;
+  // Machine-measured source frame rate from ffprobe (null/absent if the probe
+  // failed). Threaded to proxyGenWorkerStep which writes it to Project.frame_rate
+  // with provenance frame_rate_source='ffprobe'. Best-effort — never gates the proxy.
+  source_frame_rate?: number | null;
   // Echo fields are optional but useful for audit cross-correlation.
   project_id?: string;
 }
@@ -217,6 +221,8 @@ export async function processProxyGen(job: Job<ProxyGenJobData>) {
           proxy_audio_key: railwayRes.proxy_audio_key,
           bytes_video: railwayRes.bytes_video || null,
           bytes_audio: railwayRes.bytes_audio || null,
+          // Machine-measured source frame rate (best-effort; null if probe failed).
+          source_frame_rate: railwayRes.source_frame_rate ?? null,
         },
         timeoutMs: FINALIZER_TIMEOUT_MS,
         signal,
