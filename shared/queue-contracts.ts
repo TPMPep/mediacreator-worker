@@ -1004,6 +1004,15 @@ export interface ExportJobData {
   /** [audio kind, video_mux mode] Which video stream to mux onto.
    *  'original' = full-res source (deliverable). 'proxy' = 720p editor proxy. */
   source_res?: 'original' | 'proxy';
+  /** [cc kind] Which CC deliverable this export produces. 'file' (default/absent)
+   *  = a caption text file (SRT/VTT/SCC/TTML) built from CaptionCue rows. 'burn_in'
+   *  = a Timed-Text HARDSUB MP4: the caption cues are baked onto the video via
+   *  FFmpeg's subtitles filter (spec-styled ASS). The one place the VIDEO stream
+   *  is re-encoded. */
+  cc_mode?: 'file' | 'burn_in';
+  /** [cc kind, burn_in mode] Which video stream the captions are burned onto.
+   *  'original' = full-res source media (deliverable). 'proxy' = 720p editor proxy. */
+  cc_burn_source_res?: 'original' | 'proxy';
   /** Scoped JWT bound to (user, export_job_id, 'exportProjectWorkerStep'). 30 min TTL. */
   auth_token: string;
 }
