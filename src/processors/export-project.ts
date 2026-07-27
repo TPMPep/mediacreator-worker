@@ -31,11 +31,19 @@ const MAX_PHASE_ITERATIONS = 12;
 const RAILWAY_MIX_TIMEOUT_MS = 30 * 60 * 1000;
 
 interface PhaseStepResponse {
-  action: 'recall_function' | 'done' | 'render_audio';
+  action: 'recall_function' | 'done' | 'render_audio' | 'burn_subtitles';
   phase?: string;
   done?: boolean;
   result?: unknown;
   carry?: unknown;
+  // Present only when action='burn_subtitles' — the signed source video + the
+  // signed compiled ASS document the worker hands to Railway /burn-subtitles.
+  burn_job?: {
+    video_url: string;
+    subtitles_url: string;
+    source_res: 'original' | 'proxy';
+    cue_count: number;
+  };
   // Present only when action='render_audio' — the signed clip list + render
   // params the worker needs to call Railway /mix-final and upload to S3.
   audio_job?: {
@@ -171,6 +179,37 @@ async function uploadAndSign(storage: StorageHandle, bucket: string, key: string
   return presignS3Url({ method: 'GET', storage: scoped, key, expiresIn: 3600 });
 }
 
+// ─── Railway /burn-subtitles caller (worker-side — no function ceiling) ───
+// Takes a signed source video URL + a signed compiled-ASS URL and returns the
+// hardsub MP4 bytes (video RE-ENCODED via the subtitles filter, audio copied).
+// This is a minutes-long re-encode on a feature-length program — the worker's
+// heartbeat-extended lock (not a function tick) is what makes it viable.
+async function callBurnSubtitles(opts: {
+  railwayUrl: string;
+  railwayKey: string;
+  videoUrl: string;
+  subtitlesUrl: string;
+}): Promise<Uint8Array> {
+  const base = opts.railwayUrl.replace(/\/+$/, '');
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), RAILWAY_MIX_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${base}/burn-subtitles`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${opts.railwayKey}` },
+      body: JSON.stringify({ video_url: opts.videoUrl, subtitles_url: opts.subtitlesUrl, output_format: 'mp4' }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(`Railway /burn-subtitles failed (${res.status}): ${errText.slice(0, 500)}`);
+    }
+    return new Uint8Array(await res.arrayBuffer());
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function slugifyLabel(s: string) {
   return String(s || 'speaker').replace(/[^a-zA-Z0-9]/g, '_').slice(0, 40);
 }
@@ -182,6 +221,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
     s3_bucket, s3_key, s3_region, credential_secret_prefix,
     suggested_filename, cc_options, user_email, request_id, auth_token,
     audio_mode, loudness_target_lufs, mix_recipe, source_res,
+    cc_mode, cc_burn_source_res,
   } = job.data as ExportJobData & {
     railway_url?: string; railway_api_key?: string;
   };
@@ -221,9 +261,13 @@ export async function processExportProject(job: Job<ExportJobData>) {
           loudness_target_lufs: loudness_target_lufs ?? null,
           mix_recipe: mix_recipe ?? null,
           source_res: source_res || null,
+          cc_mode: cc_mode || null,
+          cc_burn_source_res: cc_burn_source_res || null,
           user_email, request_id, carry,
           // Echoed back when the worker calls finalize_audio after rendering.
           audio_result: (carry as { _audio_result?: unknown } | undefined)?._audio_result,
+          // Echoed back when the worker calls finalize_burn after hardsub.
+          burn_result: (carry as { _burn_result?: unknown } | undefined)?._burn_result,
         },
         timeoutMs: FUNCTION_CALL_TIMEOUT_MS,
       });
@@ -320,6 +364,34 @@ export async function processExportProject(job: Job<ExportJobData>) {
 
         // Carry the result into the next tick (finalize_audio reads audio_result).
         carry = { ...(step.carry as object), _audio_result: audioResult };
+        continue;
+      }
+
+      // ── burn_subtitles: do the long Railway /burn-subtitles hardsub here ──
+      // Same worker-owned-render pattern as render_audio: the function prepared
+      // a signed source video + a signed compiled ASS; the worker calls Railway
+      // (which re-encodes the video with the captions baked in — minutes-long),
+      // uploads the MP4 to S3, then re-calls the step at phase='finalize_burn'.
+      if (step.action === 'burn_subtitles') {
+        if (!railwayUrl || !railwayKey) {
+          throw new Error('export-project(cc burn_in): Railway URL/key not provided in job payload');
+        }
+        const bj = step.burn_job!;
+        const s3 = buildWorkerS3(s3_region, credential_secret_prefix);
+        const key = `dubflow/exports/${project_id}/${export_job_id}/${suggested_filename}`;
+        const mp4Bytes = await callBurnSubtitles({
+          railwayUrl, railwayKey, videoUrl: bj.video_url, subtitlesUrl: bj.subtitles_url,
+        });
+        await uploadMp4(s3, s3_bucket, key, mp4Bytes, suggested_filename);
+        await logEvent({
+          function_name: 'bullmq:export-project',
+          event: 'cc_burn_complete',
+          context: { export_job_id, project_id, source_res: bj.source_res, cue_count: bj.cue_count, user_email, request_id },
+        });
+        carry = {
+          ...(step.carry as object),
+          _burn_result: { s3_key: key, file_size_bytes: mp4Bytes.length, mime_type: 'video/mp4' },
+        };
         continue;
       }
 
