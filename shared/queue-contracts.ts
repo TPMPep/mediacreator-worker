@@ -1462,19 +1462,31 @@ export const ORCHESTRATOR_JOB_OPTIONS = {
   removeOnFail: { age: 86400 * 7 },
 };
 
-// Proxy-gen: even more conservative than orchestrator. Each retry costs
-// 5-15 min of Railway compute, so we want at most ONE retry before DLQ.
-// Deterministic ffmpeg failures (non-zero exit code, missing source) throw
-// UnrecoverableError in the processor to skip retry entirely.
+// Proxy-gen: attempts=6. The extractor runs a bounded heavy-lane gate that
+// returns a FAST-503 'proxy_lane_busy' when N concurrent proxy transcodes are
+// already running — EXPECTED backpressure under 100+ concurrent users. A proxy
+// job therefore needs enough retry headroom to wait (via BullMQ backoff, never
+// a held-open HTTP connection) for a slot to free. Exponential backoff (30s
+// base) spaces retries 30s→60s→120s→240s→300s(capped) so a busy lane reliably
+// clears. Crucially, a GENUINE transcode failure (ffmpeg non-zero exit, missing
+// source) throws UnrecoverableError in the processor and skips ALL retries with
+// zero wasted compute — so the extra attempts ONLY ever benefit
+// transient/lane-busy cases, never a deterministic failure. The processor also
+// classifies HTTP 503 as ProxyLaneBusyError (logged as backpressure, not an
+// error) and only flips Project.proxy_status='failed' when ALL attempts are
+// exhausted.
 //
 // Retry policy auditor framing (SOC 2 CC7.4 — Subprocessor / Vendor Failure
-// Response): bounded retry on transient failures (network blips, Railway
-// pod restarts), immediate DLQ on deterministic failures. Every retry +
-// every DLQ entry is auditable via BullMQ failedReason + the StructuredLog
-// rows the processor emits.
+// Response): bounded retry on transient/backpressure failures, immediate DLQ on
+// deterministic failures. Every retry + every DLQ entry is auditable via BullMQ
+// failedReason + the StructuredLog rows the processor emits.
+//
+// NOTE: this constant is REFERENCE — the generateProxy producer inlines its own
+// identical options (Base44 functions can't import the worker bundle). Keep the
+// two in lockstep.
 export const PROXY_GEN_JOB_OPTIONS = {
-  attempts: 2,
-  backoff: { type: 'exponential' as const, delay: 30000 }, // 30s then DLQ
+  attempts: 6,
+  backoff: { type: 'exponential' as const, delay: 30000 }, // 30s,60s,120s,240s,300s(cap)
   removeOnComplete: { age: 3600, count: 200 },
   removeOnFail: { age: 86400 * 7 },                         // keep failed 7d for DLQ
 };
