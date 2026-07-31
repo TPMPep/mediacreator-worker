@@ -52,6 +52,21 @@ import { UnrecoverableError, type Job } from 'bullmq';
 import type { ProxyGenJobData } from '../../shared/queue-contracts.js';
 import { invokeBase44Function, logEvent, runWithLockHeartbeat, WorkerLockLostError } from '../base44-client.js';
 
+/**
+ * Thrown when the extractor's heavy-lane proxy semaphore is full (HTTP 503
+ * `proxy_lane_busy`). This is EXPECTED backpressure, not a failure: no transcode
+ * ran, no compute was wasted. The processor treats it as a retryable transient
+ * (BullMQ backoff owns the wait) and NEVER marks the Project proxy_status=failed
+ * on it. SOC 2 CC7.2 — bounded concurrency backpressure is a distinct,
+ * attributable, non-failure signal.
+ */
+class ProxyLaneBusyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProxyLaneBusyError';
+  }
+}
+
 // Per-call budgets.
 const FINALIZER_TIMEOUT_MS = 90_000;
 // Railway proxy-gen ceiling. ffmpeg at the 720p/2Mbps profile on a small
@@ -126,6 +141,17 @@ async function callRailway(
     if (lockSignal) lockSignal.removeEventListener('abort', onLock);
   }
 
+  // 503 = heavy-lane FAST-503 gate: the extractor's proxy semaphore is full, so
+  // it declined IMMEDIATELY (no transcode ran, no compute wasted). This is the
+  // EXPECTED backpressure signal under concurrent proxy load — NOT a failure.
+  // Throw a distinct ProxyLaneBusyError so the processor logs it as backpressure
+  // (not an error) and BullMQ retries it with exponential backoff. The wait is
+  // owned HERE (worker backoff), never by a held-open HTTP connection, so a
+  // Cloudflare 524 is impossible. SOC 2 CC7.2.
+  if (res.status === 503) {
+    const body = await res.text().catch(() => '');
+    throw new ProxyLaneBusyError(`railway /generate-proxy-sync → HTTP 503 (lane busy): ${body.slice(0, 300)}`);
+  }
   // Bad input → don't retry. ffmpeg non-zero exit, malformed source media,
   // missing S3 keys: all deterministic, retry wastes another 5-15min of
   // Railway compute and produces another identical failure row (auditor
@@ -137,7 +163,7 @@ async function callRailway(
       `railway /generate-proxy-sync → HTTP ${res.status}: ${body.slice(0, 500)}`,
     );
   }
-  // Transient (5xx / network) → throw plain Error so BullMQ retries per
+  // Transient (other 5xx / network) → throw plain Error so BullMQ retries per
   // PROXY_GEN_JOB_OPTIONS.attempts.
   if (!res.ok) {
     const body = await res.text().catch(() => '');
@@ -271,6 +297,29 @@ export async function processProxyGen(job: Job<ProxyGenJobData>) {
         context: { project_id, user_email, request_id, attempts: job.attemptsMade + 1 },
       });
       throw err;
+    }
+    // Heavy-lane backpressure (extractor 503). EXPECTED under concurrent proxy
+    // load — the extractor declined immediately, nothing was wasted. Log as
+    // backpressure (warn, NOT error) and re-throw so BullMQ retries with
+    // backoff. Critically, we do NOT run the terminal action='fail' finalizer:
+    // the Project stays proxy_status='generating' until a retry lands a slot.
+    // Only when BullMQ exhausts ALL attempts does the generic block below flip
+    // it to failed. SOC 2 CC7.2.
+    if (e instanceof ProxyLaneBusyError) {
+      const laneBusyWillRetry = job.attemptsMade + 1 < (job.opts.attempts ?? 1);
+      await logEvent({
+        function_name: 'bullmq:proxy-gen',
+        level: 'warn',
+        event: 'proxy_gen_lane_busy',
+        message: e.message,
+        error_kind: 'lane_busy_backpressure',
+        duration_ms: Date.now() - t0,
+        context: { project_id, user_email, request_id, attempts: job.attemptsMade + 1, will_retry: laneBusyWillRetry },
+      });
+      // If retries remain, just re-throw (BullMQ backoff owns the wait). If this
+      // was the LAST attempt, fall through to the terminal-fail path below so a
+      // sustained lane saturation still surfaces instead of hanging 'generating'.
+      if (laneBusyWillRetry) throw err;
     }
     const isUnrecoverable = e instanceof UnrecoverableError;
     const willRetry = !isUnrecoverable && job.attemptsMade + 1 < (job.opts.attempts ?? 1);
