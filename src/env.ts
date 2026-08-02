@@ -224,6 +224,14 @@ export const env = {
   // to finish). Default 4 — comfortable for 100+ concurrent users without
   // amplifying Base44 write pressure. Env-overridable.
   CONCURRENCY_CONSENSUS_TRANSCRIPTION: intEnv('WORKER_CONCURRENCY_CONSENSUS_TRANSCRIPTION', 4),
+  // Synthetic Performance Match capture (2026-08-01). ISOLATED lane so a capture
+  // burst never starves human editors. Each in-flight job is one tick-resumable
+  // run against ONE PerformanceCaptureRun; each tick analyzes ONE segment (extract
+  // audio clip → Gemini → write), so between ticks the slot is briefly idle. The
+  // real bottleneck is the per-tick Base44 write budget + Gemini rate, not
+  // parallelism. Default 4 — comfortable for 100+ concurrent users without
+  // amplifying Base44 write pressure. Env-overridable.
+  CONCURRENCY_PERFORMANCE_CAPTURE: intEnv('WORKER_CONCURRENCY_PERFORMANCE_CAPTURE', 4),
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
