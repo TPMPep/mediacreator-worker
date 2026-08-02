@@ -286,6 +286,24 @@ export const QUEUE_NAMES = {
   // (resumable), CC7.4 (bounded spend + degrade never re-doubles), CC8.1
   // (every merged word attributable to the pinned arbitration_policy).
   CONSENSUS_TRANSCRIPTION: 'consensus-transcription',
+  // Synthetic Performance Match capture pipeline (2026-08-01). ISOLATED lane.
+  // Single-shot tick-resumable job per PerformanceCaptureRun. The worker calls
+  // performanceCaptureWorkerStep in a loop; the step advances ONE segment per
+  // tick (resumable via checkpoint.cursor) — it extracts that segment's ORIGINAL
+  // audio clip (Railway audio extractor), calls Gemini audio-native to detect the
+  // speaker's delivery (emotion + inline events), DROPS every tag below its
+  // per-kind confidence floor (never hallucinate), and writes the v3 performance
+  // direction + inline cues onto the TranslationSegment. Gemini runs INSIDE the
+  // Base44 function (GEMINI_API_KEY held there), invoked per-tick by this worker
+  // with a scoped JWT — never from this worker or a browser. It ~consumes one
+  // audio→LLM analysis per in-scope segment, so the producer
+  // (enqueuePerformanceCapture) enforces a HARD cost-cap gate + producer/manager/
+  // admin RBAC BEFORE this job is ever minted. Its OWN concurrency lane
+  // (CONCURRENCY_PERFORMANCE_CAPTURE, default 4) so a capture burst never starves
+  // human editors. SOC 2 CC7.2 (resumable), CC7.4 (bounded spend), CC8.1 (every
+  // cue attributable to the pinned vocabulary + confidence thresholds; dropped
+  // low-confidence cues are counted, never emitted).
+  PERFORMANCE_CAPTURE: 'performance-capture',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -1393,6 +1411,40 @@ export interface ConsensusTranscriptionJobData {
   auth_token: string;
 }
 
+// ─── Performance-capture payload (2026-08-01) ────────────────────────────────
+//
+// Single-shot tick-resumable job. The worker calls performanceCaptureWorkerStep
+// in a loop; the step reads the PerformanceCaptureRun off the DB (keyed by
+// capture_run_id) and advances ONE segment per tick (resumable via
+// checkpoint.cursor). The parsed run config / segment scope is NEVER in this
+// payload — the step reads it off the row + the DB (the reproducibility anchor).
+// FULLY ISOLATED to the Synthetic Performance Match pipeline.
+//
+// SECURITY MODEL — identical to consensus-transcription:
+//   • Scoped JWT (30-min TTL) bound to (user, project, capture_run_id,
+//     'performanceCaptureWorkerStep'). Worker forwards verbatim as X-Worker-JWT.
+//
+// AUDIT POSTURE (SOC 2 CC7.2 / CC7.4 / CC8.1):
+//   • PerformanceCaptureRun is the audit row; status + current_phase +
+//     cost_cap_decision + checkpoint + confidence_thresholds answer "who ran
+//     capture, was the cap honored, how far did it get, and were low-confidence
+//     cues dropped?" from a single row.
+//   • BullMQ retains failed jobs 7d — every failed run is DLQ-queryable.
+export interface PerformanceCaptureJobData {
+  schema_version: number;
+  /** Owning Project.id. */
+  project_id: string;
+  /** PerformanceCaptureRun.id — the run this job advances. */
+  capture_run_id: string;
+  /** Producer/manager/admin that triggered capture (preserved for attribution). */
+  user_email: string;
+  /** Correlation id threaded into every StructuredLog row for this run. */
+  request_id: string;
+  /** Scoped JWT bound to (user, project, capture_run_id,
+   *  'performanceCaptureWorkerStep'). 30-min TTL. */
+  auth_token: string;
+}
+
 // Discriminated union for processors that need to handle multiple shapes.
 export type AnyJobData =
    | VoiceGenJobData
@@ -1421,7 +1473,8 @@ export type AnyJobData =
    | GltvCascadeJobData
    | SrtTranslateJobData
    | MEPollJobData
-   | ConsensusTranscriptionJobData;
+   | ConsensusTranscriptionJobData
+   | PerformanceCaptureJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
 
