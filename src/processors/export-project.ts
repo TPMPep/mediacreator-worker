@@ -13,6 +13,7 @@
 import type { Job } from 'bullmq';
 import type { ExportJobData } from '../../shared/queue-contracts.js';
 import { invokeBase44Function, logEvent } from '../base44-client.js';
+import { env } from '../env.js';
 // Zero-dependency WebCrypto SigV4 signer (replaces @aws-sdk/@smithy — incident
 // 2026-07-07/08). STS session-token aware. See ../s3-signer.ts.
 import { presignS3Url, putS3Object, storageFromEnv, type StorageHandle } from '../s3-signer.js';
@@ -232,13 +233,34 @@ export async function processExportProject(job: Job<ExportJobData>) {
     throw new Error('export-project: missing auth_token (job from a stale schema — re-enqueue required)');
   }
 
-  // Heartbeat
+  // Heartbeat — extends the BullMQ lock AND stamps a liveness beat + coarse
+  // render_phase onto the ExportJob row every 15s for the ENTIRE long render.
+  // The worker has no SDK, so it calls the exportRenderHeartbeat Base44 fn
+  // (scoped by the SAME worker JWT it already holds). currentPhase is advanced
+  // at real transitions below (rendering_mix → muxing_video → uploading, etc.)
+  // so the editor toast can tell 'working' (fresh beat) from 'stuck' (frozen
+  // beat). Best-effort — a heartbeat hiccup NEVER interrupts the render.
+  // SOC 2 CC7.2 — the render's liveness is provable from the row, not a client
+  // timer that a page refresh would lose.
+  let currentPhase: string = 'rendering_mix';
+  const postRenderHeartbeat = async () => {
+    try {
+      const base = (env.BASE44_FUNCTION_URL || '').replace(/\/+$/, '');
+      if (!base || !auth_token) return;
+      await fetch(`${base}/exportRenderHeartbeat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Worker-JWT': auth_token },
+        body: JSON.stringify({ export_job_id, phase: currentPhase }),
+      });
+    } catch { /* advisory — never fail the render on a heartbeat write */ }
+  };
   let heartbeatActive = true;
   const heartbeat = (async () => {
     while (heartbeatActive) {
       await new Promise(r => setTimeout(r, HEARTBEAT_MS));
       if (!heartbeatActive) break;
       try { await job.extendLock(job.token!, 30_000); } catch { /* lock may have advanced */ }
+      await postRenderHeartbeat();
     }
   })();
 
@@ -287,6 +309,11 @@ export async function processExportProject(job: Job<ExportJobData>) {
         const aj = step.audio_job!;
         const baseKeyPrefix = `dubflow/exports/${project_id}/${export_job_id}/`;
         const s3 = buildWorkerS3(s3_region, credential_secret_prefix);
+        // Entering the Railway /mix-final render — advance the coarse phase +
+        // fire an immediate beat so the editor toast flips to "Rendering mix"
+        // without waiting for the next 15s tick. SOC 2 CC7.2.
+        currentPhase = 'rendering_mix';
+        await postRenderHeartbeat();
 
         let audioResult: unknown;
         if (aj.mode === 'per_speaker') {
@@ -335,7 +362,10 @@ export async function processExportProject(job: Job<ExportJobData>) {
           // 2) Park the mix WAV in S3 + sign it so /mux-video can fetch it.
           const mixKey = `${baseKeyPrefix}_mix_intermediate.wav`;
           const mixSignedUrl = await uploadAndSign(s3, s3_bucket, mixKey, mixBytes);
-          // 3) Mux the mix onto the source video (-c:v copy) → MP4.
+          // 3) Mux the mix onto the source video (-c:v copy) → MP4. Advance the
+          // phase so the editor toast shows "Muxing video", not a stale "mix".
+          currentPhase = 'muxing_video';
+          await postRenderHeartbeat();
           if (!aj.video_url) throw new Error('video_mux: no source video URL provided');
           const mp4Bytes = await callMuxVideo({
             railwayUrl, railwayKey, videoUrl: aj.video_url, audioUrl: mixSignedUrl,
@@ -379,6 +409,10 @@ export async function processExportProject(job: Job<ExportJobData>) {
         const bj = step.burn_job!;
         const s3 = buildWorkerS3(s3_region, credential_secret_prefix);
         const key = `dubflow/exports/${project_id}/${export_job_id}/${suggested_filename}`;
+        // Hardsub re-encode — advance the phase so the editor toast shows
+        // "Burning subtitles" for the whole minutes-long encode. SOC 2 CC7.2.
+        currentPhase = 'burning_subtitles';
+        await postRenderHeartbeat();
         const mp4Bytes = await callBurnSubtitles({
           railwayUrl, railwayKey, videoUrl: bj.video_url, subtitlesUrl: bj.subtitles_url,
         });
