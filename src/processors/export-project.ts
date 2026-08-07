@@ -49,7 +49,7 @@ interface PhaseStepResponse {
   // params the worker needs to call Railway /mix-final and upload to S3.
   audio_job?: {
     mode: 'full_mix' | 'per_speaker' | 'video_dub_me' | 'video_mux';
-    clips: Array<{ url: string; start_ms: number; speaker_id: string; max_duration_ms?: number | null; playback_rate?: number }>;
+    clips: Array<{ url: string; start_ms: number; speaker_id: string; max_duration_ms?: number | null; playback_rate?: number; overrun_ms?: number }>;
     duration_ms: number;
     me_track_url: string | null;
     loudness_target_lufs: number | null;
@@ -307,6 +307,12 @@ export async function processExportProject(job: Job<ExportJobData>) {
           throw new Error('export-project(audio): Railway URL/key not provided in job payload');
         }
         const aj = step.audio_job!;
+        // Final defense-in-depth: even if a stale producer bypassed preflight,
+        // the worker refuses any timed clip that would be truncated by Railway.
+        const timedOverruns = aj.clips.filter(c => Number(c.overrun_ms || 0) > 80);
+        if (timedOverruns.length > 0) {
+          throw new Error(`Timed-audio integrity refusal: ${timedOverruns.length} clip(s) exceed their authored window; render not started.`);
+        }
         const baseKeyPrefix = `dubflow/exports/${project_id}/${export_job_id}/`;
         const s3 = buildWorkerS3(s3_region, credential_secret_prefix);
         // Entering the Railway /mix-final render — advance the coarse phase +
