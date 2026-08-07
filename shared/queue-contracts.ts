@@ -335,6 +335,13 @@ export interface VoiceGenJobData {
    * SOC 2 CC7.2 zombie-JobRun gap. Optional for legacy/direct callers.
    */
   job_run_id?: string;
+  /** True only for an interactive one-segment run. Enables one immediate,
+   * authoritative finalizer call after the child commits; bulk runs omit it. */
+  single_segment_run?: boolean;
+  /** Run-scoped finalizer JWT, present only when single_segment_run=true.
+   * Failure is non-blocking because the orchestrator's delayed monitor remains
+   * the browser-independent recovery path. */
+  finalizer_token?: string;
   /**
    * Server-authoritative audit trigger, classified by the trusted producer
    * (runVoiceGeneration) from the run's force flag + segment count:
