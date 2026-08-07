@@ -16,6 +16,9 @@ export async function processVoiceGen(job: Job<VoiceGenJobData>) {
     performance_prompt, cue_stability,
     user_email, request_id, auth_token,
     job_run_id,
+    // Interactive one-segment completion accelerator. Bulk jobs never receive
+    // these fields, so their bounded run-level finalization remains unchanged.
+    single_segment_run, finalizer_token,
     // Server-authoritative audit trigger from the producer. Forwarded verbatim;
     // generateOneSegment validates + trust-gates it (worker-JWT only, enum only).
     trigger,
@@ -78,11 +81,37 @@ export async function processVoiceGen(job: Job<VoiceGenJobData>) {
       },
       timeoutMs: 5 * 60 * 1000,
     });
+    // The atomic segment commit is complete. For the ONE-segment interactive
+    // path, finalize now instead of waiting for the orchestrator's next 4s sweep.
+    // This is one extra call per RUN (never per item in a bulk run), so SDK load
+    // is unchanged in order while cue/performance regeneration loses the fixed
+    // completion-tail latency. Best-effort: delayed worker finalization remains
+    // authoritative recovery if replication or a transient gateway error occurs.
+    let fastFinalizeStatus: string | null = null;
+    if (single_segment_run === true && finalizer_token && job_run_id) {
+      try {
+        const final = await invokeBase44Function<{ status?: string }>({
+          fn: 'finalizeVoiceGenerationRun',
+          authToken: finalizer_token,
+          payload: { job_run_id },
+          timeoutMs: 90 * 1000,
+        });
+        fastFinalizeStatus = final.status || null;
+      } catch (finalizeErr) {
+        await logEvent({
+          function_name: 'bullmq:voice-gen',
+          level: 'warn',
+          event: 'single_segment_fast_finalize_deferred',
+          message: (finalizeErr as Error).message,
+          context: { project_id, segment_id, job_run_id, request_id, user_email },
+        });
+      }
+    }
     await logEvent({
       function_name: 'bullmq:voice-gen',
       event: 'voice_generation_complete',
       duration_ms: Date.now() - t0,
-      context: { project_id, segment_id, target_language, attempts: job.attemptsMade + 1, request_id, user_email },
+      context: { project_id, segment_id, target_language, attempts: job.attemptsMade + 1, request_id, user_email, single_segment_run: single_segment_run === true, fast_finalize_status: fastFinalizeStatus },
     });
     return result;
   } catch (err) {
