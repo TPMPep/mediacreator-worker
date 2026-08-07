@@ -35,6 +35,15 @@ interface OrchestratorTickResult {
   tick_ms?: number;
 }
 
+interface FinalizeTickResult {
+  success?: boolean;
+  status?: string;
+  recovering?: boolean;
+  new_run_id?: string;
+}
+
+const FINALIZE_TICK_DELAY_MS = 4_000;
+
 let _selfQueue: Queue | null = null;
 function getSelfQueue(): Queue {
   if (!_selfQueue) {
@@ -45,7 +54,7 @@ function getSelfQueue(): Queue {
 
 export async function processVoiceGenOrchestrator(job: Job<VoiceGenOrchestratorJobData>) {
   const t0 = Date.now();
-  const { project_id, job_run_id, user_email, request_id, auth_token } = job.data;
+  const { project_id, job_run_id, user_email, request_id, auth_token, finalizer_token } = job.data;
 
   if (!auth_token) throw new Error('voice-gen-orchestrator: missing auth_token');
 
@@ -57,6 +66,38 @@ export async function processVoiceGenOrchestrator(job: Job<VoiceGenOrchestratorJ
   }, 15_000);
 
   try {
+    // Once fan-out completes, this same lightweight queue becomes a delayed
+    // completion monitor. It releases its worker slot between ticks and calls
+    // the authoritative finalizer with a run-scoped JWT, so completion never
+    // depends on an editor tab remaining open.
+    if (job.data.state?.phase === 'finalizing') {
+      if (!finalizer_token) throw new Error('voice-gen-orchestrator: missing finalizer_token');
+      const final = await invokeBase44Function<FinalizeTickResult>({
+        fn: 'finalizeVoiceGenerationRun',
+        authToken: finalizer_token,
+        payload: { job_run_id },
+        timeoutMs: 90 * 1000,
+      });
+      const finalizeTickCount = (job.data.state.finalize_tick_count || 0) + 1;
+      await logEvent({
+        function_name: 'bullmq:voice-gen-orchestrator',
+        event: 'finalize_tick_complete',
+        duration_ms: Date.now() - t0,
+        context: { project_id, job_run_id, status: final.status || 'unknown', finalize_tick_count: finalizeTickCount },
+      });
+      if (final.status === 'running') {
+        await getSelfQueue().add(
+          QUEUE_NAMES.VOICE_GEN_ORCHESTRATOR,
+          {
+            ...job.data,
+            state: { ...job.data.state, phase: 'finalizing', finalize_tick_count: finalizeTickCount },
+          },
+          { ...ORCHESTRATOR_JOB_OPTIONS, delay: FINALIZE_TICK_DELAY_MS },
+        );
+      }
+      return final;
+    }
+
     const result = await invokeBase44Function<OrchestratorTickResult>({
       fn: 'orchestrateVoiceGenerationRun',
       authToken: auth_token,
@@ -99,6 +140,7 @@ export async function processVoiceGenOrchestrator(job: Job<VoiceGenOrchestratorJ
           user_email,
           request_id,
           auth_token,
+          finalizer_token,
           inlined_plan: job.data.inlined_plan,
           state: result.next_state,
         },
@@ -106,6 +148,15 @@ export async function processVoiceGenOrchestrator(job: Job<VoiceGenOrchestratorJ
           ...ORCHESTRATOR_JOB_OPTIONS,
           delay: result.next_tick_delay_ms ?? 500,
         },
+      );
+    } else if (result.finalized && finalizer_token) {
+      await getSelfQueue().add(
+        QUEUE_NAMES.VOICE_GEN_ORCHESTRATOR,
+        {
+          ...job.data,
+          state: { ...job.data.state, phase: 'finalizing', finalize_tick_count: 0 },
+        },
+        { ...ORCHESTRATOR_JOB_OPTIONS, delay: 1_000 },
       );
     }
 
