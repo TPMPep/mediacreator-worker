@@ -410,6 +410,8 @@ export interface VoiceGenOrchestratorJobData {
   request_id: string;
   /** Scoped JWT bound to (user, project, job_run_id, 'orchestrateVoiceGenerationRun'). 30 min TTL. */
   auth_token: string;
+  /** Run-scoped JWT used by delayed worker-owned finalization ticks. */
+  finalizer_token: string;
   /** Immutable run config — frozen at producer time. */
   inlined_plan: {
     target_language: string;
@@ -427,6 +429,11 @@ export interface VoiceGenOrchestratorJobData {
     enqueue_failed_count: number;
     enqueue_failed_ids: string[];
     tick_count: number;
+    phase?: 'dispatching' | 'finalizing';
+    finalize_tick_count?: number;
+    auto_resume_count?: number;
+    root_run_id?: string;
+    resumed_from_run_id?: string | null;
   };
 }
 
