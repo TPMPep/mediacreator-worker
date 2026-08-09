@@ -11,6 +11,12 @@
 // =============================================================================
 
 import type { Job } from 'bullmq';
+import { createWriteStream } from 'node:fs';
+import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import type { ExportJobData } from '../../shared/queue-contracts.js';
 import { invokeBase44Function, logEvent } from '../base44-client.js';
 import { env } from '../env.js';
@@ -120,6 +126,60 @@ async function callMixFinal(opts: {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function postRailwayToFile(opts: {
+  url: string; railwayKey: string; body: Record<string, unknown>;
+  filePath: string; label: string;
+}): Promise<{ size: number }> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), RAILWAY_MIX_TIMEOUT_MS);
+  try {
+    const response = await fetch(opts.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${opts.railwayKey}` },
+      body: JSON.stringify(opts.body), signal: ctrl.signal,
+    });
+    if (!response.ok || !response.body) {
+      const detail = await response.text().catch(() => '');
+      throw new Error(`${opts.label} failed (${response.status}): ${detail.slice(0, 500)}`);
+    }
+    await pipeline(Readable.fromWeb(response.body as any), createWriteStream(opts.filePath));
+    const info = await stat(opts.filePath);
+    if (info.size === 0) throw new Error(`${opts.label} returned an empty file`);
+    return { size: info.size };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function callMixFinalToFile(opts: {
+  railwayUrl: string; railwayKey: string; filePath: string;
+  clips: Array<{ url: string; start_ms: number; gain_db?: number; max_duration_ms?: number | null; playback_rate?: number }>;
+  durationMs: number; meTrackUrl?: string | null; meGainDb?: number;
+  vocalsTrackUrl?: string | null; vocalsGainDb?: number | null; loudnessTargetLufs?: number | null;
+}) {
+  const base = opts.railwayUrl.replace(/\/+$/, '');
+  return postRailwayToFile({
+    url: `${base}/mix-final`, railwayKey: opts.railwayKey, filePath: opts.filePath, label: 'Railway /mix-final',
+    body: {
+      clips: opts.clips, duration_ms: opts.durationMs, output_format: 'flac', sample_rate: 48000,
+      fade_in_ms: 8, fade_out_ms: 12,
+      ...(opts.meTrackUrl ? { me_track: { url: opts.meTrackUrl, gain_db: opts.meGainDb ?? -6 } } : {}),
+      ...(opts.vocalsTrackUrl ? { vocals_track: { url: opts.vocalsTrackUrl, gain_db: opts.vocalsGainDb ?? -18 } } : {}),
+      ...(opts.loudnessTargetLufs != null ? { loudness_target_lufs: opts.loudnessTargetLufs } : {}),
+    },
+  });
+}
+
+async function callMuxVideoToFile(opts: {
+  railwayUrl: string; railwayKey: string; videoUrl: string; audioUrl: string; filePath: string;
+}) {
+  const base = opts.railwayUrl.replace(/\/+$/, '');
+  return postRailwayToFile({
+    url: `${base}/mux-video`, railwayKey: opts.railwayKey, filePath: opts.filePath, label: 'Railway /mux-video',
+    body: { video_url: opts.videoUrl, audio_url: opts.audioUrl, output_format: 'mp4', audio_codec: 'aac', audio_bitrate: '256k' },
+  });
 }
 
 async function transcodeSegment(opts: {
@@ -417,30 +477,35 @@ export async function processExportProject(job: Job<ExportJobData>) {
           //    • optional original-dialogue (vocals) stem at vocals_gain_db
           //    • loudnorm as the final stage (absolute delivery loudness)
           const dubGain = aj.dub_gain_db ?? 0;
-          const mixBytes = await callMixFinal({
-            railwayUrl, railwayKey,
-            clips: aj.clips.map(c => ({ url: c.url, start_ms: c.start_ms, gain_db: dubGain, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate })),
-            durationMs: aj.duration_ms,
-            meTrackUrl: aj.me_track_url,
-            meGainDb: aj.me_gain_db,
-            vocalsTrackUrl: aj.vocals_track_url || null,
-            vocalsGainDb: aj.vocals_gain_db ?? null,
-            loudnessTargetLufs: aj.loudness_target_lufs,
-          });
-          // 2) Park the mix WAV in S3 + sign it so /mux-video can fetch it.
-          const mixKey = `${baseKeyPrefix}_mix_intermediate.wav`;
-          const mixSignedUrl = await uploadAndSign(s3, s3_bucket, mixKey, mixBytes);
-          // 3) Mux the mix onto the source video (-c:v copy) → MP4. Advance the
-          // phase so the editor toast shows "Muxing video", not a stale "mix".
-          currentPhase = 'muxing_video';
-          await postRenderHeartbeat();
-          if (!aj.video_url) throw new Error('video_mux: no source video URL provided');
-          const mp4Bytes = await callMuxVideo({
-            railwayUrl, railwayKey, videoUrl: aj.video_url, audioUrl: mixSignedUrl,
-          });
-          const key = `${baseKeyPrefix}${suggested_filename}`;
-          await uploadMp4(s3, s3_bucket, key, mp4Bytes, suggested_filename);
-          audioResult = { s3_key: key, file_size_bytes: mp4Bytes.length, mime_type: 'video/mp4' };
+          const renderDir = await mkdtemp(join(tmpdir(), `video-mux-${export_job_id}-`));
+          try {
+            // Disk-backed + lossless-compressed: feature-length mixes never sit
+            // in extractor or worker RAM as a 700MB+ WAV.
+            const mixPath = join(renderDir, 'mix.flac');
+            await callMixFinalToFile({
+              railwayUrl, railwayKey, filePath: mixPath,
+              clips: aj.clips.map(c => ({ url: c.url, start_ms: c.start_ms, gain_db: dubGain, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate })),
+              durationMs: aj.duration_ms, meTrackUrl: aj.me_track_url, meGainDb: aj.me_gain_db,
+              vocalsTrackUrl: aj.vocals_track_url || null, vocalsGainDb: aj.vocals_gain_db ?? null,
+              loudnessTargetLufs: aj.loudness_target_lufs,
+            });
+            const mixKey = `${baseKeyPrefix}_mix_intermediate.flac`;
+            await putS3File({ ...s3, bucket: s3_bucket }, mixKey, mixPath, { contentType: 'audio/flac', timeoutMs: RAILWAY_MIX_TIMEOUT_MS });
+            const mixSignedUrl = await presignS3Url({ method: 'GET', storage: { ...s3, bucket: s3_bucket }, key: mixKey, expiresIn: 3600 });
+
+            currentPhase = 'muxing_video';
+            await postRenderHeartbeat();
+            if (!aj.video_url) throw new Error('video_mux: no source video URL provided');
+            const mp4Path = join(renderDir, 'deliverable.mp4');
+            await callMuxVideoToFile({ railwayUrl, railwayKey, videoUrl: aj.video_url, audioUrl: mixSignedUrl, filePath: mp4Path });
+            const key = `${baseKeyPrefix}${suggested_filename}`;
+            const uploaded = await putS3File({ ...s3, bucket: s3_bucket }, key, mp4Path, {
+              contentType: 'video/mp4', contentDisposition: `attachment; filename="${suggested_filename}"`, timeoutMs: RAILWAY_MIX_TIMEOUT_MS,
+            });
+            audioResult = { s3_key: key, file_size_bytes: uploaded.size, mime_type: 'video/mp4', output_sha256: uploaded.sha256 };
+          } finally {
+            await rm(renderDir, { recursive: true, force: true });
+          }
         } else {
           const bytes = await callMixFinal({
             railwayUrl, railwayKey,
@@ -547,19 +612,25 @@ export async function processExportProject(job: Job<ExportJobData>) {
       context: { export_job_id, project_id, kind, user_email, request_id, attempts: job.attemptsMade + 1 },
     });
 
-    try {
-      await invokeBase44Function({
-        fn: 'exportProjectWorkerStep',
-        authToken: auth_token,
-        payload: {
-          fail: true,
-          export_job_id, project_id, user_email, request_id,
-          error_message: e.message,
-          duration_ms: Date.now() - t0,
-        },
-        timeoutMs: 30_000,
-      });
-    } catch { /* nothing to do */ }
+    // BullMQ owns the retry. Keep the audit row running between attempts and
+    // terminalize it only when the configured retry budget is exhausted.
+    const maxAttempts = Number(job.opts.attempts || 1);
+    const isFinalAttempt = (job.attemptsMade + 1) >= maxAttempts;
+    if (isFinalAttempt) {
+      try {
+        await invokeBase44Function({
+          fn: 'exportProjectWorkerStep',
+          authToken: auth_token,
+          payload: {
+            fail: true,
+            export_job_id, project_id, user_email, request_id,
+            error_message: e.message,
+            duration_ms: Date.now() - t0,
+          },
+          timeoutMs: 30_000,
+        });
+      } catch { /* watchdog remains the terminal backstop */ }
+    }
 
     throw err;
   } finally {
