@@ -56,7 +56,7 @@ interface PhaseStepResponse {
   // params the worker needs to call Railway /mix-final and upload to S3.
   audio_job?: {
     mode: 'full_mix' | 'per_speaker' | 'per_segment_zip' | 'video_dub_me' | 'video_mux';
-    clips: Array<{ url: string; start_ms: number; speaker_id: string; max_duration_ms?: number | null; playback_rate?: number; overrun_ms?: number; filename?: string; snapshot_id?: string; take_id?: string | null; translation_id?: string; snapshot_at?: string }>;
+    clips: Array<{ url: string; start_ms: number; speaker_id: string; max_duration_ms?: number | null; playback_rate?: number; overrun_ms?: number; scene_placement?: { id?: string; version?: number; preset_key?: string; recipe_hash?: string; recipe?: Record<string, number> } | null; filename?: string; snapshot_id?: string; take_id?: string | null; translation_id?: string; snapshot_at?: string }>;
     duration_ms: number;
     me_track_url: string | null;
     loudness_target_lufs: number | null;
@@ -84,7 +84,7 @@ interface PhaseStepResponse {
 async function callMixFinal(opts: {
   railwayUrl: string;
   railwayKey: string;
-  clips: Array<{ url: string; start_ms: number; gain_db?: number; max_duration_ms?: number | null; playback_rate?: number }>;
+  clips: Array<{ url: string; start_ms: number; gain_db?: number; max_duration_ms?: number | null; playback_rate?: number; scene_placement?: Record<string, unknown> | null }>;
   durationMs: number;
   meTrackUrl?: string | null;
   loudnessTargetLufs?: number | null;
@@ -155,7 +155,7 @@ async function postRailwayToFile(opts: {
 
 async function callMixFinalToFile(opts: {
   railwayUrl: string; railwayKey: string; filePath: string;
-  clips: Array<{ url: string; start_ms: number; gain_db?: number; max_duration_ms?: number | null; playback_rate?: number }>;
+  clips: Array<{ url: string; start_ms: number; gain_db?: number; max_duration_ms?: number | null; playback_rate?: number; scene_placement?: Record<string, unknown> | null }>;
   durationMs: number; meTrackUrl?: string | null; meGainDb?: number;
   vocalsTrackUrl?: string | null; vocalsGainDb?: number | null; loudnessTargetLufs?: number | null;
 }) {
@@ -447,10 +447,10 @@ export async function processExportProject(job: Job<ExportJobData>) {
         } else if (aj.mode === 'per_speaker') {
           // Group clips by speaker, render one WAV per group (serial — gentle
           // on Railway, matches legacy buildFinalMix per_speaker behavior).
-          const groups: Record<string, Array<{ url: string; start_ms: number; max_duration_ms?: number | null; playback_rate?: number }>> = {};
+          const groups: Record<string, Array<{ url: string; start_ms: number; max_duration_ms?: number | null; playback_rate?: number; scene_placement?: Record<string, unknown> | null }>> = {};
           for (const c of aj.clips) {
             // RENDER PARITY (A′): carry per-clip trim + Speed-to-Fit rate through grouping.
-            (groups[c.speaker_id] ||= []).push({ url: c.url, start_ms: c.start_ms, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate });
+            (groups[c.speaker_id] ||= []).push({ url: c.url, start_ms: c.start_ms, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate, scene_placement: c.scene_placement || null });
           }
           const speaker_files: Array<Record<string, unknown>> = [];
           for (const spId of Object.keys(groups)) {
@@ -484,7 +484,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
             const mixPath = join(renderDir, 'mix.flac');
             await callMixFinalToFile({
               railwayUrl, railwayKey, filePath: mixPath,
-              clips: aj.clips.map(c => ({ url: c.url, start_ms: c.start_ms, gain_db: dubGain, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate })),
+              clips: aj.clips.map(c => ({ url: c.url, start_ms: c.start_ms, gain_db: dubGain, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate, scene_placement: c.scene_placement || null })),
               durationMs: aj.duration_ms, meTrackUrl: aj.me_track_url, meGainDb: aj.me_gain_db,
               vocalsTrackUrl: aj.vocals_track_url || null, vocalsGainDb: aj.vocals_gain_db ?? null,
               loudnessTargetLufs: aj.loudness_target_lufs,
@@ -509,7 +509,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
         } else {
           const bytes = await callMixFinal({
             railwayUrl, railwayKey,
-            clips: aj.clips.map(c => ({ url: c.url, start_ms: c.start_ms, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate })),
+            clips: aj.clips.map(c => ({ url: c.url, start_ms: c.start_ms, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate, scene_placement: c.scene_placement || null })),
             durationMs: aj.duration_ms,
             meTrackUrl: aj.me_track_url,
             loudnessTargetLufs: aj.loudness_target_lufs,
