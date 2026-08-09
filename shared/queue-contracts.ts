@@ -960,7 +960,7 @@ export interface AIRewriteChunkResult {
 //   Producer (Base44 fn `enqueueExportProject` and module-specific aliases)
 //     → Validates auth + ownership + format.
 //     → Creates ExportJob (status='queued') for audit + status polling.
-//     → Mints 30-min scoped JWT bound to (user, job_id, 'exportProjectWorkerStep').
+//     → Mints a 4h scoped JWT bound to (user, job_id, 'exportProjectWorkerStep').
 //     → Enqueues ONE ExportJobData job to the export-project queue.
 //
 //   Worker (src/processors/export-project.ts)
@@ -975,7 +975,7 @@ export interface AIRewriteChunkResult {
 //     → Writes ActivityLog 'export.completed' for the audit trail.
 //
 // SECURITY MODEL — same as project-cascade:
-//   • Scoped JWT (30-min TTL) verified by exportProjectWorkerStep.
+//   • Scoped JWT (4h TTL) verified by exportProjectWorkerStep.
 //   • ExportJob.created_by gates who can poll/download.
 //   • Signed URL has 24h TTL — sufficient for the user to download once.
 //
