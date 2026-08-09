@@ -1000,7 +1000,7 @@ export interface ExportJobData {
   project_id: string;
   user_email: string;
   request_id: string;
-  /** Output format — interpreted by the module-specific builder. For kind='audio' always 'wav'. */
+  /** Output format — interpreted by the module-specific builder. Audio uses wav, zip, or mp4 according to audio_mode. */
   format: string;
   /** Target language (when format is per-language: srt/vtt/txt_translation/csv, OR any audio export). */
   target_language_code?: string;
@@ -1021,9 +1021,9 @@ export interface ExportJobData {
    *  that is the 3-stem mix (dubbed + M&E + optional original dialogue) at the
    *  operator's fader levels, normalized. The worker renders the audio via
    *  /mix-final then muxes via /mux-video — one audio code path. */
-  audio_mode?: 'full_mix' | 'per_speaker' | 'video_dub_me' | 'video_mux';
-  /** [audio kind] EBU R128 loudness target (-16 | -23). Null/absent = raw mix.
-   *  Applies only to full_mix / video_dub_me / video_mux; ignored for per_speaker. */
+  audio_mode?: 'full_mix' | 'per_speaker' | 'per_segment_zip' | 'video_dub_me' | 'video_mux';
+  /** [audio kind] EBU R128 loudness target (-16 | -23). Null/absent = raw audio.
+   *  Applies to mixes and each per_segment_zip file; ignored for per_speaker. */
   loudness_target_lufs?: number | null;
   /** [audio kind, video_mux mode] The 3-stem mixing-console fader recipe, pinned
    *  verbatim. Faders control relative BLEND (dB); loudness_target_lufs controls
@@ -1047,7 +1047,7 @@ export interface ExportJobData {
   /** [cc kind, burn_in mode] Which video stream the captions are burned onto.
    *  'original' = full-res source media (deliverable). 'proxy' = 720p editor proxy. */
   cc_burn_source_res?: 'original' | 'proxy';
-  /** Scoped JWT bound to (user, export_job_id, 'exportProjectWorkerStep'). 30 min TTL. */
+  /** Scoped JWT bound to (user, export_job_id, 'exportProjectWorkerStep'). 4h TTL for queued, multi-segment transcodes. */
   auth_token: string;
 }
 
