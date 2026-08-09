@@ -50,7 +50,7 @@ interface PhaseStepResponse {
   // params the worker needs to call Railway /mix-final and upload to S3.
   audio_job?: {
     mode: 'full_mix' | 'per_speaker' | 'per_segment_zip' | 'video_dub_me' | 'video_mux';
-    clips: Array<{ url: string; start_ms: number; speaker_id: string; max_duration_ms?: number | null; playback_rate?: number; overrun_ms?: number; filename?: string; snapshot_id?: string; take_id?: string | null; translation_id?: string }>;
+    clips: Array<{ url: string; start_ms: number; speaker_id: string; max_duration_ms?: number | null; playback_rate?: number; overrun_ms?: number; filename?: string; snapshot_id?: string; take_id?: string | null; translation_id?: string; snapshot_at?: string }>;
     duration_ms: number;
     me_track_url: string | null;
     loudness_target_lufs: number | null;
@@ -273,6 +273,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
   // SOC 2 CC7.2 — the render's liveness is provable from the row, not a client
   // timer that a page refresh would lose.
   let currentPhase: string = 'rendering_mix';
+  let currentProgressPct: number | null = null;
   const postRenderHeartbeat = async () => {
     try {
       const base = (env.BASE44_FUNCTION_URL || '').replace(/\/+$/, '');
@@ -280,7 +281,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
       await fetch(`${base}/exportRenderHeartbeat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Worker-JWT': auth_token },
-        body: JSON.stringify({ export_job_id, phase: currentPhase }),
+        body: JSON.stringify({ export_job_id, phase: currentPhase, progress_hint_pct: currentProgressPct }),
       });
     } catch { /* advisory — never fail the render on a heartbeat write */ }
   };
@@ -369,7 +370,8 @@ export async function processExportProject(job: Job<ExportJobData>) {
               await putS3Object({ ...s3, bucket: s3_bucket }, individualKey, bytes, {
                 contentType, contentDisposition: `attachment; filename="${filename}"`,
               });
-              await archive.add(filename, bytes);
+              await archive.add(filename, bytes, clip.snapshot_at ? new Date(clip.snapshot_at) : undefined);
+              currentProgressPct = 10 + Math.round(((index + 1) / aj.clips.length) * 75);
             }
             const completedArchive = await archive.close();
             currentPhase = 'uploading';
@@ -378,7 +380,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
             const uploaded = await putS3File({ ...s3, bucket: s3_bucket }, key, completedArchive.path, {
               contentType: 'application/zip', contentDisposition: `attachment; filename="${suggested_filename}"`, timeoutMs: 30 * 60 * 1000,
             });
-            audioResult = { s3_key: key, file_size_bytes: uploaded.size, mime_type: 'application/zip' };
+            audioResult = { s3_key: key, file_size_bytes: uploaded.size, mime_type: 'application/zip', output_sha256: uploaded.sha256 };
           } finally {
             await archive.cleanup();
           }
