@@ -16,7 +16,8 @@ import { invokeBase44Function, logEvent } from '../base44-client.js';
 import { env } from '../env.js';
 // Zero-dependency WebCrypto SigV4 signer (replaces @aws-sdk/@smithy — incident
 // 2026-07-07/08). STS session-token aware. See ../s3-signer.ts.
-import { presignS3Url, putS3Object, storageFromEnv, type StorageHandle } from '../s3-signer.js';
+import { presignS3Url, putS3File, putS3Object, storageFromEnv, type StorageHandle } from '../s3-signer.js';
+import { createSegmentZipWriter } from '../segment-zip-writer.js';
 
 const FUNCTION_CALL_TIMEOUT_MS = 150_000; // 2.5 min per tick (pagination + build)
 const HEARTBEAT_MS = 15_000;
@@ -48,11 +49,12 @@ interface PhaseStepResponse {
   // Present only when action='render_audio' — the signed clip list + render
   // params the worker needs to call Railway /mix-final and upload to S3.
   audio_job?: {
-    mode: 'full_mix' | 'per_speaker' | 'video_dub_me' | 'video_mux';
-    clips: Array<{ url: string; start_ms: number; speaker_id: string; max_duration_ms?: number | null; playback_rate?: number; overrun_ms?: number }>;
+    mode: 'full_mix' | 'per_speaker' | 'per_segment_zip' | 'video_dub_me' | 'video_mux';
+    clips: Array<{ url: string; start_ms: number; speaker_id: string; max_duration_ms?: number | null; playback_rate?: number; overrun_ms?: number; filename?: string; snapshot_id?: string; take_id?: string | null; translation_id?: string }>;
     duration_ms: number;
     me_track_url: string | null;
     loudness_target_lufs: number | null;
+    segment_output_format?: 'wav' | 'flac' | 'mp3';
     speaker_labels: Record<string, string>;
     clip_count: number;
     // ── video_mux mode only ──────────────────────────────────────────────
@@ -115,6 +117,34 @@ async function callMixFinal(opts: {
       throw new Error(`Railway /mix-final failed (${res.status}): ${errText.slice(0, 500)}`);
     }
     return new Uint8Array(await res.arrayBuffer());
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function transcodeSegment(opts: {
+  railwayUrl: string;
+  railwayKey: string;
+  sourceUrl: string;
+  outputFormat: 'wav' | 'flac' | 'mp3';
+  loudnessTargetLufs: number | null;
+}): Promise<Uint8Array> {
+  const base = opts.railwayUrl.replace(/\/+$/, '');
+  const filter = opts.loudnessTargetLufs == null ? 'anull' : `loudnorm=I=${opts.loudnessTargetLufs}:TP=-1:LRA=11`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 120_000);
+  try {
+    const response = await fetch(`${base}/process`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${opts.railwayKey}` },
+      body: JSON.stringify({ source_url: opts.sourceUrl, filters: filter, output_format: opts.outputFormat, delivery_profile: 'segment_export' }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      throw new Error(`Segment transcode failed (${response.status}): ${detail.slice(0, 300)}`);
+    }
+    return new Uint8Array(await response.arrayBuffer());
   } finally {
     clearTimeout(timer);
   }
@@ -220,7 +250,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
   const {
     kind, export_job_id, project_id, format, target_language_code,
     s3_bucket, s3_key, s3_region, credential_secret_prefix,
-    suggested_filename, cc_options, user_email, request_id, auth_token,
+    suggested_filename, cc_options, module_options, user_email, request_id, auth_token,
     audio_mode, loudness_target_lufs, mix_recipe, source_res,
     cc_mode, cc_burn_source_res,
   } = job.data as ExportJobData & {
@@ -279,6 +309,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
           credential_secret_prefix: credential_secret_prefix || '',
           suggested_filename,
           cc_options: cc_options || null,
+          module_options: module_options || null,
           audio_mode: audio_mode || null,
           loudness_target_lufs: loudness_target_lufs ?? null,
           mix_recipe: mix_recipe ?? null,
@@ -303,10 +334,10 @@ export async function processExportProject(job: Job<ExportJobData>) {
       // carry._audio_result and continue the loop, which re-calls the step at
       // phase='finalize_audio' to record the result onto the ExportJob.
       if (step.action === 'render_audio') {
+        const aj = step.audio_job!;
         if (!railwayUrl || !railwayKey) {
           throw new Error('export-project(audio): Railway URL/key not provided in job payload');
         }
-        const aj = step.audio_job!;
         // Final defense-in-depth: even if a stale producer bypassed preflight,
         // the worker refuses any timed clip that would be truncated by Railway.
         const timedOverruns = aj.clips.filter(c => Number(c.overrun_ms || 0) > 80);
@@ -318,11 +349,40 @@ export async function processExportProject(job: Job<ExportJobData>) {
         // Entering the Railway /mix-final render — advance the coarse phase +
         // fire an immediate beat so the editor toast flips to "Rendering mix"
         // without waiting for the next 15s tick. SOC 2 CC7.2.
-        currentPhase = 'rendering_mix';
+        currentPhase = aj.mode === 'per_segment_zip' ? 'packaging_segments' : 'rendering_mix';
         await postRenderHeartbeat();
 
         let audioResult: unknown;
-        if (aj.mode === 'per_speaker') {
+        if (aj.mode === 'per_segment_zip') {
+          const outputFormat = aj.segment_output_format || 'wav';
+          const contentType = outputFormat === 'mp3' ? 'audio/mpeg' : `audio/${outputFormat}`;
+          const archive = await createSegmentZipWriter(export_job_id);
+          try {
+            for (let index = 0; index < aj.clips.length; index++) {
+              const clip = aj.clips[index];
+              const filename = clip.filename || `${String(index + 1).padStart(4, '0')}_segment.${outputFormat}`;
+              const bytes = await transcodeSegment({
+                railwayUrl: railwayUrl!, railwayKey: railwayKey!, sourceUrl: clip.url,
+                outputFormat, loudnessTargetLufs: aj.loudness_target_lufs,
+              });
+              const individualKey = `${baseKeyPrefix}segments/${filename}`;
+              await putS3Object({ ...s3, bucket: s3_bucket }, individualKey, bytes, {
+                contentType, contentDisposition: `attachment; filename="${filename}"`,
+              });
+              await archive.add(filename, bytes);
+            }
+            const completedArchive = await archive.close();
+            currentPhase = 'uploading';
+            await postRenderHeartbeat();
+            const key = `${baseKeyPrefix}${suggested_filename}`;
+            const uploaded = await putS3File({ ...s3, bucket: s3_bucket }, key, completedArchive.path, {
+              contentType: 'application/zip', contentDisposition: `attachment; filename="${suggested_filename}"`, timeoutMs: 30 * 60 * 1000,
+            });
+            audioResult = { s3_key: key, file_size_bytes: uploaded.size, mime_type: 'application/zip' };
+          } finally {
+            await archive.cleanup();
+          }
+        } else if (aj.mode === 'per_speaker') {
           // Group clips by speaker, render one WAV per group (serial — gentle
           // on Railway, matches legacy buildFinalMix per_speaker behavior).
           const groups: Record<string, Array<{ url: string; start_ms: number; max_duration_ms?: number | null; playback_rate?: number }>> = {};
