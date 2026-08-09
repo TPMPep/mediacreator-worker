@@ -23,6 +23,10 @@
 //   • storageFromEnv({ region, bucket, prefix })                     → handle
 // =============================================================================
 
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { stat } from 'node:fs/promises';
+
 const _te = new TextEncoder();
 function _hex(bytes: Uint8Array): string { let s = ''; for (const b of bytes) s += b.toString(16).padStart(2, '0'); return s; }
 async function _sha256Hex(str: string): Promise<string> { return _hex(new Uint8Array(await crypto.subtle.digest('SHA-256', _te.encode(str)))); }
@@ -114,7 +118,6 @@ export async function putS3Object(
   const headers: Record<string, string> = { host, 'x-amz-content-sha256': payloadHash, 'x-amz-date': amzDate };
   if (contentType) headers['content-type'] = contentType;
   if (contentDisposition) headers['content-disposition'] = contentDisposition;
-  // STS temporary credentials: the security token is a SIGNED header.
   if (sessionToken) headers['x-amz-security-token'] = sessionToken;
   const sortedHeaderKeys = Object.keys(headers).sort();
   const signedHeaders = sortedHeaderKeys.join(';');
@@ -135,6 +138,57 @@ export async function putS3Object(
     }
     return { ok: true, status: res.status };
   } finally { clearTimeout(t); }
+}
+
+// Large ZIP uploads stay disk/stream-backed: hash in one pass, then stream the
+// file in a second pass with an exact signed Content-Length. Memory remains
+// bounded regardless of project duration or segment count.
+export async function putS3File(
+  storage: StorageHandle,
+  key: string,
+  filePath: string,
+  opts: { contentType?: string; contentDisposition?: string; timeoutMs?: number } = {},
+): Promise<{ ok: true; status: number; size: number }> {
+  const { contentType, contentDisposition, timeoutMs = 30 * 60 * 1000 } = opts;
+  const { region, creds: { accessKeyId, secretAccessKey, sessionToken }, endpoint, bucket } = storage;
+  const info = await stat(filePath);
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(filePath)) hash.update(chunk);
+  const payloadHash = hash.digest('hex');
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+  const dateStamp = amzDate.slice(0, 8);
+  const scope = `${dateStamp}/${region}/s3/aws4_request`;
+  let host: string, canonicalUri: string;
+  if (endpoint) { host = new URL(endpoint).host; canonicalUri = `/${bucket}/${_awsEncodePath(key)}`; }
+  else { host = `${bucket}.s3.${region}.amazonaws.com`; canonicalUri = `/${_awsEncodePath(key)}`; }
+  const headers: Record<string, string> = {
+    host, 'content-length': String(info.size), 'x-amz-content-sha256': payloadHash, 'x-amz-date': amzDate,
+  };
+  if (contentType) headers['content-type'] = contentType;
+  if (contentDisposition) headers['content-disposition'] = contentDisposition;
+  if (sessionToken) headers['x-amz-security-token'] = sessionToken;
+  const sortedHeaderKeys = Object.keys(headers).sort();
+  const signedHeaders = sortedHeaderKeys.join(';');
+  const canonicalHeaders = sortedHeaderKeys.map((h) => `${h}:${headers[h]}\n`).join('');
+  const canonicalRequest = ['PUT', canonicalUri, '', canonicalHeaders, signedHeaders, payloadHash].join('\n');
+  const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, await _sha256Hex(canonicalRequest)].join('\n');
+  const signature = _hex(await _hmac(await _signingKey(secretAccessKey, dateStamp, region), stringToSign));
+  const authorization = `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const request = {
+      method: 'PUT', headers: { ...headers, authorization }, body: createReadStream(filePath),
+      signal: controller.signal, duplex: 'half',
+    } as any;
+    const res = await fetch(`https://${host}${canonicalUri}`, request);
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`S3 PUT ${key} -> HTTP ${res.status}: ${text.slice(0, 300)}`);
+    }
+    return { ok: true, status: res.status, size: info.size };
+  } finally { clearTimeout(timer); }
 }
 
 // ── Credential resolution helper ────────────────────────────────────────────
