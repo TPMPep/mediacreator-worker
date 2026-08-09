@@ -20,6 +20,7 @@
 // EXPORTS (only what export-project.ts needs):
 //   • presignS3Url({ method, storage, key, expiresIn, extraQuery })  → string
 //   • putS3Object(storage, key, body, opts)                          → { ok }
+//   • putS3File(storage, key, filePath, opts)                        → { ok, size, sha256 }
 //   • storageFromEnv({ region, bucket, prefix })                     → handle
 // =============================================================================
 
@@ -148,7 +149,7 @@ export async function putS3File(
   key: string,
   filePath: string,
   opts: { contentType?: string; contentDisposition?: string; timeoutMs?: number } = {},
-): Promise<{ ok: true; status: number; size: number }> {
+): Promise<{ ok: true; status: number; size: number; sha256: string }> {
   const { contentType, contentDisposition, timeoutMs = 30 * 60 * 1000 } = opts;
   const { region, creds: { accessKeyId, secretAccessKey, sessionToken }, endpoint, bucket } = storage;
   const info = await stat(filePath);
@@ -187,7 +188,7 @@ export async function putS3File(
       const text = await res.text().catch(() => '');
       throw new Error(`S3 PUT ${key} -> HTTP ${res.status}: ${text.slice(0, 300)}`);
     }
-    return { ok: true, status: res.status, size: info.size };
+    return { ok: true, status: res.status, size: info.size, sha256: payloadHash };
   } finally { clearTimeout(timer); }
 }
 
