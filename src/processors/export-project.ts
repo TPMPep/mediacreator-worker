@@ -56,7 +56,7 @@ interface PhaseStepResponse {
   // params the worker needs to call Railway /mix-final and upload to S3.
   audio_job?: {
     mode: 'full_mix' | 'per_speaker' | 'per_segment_zip' | 'video_dub_me' | 'video_mux';
-    clips: Array<{ url: string; start_ms: number; speaker_id: string; max_duration_ms?: number | null; playback_rate?: number; overrun_ms?: number; scene_placement?: { id?: string; version?: number; preset_key?: string; recipe_hash?: string; recipe?: Record<string, number> } | null; filename?: string; snapshot_id?: string; take_id?: string | null; translation_id?: string; snapshot_at?: string }>;
+    clips: Array<{ url: string; start_ms: number; speaker_id: string; max_duration_ms?: number | null; playback_rate?: number; overrun_ms?: number; scene_placement?: { id?: string; version?: number; preset_key?: string; recipe_hash?: string; recipe_model_version?: number; recipe?: Record<string, number> } | null; filename?: string; snapshot_id?: string; take_id?: string | null; translation_id?: string; snapshot_at?: string }>;
     duration_ms: number;
     me_track_url: string | null;
     loudness_target_lufs: number | null;
