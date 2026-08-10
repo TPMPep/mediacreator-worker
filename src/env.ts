@@ -147,11 +147,10 @@ export const env = {
   // serialize the enqueue side as belt + suspenders. SOC 2 CC7.4 —
   // subprocessor pressure bounded by config, provable from this file alone.
   CONCURRENCY_PROJECT_CASCADE: intEnv('WORKER_CONCURRENCY_PROJECT_CASCADE', 1),
-  // Export-project (2026-05-15): user-triggered export jobs. I/O bound
-  // (SDK pagination + S3 upload), not CPU bound. 4 concurrent = comfortable
-  // throughput for the 100-150 user target without saturating the per-app
-  // SDK rate limit. Each job reads up to 2 entity types (segments +
-  // translations) at 2000 rows/page — bounded.
+  // Export-project: 4 workers keep text exports responsive. Audio/video jobs
+  // delegate CPU-heavy FFmpeg work to the extractor's FAST-503 mix lane; excess
+  // jobs return to BullMQ exponential backoff rather than opening unbounded
+  // extractor processes or waiting behind an HTTP connection.
   CONCURRENCY_EXPORT_PROJECT: intEnv('WORKER_CONCURRENCY_EXPORT_PROJECT', 4),
   // Backup-snapshot (2026-05-15): admin/scheduled full-DB export. Reads
   // EVERY entity. Held at 1 — only one backup runs at a time, and the
