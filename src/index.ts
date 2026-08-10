@@ -125,7 +125,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-08-09-scene-placement-v1',
+  build_tag: '2026-08-10-scene-placement-qc-v2',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -295,9 +295,10 @@ const workers: Worker[] = [
   new Worker(QUEUE_NAMES.PROJECT_CASCADE, processProjectCascade, {
     ...baseOpts, concurrency: env.CONCURRENCY_PROJECT_CASCADE,
   }),
-  // User-triggered export pipeline (2026-05-15). Unified processor —
-  // job.data.kind selects which entity tree to paginate and which builder
-  // to use. I/O bound (not CPU bound) so concurrency=4 is safe.
+  // User-triggered export pipeline. Text exports remain I/O-bound; audio/video
+  // renders are bounded by the extractor's observable FAST-503 mix lane and
+  // BullMQ exponential retry, so worker concurrency may remain responsive
+  // without allowing unbounded FFmpeg fan-out.
   new Worker(QUEUE_NAMES.EXPORT_PROJECT, processExportProject, {
     ...baseOpts, concurrency: env.CONCURRENCY_EXPORT_PROJECT,
   }),
