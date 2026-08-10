@@ -85,6 +85,9 @@ interface RailwayProxyResponse {
   // failed). Threaded to proxyGenWorkerStep which writes it to Project.frame_rate
   // with provenance frame_rate_source='ffprobe'. Best-effort — never gates the proxy.
   source_frame_rate?: number | null;
+  // Machine-measured source duration. The finalizer persists this before
+  // launching whole-program preflight sampling.
+  source_duration_ms?: number | null;
   // Echo fields are optional but useful for audit cross-correlation.
   project_id?: string;
 }
@@ -249,6 +252,7 @@ export async function processProxyGen(job: Job<ProxyGenJobData>) {
           bytes_audio: railwayRes.bytes_audio || null,
           // Machine-measured source frame rate (best-effort; null if probe failed).
           source_frame_rate: railwayRes.source_frame_rate ?? null,
+          source_duration_ms: railwayRes.source_duration_ms ?? null,
         },
         timeoutMs: FINALIZER_TIMEOUT_MS,
         signal,
