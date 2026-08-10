@@ -1571,13 +1571,14 @@ export const PROJECT_CASCADE_JOB_OPTIONS = {
   removeOnFail: { age: 86400 * 7 },
 };
 
-// Export: short retry budget (2 attempts). Exports are idempotent — re-running
-// the same job produces the same S3 object at the same key, so a retry is
-// cheap and safe. Transient SDK pagination blips DO happen at scale, so we
-// give one bounded retry before DLQ.
+// Export: extended bounded retry budget. Audio/video renders use the extractor's
+// FAST-503 heavy-lane backpressure instead of holding an HTTP request in a queue;
+// exponential BullMQ retry is therefore the intentional wait mechanism. Exports
+// are idempotent at a fixed S3 key, so retries are safe. Eight attempts at a 30s
+// base cover a saturated long-form render lane without an infinite retry loop.
 export const EXPORT_JOB_OPTIONS = {
-  attempts: 2,
-  backoff: { type: 'exponential' as const, delay: 10000 },
+  attempts: 8,
+  backoff: { type: 'exponential' as const, delay: 30000 },
   removeOnComplete: { age: 3600, count: 500 },
   removeOnFail: { age: 86400 * 7 },
 };
