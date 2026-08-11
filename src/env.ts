@@ -231,6 +231,10 @@ export const env = {
   // parallelism. Default 4 — comfortable for 100+ concurrent users without
   // amplifying Base44 write pressure. Env-overridable.
   CONCURRENCY_PERFORMANCE_CAPTURE: intEnv('WORKER_CONCURRENCY_PERFORMANCE_CAPTURE', 4),
+  // Tail normalization is FFmpeg-I/O bound and isolated from every delivery lane.
+  // Two concurrent runs per replica balance throughput with Railway extractor
+  // pressure; each run processes a bounded number of items per tick.
+  CONCURRENCY_TAIL_NORMALIZATION: intEnv('WORKER_CONCURRENCY_TAIL_NORMALIZATION', 2),
 
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
