@@ -112,6 +112,7 @@ import { processConsensusTranscription } from './processors/consensus-transcript
 // enqueuePerformanceCapture (hard cost-cap gate + producer/manager/admin RBAC
 // before the job is minted).
 import { processPerformanceCapture } from './processors/performance-capture.js';
+import { processTailNormalization } from './processors/tail-normalization.js';
 
 initSentry();
 
@@ -125,7 +126,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-08-11-speaker-stem-format-parity',
+  build_tag: '2026-08-11-tail-normalization-v1',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -441,6 +442,12 @@ const workers: Worker[] = [
   new Worker(QUEUE_NAMES.PERFORMANCE_CAPTURE, processPerformanceCapture, {
     ...baseOpts,
     concurrency: env.CONCURRENCY_PERFORMANCE_CAPTURE,
+    stalledInterval: 30_000,
+    maxStalledCount: 2,
+  }),
+  new Worker(QUEUE_NAMES.TAIL_NORMALIZATION, processTailNormalization, {
+    ...baseOpts,
+    concurrency: env.CONCURRENCY_TAIL_NORMALIZATION,
     stalledInterval: 30_000,
     maxStalledCount: 2,
   }),
