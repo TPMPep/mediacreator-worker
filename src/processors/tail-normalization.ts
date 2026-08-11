@@ -15,7 +15,9 @@ export async function processTailNormalization(job: Job<TailNormalizationJobData
         fn: 'tailNormalizationWorkerStep', authToken: auth_token,
         payload: { project_id, run_id }, timeoutMs: 90_000, signal,
       }));
-      await logEvent({ function_name: 'bullmq:tail-normalization', event: 'tail_normalization_tick', context: { project_id, run_id, user_email, request_id, tick: ticks, action: step.action, phase: step.phase } });
+      if (ticks === 1 || ticks % 10 === 0 || step.action !== 'continue') {
+        await logEvent({ function_name: 'bullmq:tail-normalization', event: 'tail_normalization_tick', context: { project_id, run_id, user_email, request_id, tick: ticks, action: step.action, phase: step.phase } });
+      }
       if (step.action !== 'continue') return { ok: step.action === 'done', status: step.status, ticks };
       await new Promise(resolve => setTimeout(resolve, 500));
     }
