@@ -61,6 +61,7 @@ interface PhaseStepResponse {
     me_track_url: string | null;
     loudness_target_lufs: number | null;
     segment_output_format?: 'wav' | 'flac' | 'mp3';
+    output_format?: 'wav' | 'flac' | 'mp3';
     speaker_labels: Record<string, string>;
     clip_count: number;
     // ── video_mux mode only ──────────────────────────────────────────────
@@ -88,6 +89,7 @@ async function callMixFinal(opts: {
   durationMs: number;
   meTrackUrl?: string | null;
   loudnessTargetLufs?: number | null;
+  outputFormat?: 'wav' | 'flac' | 'mp3';
   // ── 3-stem mixing-console params (video_mux) ──
   // meGainDb overrides the default -6 dB M&E bed. vocalsTrackUrl + vocalsGainDb
   // add the original-dialogue stem. When omitted the call behaves exactly as
@@ -101,7 +103,7 @@ async function callMixFinal(opts: {
   const body: Record<string, unknown> = {
     clips: opts.clips,
     duration_ms: opts.durationMs,
-    output_format: 'wav',
+    output_format: opts.outputFormat || 'wav',
     sample_rate: 48000,
     fade_in_ms: 8,
     fade_out_ms: 12,
@@ -215,9 +217,12 @@ async function transcodeSegment(opts: {
 function buildWorkerS3(region: string, credentialSecretPrefix?: string): StorageHandle {
   return storageFromEnv({ region, bucket: '__unused__', prefix: credentialSecretPrefix || '' });
 }
-async function uploadWav(storage: StorageHandle, bucket: string, key: string, bytes: Uint8Array, filename: string) {
+function audioContentType(format: 'wav' | 'flac' | 'mp3') {
+  return format === 'mp3' ? 'audio/mpeg' : format === 'flac' ? 'audio/flac' : 'audio/wav';
+}
+async function uploadAudio(storage: StorageHandle, bucket: string, key: string, bytes: Uint8Array, filename: string, format: 'wav' | 'flac' | 'mp3') {
   await putS3Object({ ...storage, bucket }, key, bytes, {
-    contentType: 'audio/wav',
+    contentType: audioContentType(format),
     contentDisposition: `attachment; filename="${filename}"`,
   });
 }
@@ -445,30 +450,32 @@ export async function processExportProject(job: Job<ExportJobData>) {
             await archive.cleanup();
           }
         } else if (aj.mode === 'per_speaker') {
-          // Group clips by speaker, render one WAV per group (serial — gentle
-          // on Railway, matches legacy buildFinalMix per_speaker behavior).
+          // Group clips by speaker, render one file per group in the operator's
+          // selected format (serial — gentle on Railway).
           const groups: Record<string, Array<{ url: string; start_ms: number; max_duration_ms?: number | null; playback_rate?: number; scene_placement?: Record<string, unknown> | null }>> = {};
           for (const c of aj.clips) {
             // RENDER PARITY (A′): carry per-clip trim + Speed-to-Fit rate through grouping.
             (groups[c.speaker_id] ||= []).push({ url: c.url, start_ms: c.start_ms, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate, scene_placement: c.scene_placement || null });
           }
           const speaker_files: Array<Record<string, unknown>> = [];
+          const outputFormat = aj.output_format || 'wav';
           for (const spId of Object.keys(groups)) {
             const label = aj.speaker_labels[spId] || spId;
             const bytes = await callMixFinal({
               railwayUrl, railwayKey,
               clips: groups[spId], durationMs: aj.duration_ms,
               loudnessTargetLufs: null, // never normalize stems
+              outputFormat,
             });
-            const filename = `${slugifyLabel(label)}_${target_language_code}.wav`;
+            const filename = `${slugifyLabel(label)}_${target_language_code}.${outputFormat}`;
             const key = `${baseKeyPrefix}${filename}`;
-            await uploadWav(s3, s3_bucket, key, bytes, filename);
+            await uploadAudio(s3, s3_bucket, key, bytes, filename, outputFormat);
             speaker_files.push({
               speaker_id: spId, speaker_label: label, s3_key: key, filename,
               file_size_bytes: bytes.length, clip_count: groups[spId].length,
             });
           }
-          audioResult = { speaker_files };
+          audioResult = { speaker_files, mime_type: audioContentType(outputFormat) };
         } else if (aj.mode === 'video_mux') {
           // ── 3-stem mix → mux onto video → MP4 ──────────────────────────
           // 1) Render the mix WAV with the operator's fader recipe:
@@ -507,16 +514,18 @@ export async function processExportProject(job: Job<ExportJobData>) {
             await rm(renderDir, { recursive: true, force: true });
           }
         } else {
+          const outputFormat = aj.output_format || 'wav';
           const bytes = await callMixFinal({
             railwayUrl, railwayKey,
             clips: aj.clips.map(c => ({ url: c.url, start_ms: c.start_ms, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate, scene_placement: c.scene_placement || null })),
             durationMs: aj.duration_ms,
             meTrackUrl: aj.me_track_url,
             loudnessTargetLufs: aj.loudness_target_lufs,
+            outputFormat,
           });
           const key = `${baseKeyPrefix}${suggested_filename}`;
-          await uploadWav(s3, s3_bucket, key, bytes, suggested_filename);
-          audioResult = { s3_key: key, file_size_bytes: bytes.length };
+          await uploadAudio(s3, s3_bucket, key, bytes, suggested_filename, outputFormat);
+          audioResult = { s3_key: key, file_size_bytes: bytes.length, mime_type: audioContentType(outputFormat) };
         }
 
         await logEvent({
