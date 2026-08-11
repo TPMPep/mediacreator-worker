@@ -1466,6 +1466,8 @@ export interface PerformanceCaptureJobData {
   auth_token: string;
 }
 
+// Scoped JWT is minted for 12h because an isolated, concurrency-2 heavy lane can
+// legitimately queue behind other feature-length analyses under 100+ user load.
 export interface TailNormalizationJobData {
   schema_version: number;
   project_id: string;
