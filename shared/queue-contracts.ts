@@ -304,6 +304,11 @@ export const QUEUE_NAMES = {
   // cue attributable to the pinned vocabulary + confidence thresholds; dropped
   // low-confidence cues are counted, never emitted).
   PERFORMANCE_CAPTURE: 'performance-capture',
+  // Non-destructive selected-take tail analysis/apply pipeline. Analysis and
+  // apply share one audited TailNormalizationRun but execute as separate jobs,
+  // with user confirmation between them. Isolated concurrency lane prevents
+  // bulk FFmpeg analysis from starving voice generation or exports.
+  TAIL_NORMALIZATION: 'tail-normalization',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -1461,6 +1466,15 @@ export interface PerformanceCaptureJobData {
   auth_token: string;
 }
 
+export interface TailNormalizationJobData {
+  schema_version: number;
+  project_id: string;
+  run_id: string;
+  user_email: string;
+  request_id: string;
+  auth_token: string;
+}
+
 // Discriminated union for processors that need to handle multiple shapes.
 export type AnyJobData =
    | VoiceGenJobData
@@ -1490,7 +1504,8 @@ export type AnyJobData =
    | SrtTranslateJobData
    | MEPollJobData
    | ConsensusTranscriptionJobData
-   | PerformanceCaptureJobData;
+   | PerformanceCaptureJobData
+   | TailNormalizationJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
 
