@@ -56,7 +56,7 @@ interface PhaseStepResponse {
   // params the worker needs to call Railway /mix-final and upload to S3.
   audio_job?: {
     mode: 'full_mix' | 'per_speaker' | 'per_segment_zip' | 'video_dub_me' | 'video_mux';
-    clips: Array<{ url: string; start_ms: number; speaker_id: string; max_duration_ms?: number | null; playback_rate?: number; overrun_ms?: number; scene_placement?: { id?: string; version?: number; preset_key?: string; recipe_hash?: string; recipe_model_version?: number; recipe?: Record<string, number> } | null; filename?: string; snapshot_id?: string; take_id?: string | null; translation_id?: string; snapshot_at?: string }>;
+    clips: Array<{ url: string; start_ms: number; speaker_id: string; audio_dur_ms?: number; max_duration_ms?: number | null; playback_rate?: number; overrun_ms?: number; scene_placement?: { id?: string; version?: number; preset_key?: string; recipe_hash?: string; recipe_model_version?: number; recipe?: Record<string, number> } | null; filename?: string; snapshot_id?: string; take_id?: string | null; translation_id?: string; snapshot_at?: string }>;
     duration_ms: number;
     me_track_url: string | null;
     loudness_target_lufs: number | null;
@@ -64,6 +64,7 @@ interface PhaseStepResponse {
     output_format?: 'wav' | 'flac' | 'mp3';
     speaker_labels: Record<string, string>;
     clip_count: number;
+    speaker_segment_gap_ms?: number | null;
     // ── video_mux mode only ──────────────────────────────────────────────
     // The 3-stem mixing-console recipe + the signed source video to mux onto.
     // dub_gain_db is applied UNIFORMLY to every dubbed clip (the "Dubbed"
@@ -452,28 +453,46 @@ export async function processExportProject(job: Job<ExportJobData>) {
         } else if (aj.mode === 'per_speaker') {
           // Group clips by speaker, render one file per group in the operator's
           // selected format (serial — gentle on Railway).
-          const groups: Record<string, Array<{ url: string; start_ms: number; max_duration_ms?: number | null; playback_rate?: number; scene_placement?: Record<string, unknown> | null }>> = {};
+          const groups: Record<string, Array<{ url: string; start_ms: number; audio_dur_ms?: number; max_duration_ms?: number | null; playback_rate?: number; scene_placement?: Record<string, unknown> | null }>> = {};
           for (const c of aj.clips) {
             // RENDER PARITY (A′): carry per-clip trim + Speed-to-Fit rate through grouping.
-            (groups[c.speaker_id] ||= []).push({ url: c.url, start_ms: c.start_ms, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate, scene_placement: c.scene_placement || null });
+            (groups[c.speaker_id] ||= []).push({ url: c.url, start_ms: c.start_ms, audio_dur_ms: c.audio_dur_ms, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate, scene_placement: c.scene_placement || null });
           }
           const speaker_files: Array<Record<string, unknown>> = [];
           const outputFormat = aj.output_format || 'wav';
           for (const spId of Object.keys(groups)) {
             const label = aj.speaker_labels[spId] || spId;
+            const gapMs = Number(aj.speaker_segment_gap_ms || 0);
+            let stemDurationMs = aj.duration_ms;
+            let stemClips = groups[spId];
+            if (gapMs > 0) {
+              const missingDuration = groups[spId].find(clip => !Number.isFinite(Number(clip.audio_dur_ms)) || Number(clip.audio_dur_ms) <= 0);
+              if (missingDuration) throw new Error(`Untimed TTS stem spacing requires a measured duration for every ${label} clip.`);
+              let cursorMs = 0;
+              stemClips = groups[spId].map((clip, index, list) => {
+                const positioned = { ...clip, start_ms: cursorMs, max_duration_ms: null };
+                cursorMs += Math.round(Number(clip.audio_dur_ms));
+                if (index < list.length - 1) cursorMs += gapMs;
+                return positioned;
+              });
+              stemDurationMs = Math.max(1, cursorMs);
+            }
             const bytes = await callMixFinal({
               railwayUrl, railwayKey,
-              clips: groups[spId], durationMs: aj.duration_ms,
+              clips: stemClips, durationMs: stemDurationMs,
               loudnessTargetLufs: null, // never normalize stems
               outputFormat,
             });
-            const filename = `${slugifyLabel(label)}_${target_language_code}.${outputFormat}`;
+            const gapSuffix = gapMs > 0 ? `_gap${gapMs / 1000}s` : '';
+            const filename = `${slugifyLabel(label)}_${target_language_code}${gapSuffix}.${outputFormat}`;
             const key = `${baseKeyPrefix}${filename}`;
             await uploadAudio(s3, s3_bucket, key, bytes, filename, outputFormat);
             speaker_files.push({
               speaker_id: spId, speaker_label: label, s3_key: key, filename,
               file_size_bytes: bytes.length, clip_count: groups[spId].length,
-            });
+              duration_ms: stemDurationMs,
+              segment_gap_seconds: gapMs > 0 ? gapMs / 1000 : null,
+              });
           }
           audioResult = { speaker_files, mime_type: audioContentType(outputFormat) };
         } else if (aj.mode === 'video_mux') {
@@ -531,7 +550,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
         await logEvent({
           function_name: 'bullmq:export-project',
           event: 'audio_render_complete',
-          context: { export_job_id, project_id, audio_mode: aj.mode, clip_count: aj.clip_count, user_email, request_id },
+          context: { export_job_id, project_id, audio_mode: aj.mode, clip_count: aj.clip_count, speaker_segment_gap_ms: aj.speaker_segment_gap_ms || null, user_email, request_id },
         });
 
         // Carry the result into the next tick (finalize_audio reads audio_result).
