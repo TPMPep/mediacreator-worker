@@ -1000,7 +1000,7 @@ export interface ExportJobData {
   project_id: string;
   user_email: string;
   request_id: string;
-  /** Output format — interpreted by the module-specific builder. Audio uses wav, zip, or mp4 according to audio_mode. */
+  /** Output format — interpreted by the module-specific builder. Audio mixes and speaker stems support wav/flac/mp3; segment bundles use zip and video uses mp4. */
   format: string;
   /** Target language (when format is per-language: srt/vtt/txt_translation/csv, OR any audio export). */
   target_language_code?: string;
