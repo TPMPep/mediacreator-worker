@@ -1019,7 +1019,7 @@ export interface ExportJobData {
   suggested_filename: string;
   /** Optional CC export options (passed through verbatim to ccExporters). */
   cc_options?: Record<string, unknown>;
-  /** Optional Superscript / Adaptation export options. */
+  /** Module-specific immutable options. Audio per-speaker exports may pin speaker_stem.gap_seconds (1|2|3) for untimed TTS. */
   module_options?: Record<string, unknown>;
   /** [audio kind] Which deliverable to render. 'video_mux' produces a finished
    *  MP4: source video stream copied verbatim (-c:v copy) with a NEW audio track
