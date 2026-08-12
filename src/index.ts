@@ -81,6 +81,7 @@ import { processTranscriptImport } from './processors/transcript-import.js';
 // Media Creator pipeline. Factory-built because the processor re-enqueues its
 // own next tick and needs a handle to the lazily-initialised queue registry.
 import { makeGltvCascadeProcessor } from './processors/gltv-cascade.js';
+import { processGltvMEExtraction } from './processors/gltv-me-extract.js';
 // Simple Translation (SRT) async translate (2026-06-16). FULLY ISOLATED to the
 // Translation module — its own queue + concurrency lane; never shares state with
 // the AI-Dubbing translate pipeline. Moves the heavy bulk SRT translate out of
@@ -126,7 +127,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-08-11-untimed-tts-speaker-stem-spacing',
+  build_tag: '2026-08-12-gltv-optional-me-mix',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -376,6 +377,12 @@ const workers: Worker[] = [
   new Worker(QUEUE_NAMES.GLTV_CASCADE, makeGltvCascadeProcessor(getQueue), {
     ...baseOpts,
     concurrency: env.CONCURRENCY_GLTV_CASCADE,
+    stalledInterval: 30_000,
+    maxStalledCount: 2,
+  }),
+  new Worker(QUEUE_NAMES.GLTV_ME_EXTRACT, processGltvMEExtraction, {
+    ...baseOpts,
+    concurrency: env.CONCURRENCY_GLTV_ME_EXTRACT,
     stalledInterval: 30_000,
     maxStalledCount: 2,
   }),
