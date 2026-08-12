@@ -201,6 +201,9 @@ export const env = {
   // — comfortable for 100+ concurrent API customers without amplifying Base44
   // write pressure. Env-overridable via GLTV_CASCADE_CONCURRENCY.
   CONCURRENCY_GLTV_CASCADE: intEnv('GLTV_CASCADE_CONCURRENCY', 5),
+  // Long-lived source extract/upload is isolated from the cascade and capped so
+  // 100-job bursts queue safely instead of opening unbounded Railway streams.
+  CONCURRENCY_GLTV_ME_EXTRACT: intEnv('GLTV_ME_EXTRACT_CONCURRENCY', 2),
   // Simple Translation (SRT) async translate (2026-06-16). ISOLATED concurrency
   // lane for the Translation module — its OWN budget so a bulk-translate burst
   // never starves human Media Creator editors or the AI-Dubbing translate
