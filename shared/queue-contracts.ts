@@ -227,6 +227,9 @@ export const QUEUE_NAMES = {
   // phase transition appends to DubbingApiJob.phase_history with timestamps +
   // the underlying run id.
   GLTV_CASCADE: 'gltv-cascade',
+  // GLTV-only M&E submit lane. The long source extract/upload runs in BullMQ,
+  // outside the Base44 function ceiling; pollMEStatus remains the one harvester.
+  GLTV_ME_EXTRACT: 'gltv-me-extract',
   // Simple Translation (SRT) async translate pipeline (2026-06-16). FULLY
   // ISOLATED to the Translation module (project_type='simple_translation' +
   // TranslationCue + SimpleTranslationRun) — never shares state, queue, or
@@ -1327,15 +1330,22 @@ export interface TranscriptImportJobData {
 //   • BullMQ retains failed jobs 7d — every failed cascade is DLQ-queryable.
 export interface GltvCascadeJobData {
   schema_version: number;
-  /** DubbingApiJob.id — the API job this cascade advances. */
   dubbing_api_job_id: string;
-  /** Internal Project.id spawned for this job (tagged gltv_api). */
   project_id: string;
-  /** Correlation id threaded into every StructuredLog row for this cascade. */
   request_id: string;
-  /** Scoped JWT bound to (system, dubbing_api_job_id, 'gltvCascadeWorkerStep').
-   *  60-min TTL — a single phase tick is short, but the cascade re-enqueues
-   *  across many ticks; the producer mints a fresh JWT each (re-)enqueue. */
+  auth_token: string;
+}
+
+export interface GltvMEExtractionJobData {
+  schema_version: number;
+  project_id: string;
+  dubbing_api_job_id: string;
+  request_id: string;
+  fidelity: 'standard' | 'high';
+  source_url: string;
+  railway_url: string;
+  railway_api_key: string;
+  lalal_license_key: string;
   auth_token: string;
 }
 
@@ -1503,6 +1513,7 @@ export type AnyJobData =
    | CCCueSupersedeJobData
    | TranscriptImportJobData
    | GltvCascadeJobData
+   | GltvMEExtractionJobData
    | SrtTranslateJobData
    | MEPollJobData
    | ConsensusTranscriptionJobData
