@@ -12,13 +12,13 @@ async function uploadSource(job: GltvMEExtractionJobData, signal: AbortSignal) {
     method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${job.railway_api_key}` }, signal,
     body: JSON.stringify({ source_url: job.source_url, lalal_key: job.lalal_license_key, output_format: fidelity.format, extra_args: fidelity.args, upload_ext: fidelity.ext, filename_base: `gltv_me_${job.dubbing_api_job_id}` }),
   });
-  const data = await response.json().catch(() => ({}));
+  const data = await response.json().catch(() => ({})) as { source_id?: unknown };
   if (!response.ok || !data.source_id) throw new Error(`M&E source upload failed (${response.status}): ${JSON.stringify(data).slice(0, 300)}`);
   return String(data.source_id);
 }
 async function startSplit(job: GltvMEExtractionJobData, sourceId: string, signal: AbortSignal) {
   const response = await fetch('https://www.lalal.ai/api/v1/split/stem_separator/', { method: 'POST', headers: { 'X-License-Key': job.lalal_license_key, 'Content-Type': 'application/json' }, signal, body: JSON.stringify({ source_id: sourceId, idempotency_key: `gltv-me-${job.dubbing_api_job_id}`, presets: { stem: 'vocals', splitter: 'perseus', enhanced_processing_enabled: true } }) });
-  const data = await response.json().catch(() => ({}));
+  const data = await response.json().catch(() => ({})) as { task_id?: unknown };
   if (!response.ok || !data.task_id) throw new Error(`M&E split submit failed (${response.status}): ${JSON.stringify(data).slice(0, 300)}`);
   return String(data.task_id);
 }
@@ -42,9 +42,10 @@ export async function processGltvMEExtraction(job: Job<GltvMEExtractionJobData>)
       return { ok: true, state: 'submitted', task_id: taskId };
     });
   } catch (error) {
+    const err = error instanceof Error ? error : new Error(String(error));
     const finalAttempt = job.attemptsMade + 1 >= Number(job.opts.attempts || 1);
-    await logEvent({ function_name: 'bullmq:gltv-me-extract', level: 'error', event: 'gltv_me_submit_failed', message: error.message, context: { ...ctx, attempt: job.attemptsMade + 1, final_attempt: finalAttempt } });
-    if (finalAttempt) await invokeBase44Function({ fn: 'gltvMEExtractionWorkerStep', authToken: data.auth_token, payload: { project_id: data.project_id, dubbing_api_job_id: data.dubbing_api_job_id, fidelity: data.fidelity, action: 'fail', error_message: error.message, request_id: data.request_id }, timeoutMs: 60000 }).catch(() => {});
-    throw error;
+    await logEvent({ function_name: 'bullmq:gltv-me-extract', level: 'error', event: 'gltv_me_submit_failed', message: err.message, context: { ...ctx, attempt: job.attemptsMade + 1, final_attempt: finalAttempt } });
+    if (finalAttempt) await invokeBase44Function({ fn: 'gltvMEExtractionWorkerStep', authToken: data.auth_token, payload: { project_id: data.project_id, dubbing_api_job_id: data.dubbing_api_job_id, fidelity: data.fidelity, action: 'fail', error_message: err.message, request_id: data.request_id }, timeoutMs: 60000 }).catch(() => {});
+    throw err;
   }
 }
