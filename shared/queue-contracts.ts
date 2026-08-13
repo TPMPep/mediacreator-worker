@@ -289,6 +289,9 @@ export const QUEUE_NAMES = {
   // (resumable), CC7.4 (bounded spend + degrade never re-doubles), CC8.1
   // (every merged word attributable to the pinned arbitration_policy).
   CONSENSUS_TRANSCRIPTION: 'consensus-transcription',
+  // Mandatory post-transcription Precision-2 speaker refinement. Isolated lane:
+  // provider polling + staged transcript cutover never competes with translation.
+  SPEAKER_DIARIZATION: 'speaker-diarization',
   // Synthetic Performance Match capture pipeline (2026-08-01). ISOLATED lane.
   // Single-shot tick-resumable job per PerformanceCaptureRun. The worker calls
   // performanceCaptureWorkerStep in a loop; the step advances ONE segment per
@@ -1442,6 +1445,16 @@ export interface ConsensusTranscriptionJobData {
   auth_token: string;
 }
 
+export interface SpeakerDiarizationJobData {
+  schema_version: number;
+  project_id: string;
+  run_id: string;
+  job_run_id: string;
+  user_email: string;
+  request_id: string;
+  auth_token: string;
+}
+
 // ─── Performance-capture payload (2026-08-01) ────────────────────────────────
 //
 // Single-shot tick-resumable job. The worker calls performanceCaptureWorkerStep
@@ -1517,6 +1530,7 @@ export type AnyJobData =
    | SrtTranslateJobData
    | MEPollJobData
    | ConsensusTranscriptionJobData
+   | SpeakerDiarizationJobData
    | PerformanceCaptureJobData
    | TailNormalizationJobData;
 
