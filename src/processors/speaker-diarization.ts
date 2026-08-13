@@ -21,7 +21,22 @@ async function sleep(ms:number,signal:AbortSignal){await new Promise<void>((reso
 export async function processSpeakerDiarization(job:Job<SpeakerDiarizationJobData>){
   const started=Date.now();
   const {project_id,run_id,job_run_id,request_id,user_email,auth_token}=job.data;
-  const call=<T=any>(operation:string,payload:Record<string,unknown>={},signal?:AbortSignal)=>invokeBase44Function<T>({fn:'speakerDiarizationWorkerStep',authToken:auth_token,payload:{project_id,run_id,job_run_id,operation,...payload},timeoutMs:170000,signal});
+  const call=async <T=any>(operation:string,payload:Record<string,unknown>={},signal?:AbortSignal):Promise<T>=>{
+    const maxAttempts=6;
+    for(let attempt=1;attempt<=maxAttempts;attempt++){
+      try{return await invokeBase44Function<T>({fn:'speakerDiarizationWorkerStep',authToken:auth_token,payload:{project_id,run_id,job_run_id,operation,...payload},timeoutMs:170000,signal});}
+      catch(error){
+        const message=String((error as Error)?.message||error);
+        const transient=/rate limit|HTTP 429|HTTP 50[234]|timeout|timed out|ECONNRESET|fetch failed|network/i.test(message);
+        if(!transient||attempt===maxAttempts||signal?.aborted)throw error;
+        const ceiling=Math.min(20_000,1_000*(2**(attempt-1)));
+        const delay=Math.max(500,Math.floor(Math.random()*ceiling));
+        console.warn(`[speaker-diarization] ${operation} transient failure; retry ${attempt}/${maxAttempts} in ${delay}ms: ${message.slice(0,200)}`);
+        if(signal)await sleep(delay,signal);else await new Promise(resolve=>setTimeout(resolve,delay));
+      }
+    }
+    throw new Error(`${operation} retry budget exhausted`);
+  };
   try{return await runWithLockHeartbeat(job,async signal=>{
     if(!env.PYANNOTE_API_KEY)throw new Error('PYANNOTE_API_KEY is not configured in Railway');
     const prep=await call<any>('prepare',{},signal); if(prep.action==='done')return {ok:true,already_terminal:true};
