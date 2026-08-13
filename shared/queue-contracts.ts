@@ -289,6 +289,10 @@ export const QUEUE_NAMES = {
   // (resumable), CC7.4 (bounded spend + degrade never re-doubles), CC8.1
   // (every merged word attributable to the pinned arbitration_policy).
   CONSENSUS_TRANSCRIPTION: 'consensus-transcription',
+  // Single-model transcription (AAI 3.5/U2/U3 or ElevenLabs Scribe). Provider
+  // execution and staged cutover are Railway-owned; Base44 only validates,
+  // signs storage, and commits bounded idempotent phases.
+  TRANSCRIPTION: 'transcription',
   // Mandatory post-transcription Precision-2 speaker refinement. Isolated lane:
   // provider polling + staged transcript cutover never competes with translation.
   SPEAKER_DIARIZATION: 'speaker-diarization',
@@ -1432,16 +1436,19 @@ export interface MEPollJobData {
 //   • BullMQ retains failed jobs 7d — every failed run is DLQ-queryable.
 export interface ConsensusTranscriptionJobData {
   schema_version: number;
-  /** Owning Project.id. */
   project_id: string;
-  /** ConsensusTranscriptionRun.id — the run this job advances. */
   consensus_run_id: string;
-  /** Producer/manager/admin that opted into consensus (preserved for attribution). */
   user_email: string;
-  /** Correlation id threaded into every StructuredLog row for this run. */
   request_id: string;
-  /** Scoped JWT bound to (user, project, consensus_run_id,
-   *  'consensusTranscriptionWorkerStep'). 30-min TTL. */
+  auth_token: string;
+}
+
+export interface TranscriptionJobData {
+  schema_version: number;
+  project_id: string;
+  job_run_id: string;
+  user_email: string;
+  request_id: string;
   auth_token: string;
 }
 
@@ -1530,6 +1537,7 @@ export type AnyJobData =
    | SrtTranslateJobData
    | MEPollJobData
    | ConsensusTranscriptionJobData
+   | TranscriptionJobData
    | SpeakerDiarizationJobData
    | PerformanceCaptureJobData
    | TailNormalizationJobData;
