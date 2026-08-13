@@ -226,6 +226,13 @@ export const env = {
   // to finish). Default 4 — comfortable for 100+ concurrent users without
   // amplifying Base44 write pressure. Env-overridable.
   CONCURRENCY_CONSENSUS_TRANSCRIPTION: intEnv('WORKER_CONCURRENCY_CONSENSUS_TRANSCRIPTION', 4),
+  // Precision-2 is provider-bound and each run performs one staged cutover.
+  // Four isolated slots support concurrent projects without increasing hot-path
+  // Base44 write density; each slot sleeps between provider status polls.
+  CONCURRENCY_SPEAKER_DIARIZATION: intEnv('WORKER_CONCURRENCY_SPEAKER_DIARIZATION', 4),
+  // Provider execution is Railway-native. Kept optional at boot so a missing
+  // pyannote credential fails only this isolated lane, not every worker queue.
+  PYANNOTE_API_KEY: process.env.PYANNOTE_API_KEY || '',
   // Synthetic Performance Match capture (2026-08-01). ISOLATED lane so a capture
   // burst never starves human editors. Each in-flight job is one tick-resumable
   // run against ONE PerformanceCaptureRun; each tick analyzes ONE segment (extract
