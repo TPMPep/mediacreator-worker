@@ -105,6 +105,7 @@ import { seedMEPollHeartbeat } from './me-poll-seed.js';
 // machine (Phase 1 parks at awaiting_merge). Producer is enqueueConsensusTranscription
 // (hard cost-cap gate + producer/manager/admin RBAC before the job is minted).
 import { processConsensusTranscription } from './processors/consensus-transcription.js';
+import { processSpeakerDiarization } from './processors/speaker-diarization.js';
 // Synthetic Performance Match capture (2026-08-01). ISOLATED lane. One
 // tick-resumable job per PerformanceCaptureRun; the step analyzes ONE segment
 // per tick (extract audio clip → Gemini → write v3 performance direction +
@@ -127,7 +128,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-08-12-gltv-me-typesafe',
+  build_tag: '2026-08-13-pyannote-railway-native-v2',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -432,6 +433,12 @@ const workers: Worker[] = [
   new Worker(QUEUE_NAMES.CONSENSUS_TRANSCRIPTION, processConsensusTranscription, {
     ...baseOpts,
     concurrency: env.CONCURRENCY_CONSENSUS_TRANSCRIPTION,
+    stalledInterval: 30_000,
+    maxStalledCount: 2,
+  }),
+  new Worker(QUEUE_NAMES.SPEAKER_DIARIZATION, processSpeakerDiarization, {
+    ...baseOpts,
+    concurrency: env.CONCURRENCY_SPEAKER_DIARIZATION,
     stalledInterval: 30_000,
     maxStalledCount: 2,
   }),
