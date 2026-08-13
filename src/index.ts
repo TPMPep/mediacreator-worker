@@ -105,6 +105,7 @@ import { seedMEPollHeartbeat } from './me-poll-seed.js';
 // machine (Phase 1 parks at awaiting_merge). Producer is enqueueConsensusTranscription
 // (hard cost-cap gate + producer/manager/admin RBAC before the job is minted).
 import { processConsensusTranscription } from './processors/consensus-transcription.js';
+import { processTranscription } from './processors/transcription.js';
 import { processSpeakerDiarization } from './processors/speaker-diarization.js';
 // Synthetic Performance Match capture (2026-08-01). ISOLATED lane. One
 // tick-resumable job per PerformanceCaptureRun; the step analyzes ONE segment
@@ -128,7 +129,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-08-13-pyannote-atomic-cutover-v7',
+  build_tag: '2026-08-13-worker-native-transcription-v9',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -433,6 +434,12 @@ const workers: Worker[] = [
   new Worker(QUEUE_NAMES.CONSENSUS_TRANSCRIPTION, processConsensusTranscription, {
     ...baseOpts,
     concurrency: env.CONCURRENCY_CONSENSUS_TRANSCRIPTION,
+    stalledInterval: 30_000,
+    maxStalledCount: 2,
+  }),
+  new Worker(QUEUE_NAMES.TRANSCRIPTION, processTranscription, {
+    ...baseOpts,
+    concurrency: env.CONCURRENCY_TRANSCRIPTION,
     stalledInterval: 30_000,
     maxStalledCount: 2,
   }),
