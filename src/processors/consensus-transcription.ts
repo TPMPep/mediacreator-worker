@@ -37,6 +37,7 @@
 import type { Job } from 'bullmq';
 import type { ConsensusTranscriptionJobData } from '../../shared/queue-contracts.js';
 import { invokeBase44Function, logEvent, runWithLockHeartbeat } from '../base44-client.js';
+import { env } from '../env.js';
 
 const FUNCTION_CALL_TIMEOUT_MS = 60_000;
 // Total wall-clock cap for the whole run's tick loop. Phase 1 parks after one
@@ -53,6 +54,24 @@ interface ConsensusStepResponse {
   tick_count?: number;
   note?: string;
   error?: string;
+  needs_external_dispatch?: boolean;
+  source_url?: string;
+  state_get_url?: string;
+  state_put_url?: string;
+  raw_get_url?: string;
+  raw_put_url?: string;
+}
+
+async function fetchJson(url: string, init: RequestInit = {}, allow404 = false): Promise<any> {
+  const response = await fetch(url, init);
+  if (allow404 && response.status === 404) return null;
+  const text = await response.text();
+  if (!response.ok) throw new Error(`provider HTTP ${response.status}: ${text.slice(0, 300)}`);
+  return JSON.parse(text);
+}
+async function putJson(url: string, value: unknown): Promise<void> {
+  const response = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
+  if (!response.ok) throw new Error(`consensus checkpoint upload failed: HTTP ${response.status}`);
 }
 
 async function _log(
@@ -95,6 +114,61 @@ export async function processConsensusTranscription(job: Job<ConsensusTranscript
 
   let tickCount = 0;
   let lastStep: ConsensusStepResponse | null = null;
+
+  // Provider dispatch belongs on Railway. The Base44 step returns only signed
+  // source/checkpoint URLs; this worker performs AAI + Scribe I/O and then pins
+  // their durable IDs/results before the existing merge phase begins.
+  await runWithLockHeartbeat(job, async (signal) => {
+    const prep = await invokeBase44Function<ConsensusStepResponse>({
+      fn: 'consensusTranscriptionWorkerStep', authToken: auth_token,
+      payload: { project_id, consensus_run_id, operation: 'prepare_external' },
+      timeoutMs: FUNCTION_CALL_TIMEOUT_MS, signal,
+    });
+    if (!prep.needs_external_dispatch) return;
+    if (!env.ASSEMBLYAI_API_KEY || !env.ELEVENLABS_API_KEY) throw new Error('AAI and Scribe credentials must be configured in Railway');
+    let state = await fetchJson(prep.state_get_url!, {}, true).catch(() => null);
+    let rawStash = await fetchJson(prep.raw_get_url!, {}, true).catch(() => null);
+    let aaiJobId = String(state?.aai_job_id || '');
+    if (!aaiJobId) {
+      const submitted = await fetchJson('https://api.assemblyai.com/v2/transcript', {
+        method: 'POST', headers: { authorization: env.ASSEMBLYAI_API_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ audio_url: prep.source_url, speaker_labels: true, speech_models: ['universal-3-5-pro'], punctuate: true, language_detection: true }),
+        signal,
+      });
+      aaiJobId = String(submitted.id || '');
+      if (!aaiJobId) throw new Error(`AssemblyAI returned no transcript id: ${submitted.error || 'unknown error'}`);
+      state = { aai_job_id: aaiJobId, submitted_at: new Date().toISOString() };
+      await putJson(prep.state_put_url!, state);
+    }
+    let scribeOk = !!rawStash?.raw;
+    let scribeProviderId = String(rawStash?.raw?.request_id || '');
+    let degradeReason = '';
+    if (!scribeOk) {
+      try {
+        const form = new FormData();
+        form.append('model_id', 'scribe_v2');
+        form.append('source_url', prep.source_url!);
+        form.append('diarize', 'true');
+        form.append('tag_audio_events', 'true');
+        form.append('timestamps_granularity', 'word');
+        const response = await fetch('https://api.elevenlabs.io/v1/speech-to-text', { method: 'POST', headers: { 'xi-api-key': env.ELEVENLABS_API_KEY }, body: form, signal });
+        const text = await response.text();
+        if (!response.ok) throw new Error(`Scribe HTTP ${response.status}: ${text.slice(0, 300)}`);
+        const raw = JSON.parse(text);
+        rawStash = { raw };
+        scribeProviderId = String(raw.request_id || `scribe_${Date.now()}`);
+        await putJson(prep.raw_put_url!, rawStash);
+        scribeOk = true;
+      } catch (error) {
+        degradeReason = `ElevenLabs Scribe leg failed on Railway: ${String((error as Error)?.message || error).slice(0, 240)}`;
+      }
+    }
+    await invokeBase44Function({
+      fn: 'consensusTranscriptionWorkerStep', authToken: auth_token,
+      payload: { project_id, consensus_run_id, operation: 'mark_external_dispatched', aai_job_id: aaiJobId, scribe_ok: scribeOk, scribe_provider_job_id: scribeProviderId, degrade_reason: degradeReason },
+      timeoutMs: FUNCTION_CALL_TIMEOUT_MS, signal,
+    });
+  });
 
   while (true) {
     if (Date.now() - t0 > WALL_CLOCK_CAP_MS) {
