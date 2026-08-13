@@ -226,6 +226,11 @@ export const env = {
   // to finish). Default 4 — comfortable for 100+ concurrent users without
   // amplifying Base44 write pressure. Env-overridable.
   CONCURRENCY_CONSENSUS_TRANSCRIPTION: intEnv('WORKER_CONCURRENCY_CONSENSUS_TRANSCRIPTION', 4),
+  // Single-model provider execution. Four isolated slots keep provider polling
+  // off Base44 while bounding write/cutover pressure under concurrent projects.
+  CONCURRENCY_TRANSCRIPTION: intEnv('WORKER_CONCURRENCY_TRANSCRIPTION', 4),
+  ASSEMBLYAI_API_KEY: process.env.ASSEMBLYAI_API_KEY || '',
+  ELEVENLABS_API_KEY: process.env.ELEVENLABS_API_KEY || '',
   // Precision-2 is provider-bound and each run performs one staged cutover.
   // Four isolated slots support concurrent projects without increasing hot-path
   // Base44 write density; each slot sleeps between provider status polls.
