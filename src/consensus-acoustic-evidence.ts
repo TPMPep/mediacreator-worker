@@ -34,6 +34,19 @@ function languageCode(aaiRaw: any, fallback = 'en'): string {
   return String(aaiRaw?.language_code || fallback || 'en').toLowerCase().replace(/_/g, '-').split('-')[0];
 }
 
+const MAX_VERIFIED_SHIFT_MS = 30_000;
+const MIN_VERIFIED_MEAN_CONFIDENCE = 0.5;
+
+function assertVerificationQuality(label: string, result: AlignmentResult) {
+  if (!result.verified) throw new Error(`${label} forced alignment was not verified`);
+  if (Number(result.mean_confidence || 0) < MIN_VERIFIED_MEAN_CONFIDENCE) {
+    throw new Error(`${label} forced alignment confidence ${Number(result.mean_confidence || 0).toFixed(3)} is below ${MIN_VERIFIED_MEAN_CONFIDENCE}`);
+  }
+  if (Number(result.max_provider_shift_ms || 0) > MAX_VERIFIED_SHIFT_MS) {
+    throw new Error(`${label} forced alignment shift ${Math.round(Number(result.max_provider_shift_ms))}ms exceeds ${MAX_VERIFIED_SHIFT_MS}ms`);
+  }
+}
+
 function summarize(result: AlignmentResult) {
   return {
     verified: result.verified,
@@ -74,7 +87,9 @@ export async function buildConsensusAcousticEvidence(input: {
   await input.onProgress?.('primary_aligned');
   const secondaryResult = await alignTranscript({ requestId: `${input.requestId}:secondary`, audioUrl: input.audioUrl, languageCode: language, words: secondary, signal: input.signal });
   await input.onProgress?.('secondary_aligned');
-  if (primaryResult.audio_sha256 !== secondaryResult.audio_sha256) throw new Error('Consensus acoustic evidence was computed from different source bytes');
+  assertVerificationQuality('AssemblyAI', primaryResult);
+  assertVerificationQuality('Scribe', secondaryResult);
+  if (primaryResult.audio_sha256 !== secondaryResult.audio_sha256) throw new Error('Duo verification evidence was computed from different source bytes');
   return {
     policy_version: 1,
     verified: true,
