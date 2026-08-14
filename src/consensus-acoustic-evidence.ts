@@ -45,8 +45,13 @@ function summarize(result: AlignmentResult) {
     word_count: result.word_count,
     mean_confidence: result.mean_confidence,
     max_provider_shift_ms: result.max_provider_shift_ms,
+    timing_repair_count: result.timing_repair_count || 0,
+    max_regression_ms: result.max_regression_ms || 0,
     duration_ms: result.duration_ms,
-    words: result.words.map(word => ({ key: word.key, confidence: word.confidence, start_ms: word.start_ms, end_ms: word.end_ms })),
+    words: result.words.map(word => ({
+      key: word.key, confidence: word.confidence, start_ms: word.start_ms, end_ms: word.end_ms,
+      ...(word.timing_repaired ? { timing_repaired: true, raw_start_ms: word.raw_start_ms, raw_end_ms: word.raw_end_ms } : {}),
+    })), 
   };
 }
 
@@ -57,6 +62,7 @@ export async function buildConsensusAcousticEvidence(input: {
   scribeRaw: any;
   sourceLanguage?: string;
   signal: AbortSignal;
+  onProgress?: (phase: 'primary_aligned' | 'secondary_aligned') => Promise<void>;
 }) {
   const primary = primaryWords(input.aaiRaw);
   const secondary = secondaryWords(input.scribeRaw);
@@ -65,7 +71,9 @@ export async function buildConsensusAcousticEvidence(input: {
   // Deliberately sequential: the alignment service is the bounded heavy lane.
   // Parallel calls would double source downloads and defeat its concurrency cap.
   const primaryResult = await alignTranscript({ requestId: `${input.requestId}:primary`, audioUrl: input.audioUrl, languageCode: language, words: primary, signal: input.signal });
+  await input.onProgress?.('primary_aligned');
   const secondaryResult = await alignTranscript({ requestId: `${input.requestId}:secondary`, audioUrl: input.audioUrl, languageCode: language, words: secondary, signal: input.signal });
+  await input.onProgress?.('secondary_aligned');
   if (primaryResult.audio_sha256 !== secondaryResult.audio_sha256) throw new Error('Consensus acoustic evidence was computed from different source bytes');
   return {
     policy_version: 1,
