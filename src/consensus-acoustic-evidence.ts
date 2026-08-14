@@ -1,4 +1,10 @@
-import { alignTranscript, type AlignmentInputWord, type AlignmentResult } from './alignment-client.js';
+import {
+  alignTranscript,
+  assertAlignmentQuality,
+  ALIGNMENT_QUALITY_POLICY_VERSION,
+  type AlignmentInputWord,
+  type AlignmentResult,
+} from './alignment-client.js';
 
 type ProviderWord = { text?: string; start?: number; end?: number; confidence?: number; type?: string };
 
@@ -34,19 +40,6 @@ function languageCode(aaiRaw: any, fallback = 'en'): string {
   return String(aaiRaw?.language_code || fallback || 'en').toLowerCase().replace(/_/g, '-').split('-')[0];
 }
 
-const MAX_VERIFIED_SHIFT_MS = 30_000;
-const MIN_VERIFIED_MEAN_CONFIDENCE = 0.5;
-
-function assertVerificationQuality(label: string, result: AlignmentResult) {
-  if (!result.verified) throw new Error(`${label} forced alignment was not verified`);
-  if (Number(result.mean_confidence || 0) < MIN_VERIFIED_MEAN_CONFIDENCE) {
-    throw new Error(`${label} forced alignment confidence ${Number(result.mean_confidence || 0).toFixed(3)} is below ${MIN_VERIFIED_MEAN_CONFIDENCE}`);
-  }
-  if (Number(result.max_provider_shift_ms || 0) > MAX_VERIFIED_SHIFT_MS) {
-    throw new Error(`${label} forced alignment shift ${Math.round(Number(result.max_provider_shift_ms))}ms exceeds ${MAX_VERIFIED_SHIFT_MS}ms`);
-  }
-}
-
 function summarize(result: AlignmentResult) {
   return {
     verified: result.verified,
@@ -58,6 +51,13 @@ function summarize(result: AlignmentResult) {
     word_count: result.word_count,
     mean_confidence: result.mean_confidence,
     max_provider_shift_ms: result.max_provider_shift_ms,
+    median_provider_shift_ms: result.median_provider_shift_ms ?? null,
+    p95_provider_shift_ms: result.p95_provider_shift_ms ?? null,
+    p99_provider_shift_ms: result.p99_provider_shift_ms ?? null,
+    outlier_tolerance_ms: result.outlier_tolerance_ms ?? null,
+    outlier_word_count: result.outlier_word_count ?? null,
+    outlier_ratio: result.outlier_ratio ?? null,
+    outlier_sample: result.outlier_sample || [],
     timing_repair_count: result.timing_repair_count || 0,
     max_regression_ms: result.max_regression_ms || 0,
     duration_ms: result.duration_ms,
@@ -87,11 +87,11 @@ export async function buildConsensusAcousticEvidence(input: {
   await input.onProgress?.('primary_aligned');
   const secondaryResult = await alignTranscript({ requestId: `${input.requestId}:secondary`, audioUrl: input.audioUrl, languageCode: language, words: secondary, signal: input.signal });
   await input.onProgress?.('secondary_aligned');
-  assertVerificationQuality('AssemblyAI', primaryResult);
-  assertVerificationQuality('Scribe', secondaryResult);
+  assertAlignmentQuality('AssemblyAI', primaryResult);
+  assertAlignmentQuality('Scribe', secondaryResult);
   if (primaryResult.audio_sha256 !== secondaryResult.audio_sha256) throw new Error('Duo verification evidence was computed from different source bytes');
   return {
-    policy_version: 1,
+    policy_version: ALIGNMENT_QUALITY_POLICY_VERSION,
     verified: true,
     source_audio_sha256: primaryResult.audio_sha256,
     language_code: language,
