@@ -1,10 +1,10 @@
 // =============================================================================
-// CONSENSUS-TRANSCRIPTION PROCESSOR — Dual-Model Consensus transcription pipeline
-// (Phase 2 — full dual dispatch + word-level arbitration).
+// CONSENSUS-TRANSCRIPTION PROCESSOR — Duo Verification pipeline
+// (Universal-3.5 Pro authoritative + Scribe shadow verification).
 // -----------------------------------------------------------------------------
-// Consensus mode transcribes ONE source with BOTH providers (AssemblyAI primary
-// for diarization + ElevenLabs Scribe v2 secondary for word recovery) and merges
-// them at the word level. This processor is the ISOLATED worker lane that drives
+// Duo Verification transcribes ONE source with BOTH providers. AssemblyAI 3.5
+// is the sole transcript writer; ElevenLabs Scribe v2 is immutable shadow evidence
+// used only to flag disagreements. Scribe never changes deliverable words or timing. This processor is the ISOLATED worker lane that drives
 // a ConsensusTranscriptionRun to completion, tick by tick, independent of any
 // browser or function budget — the same tick-resumable pattern as
 // cc-cue-supersede / hls-ingest / gltv-cascade.
