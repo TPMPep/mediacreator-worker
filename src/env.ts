@@ -238,6 +238,11 @@ export const env = {
   // Provider execution is Railway-native. Kept optional at boot so a missing
   // pyannote credential fails only this isolated lane, not every worker queue.
   PYANNOTE_API_KEY: process.env.PYANNOTE_API_KEY || '',
+  // Mandatory, fail-closed multilingual timing authority. The service is
+  // isolated from BullMQ so model inference cannot contend with queue control.
+  ALIGNMENT_ENGINE_URL: process.env.ALIGNMENT_ENGINE_URL || '',
+  ALIGNMENT_ENGINE_SECRET: process.env.ALIGNMENT_ENGINE_SECRET || '',
+  ALIGNMENT_ENGINE_TIMEOUT_MS: intEnv('ALIGNMENT_ENGINE_TIMEOUT_MS', 40 * 60 * 1000),
   // Synthetic Performance Match capture (2026-08-01). ISOLATED lane so a capture
   // burst never starves human editors. Each in-flight job is one tick-resumable
   // run against ONE PerformanceCaptureRun; each tick analyzes ONE segment (extract
