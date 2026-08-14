@@ -6,6 +6,8 @@ import { alignTranscript } from '../alignment-client.js';
 
 const API = 'https://api.pyannote.ai/v1';
 const COLORS = ['blue','purple','green','amber','red','pink','cyan','orange'];
+const MAX_VERIFIED_ALIGNMENT_SHIFT_MS = 30_000;
+const MIN_VERIFIED_ALIGNMENT_CONFIDENCE = 0.5;
 type Turn = { speaker:string; start:number; end:number; confidence?:Record<string,number> };
 type Word = { text?:string; start_ms:number; end_ms:number; confidence?:number; cluster?:string|null };
 type Segment = { id:string; sequence_index:number; start_ms:number; end_ms:number; source_text:string; speaker_label?:string; source_text_status?:string; confidence?:number; avg_word_confidence?:number; aai_word_timings?:Word[]; provider_name?:string; version_number?:number; consensus_run_id?:string; consensus_word_sources?:Array<{start_ms?:number;end_ms?:number;[key:string]:unknown}>; is_music?:boolean; music_source?:string; music_context?:string };
@@ -50,6 +52,7 @@ export async function processSpeakerDiarization(job:Job<SpeakerDiarizationJobDat
     const alignmentInput=source.flatMap(segment=>{const words=segment.aai_word_timings||[];if(!words.length&& !segment.is_music)throw new Error(`Missing provider word timings for segment ${segment.id}`);return words.map((word,index)=>({key:`${segment.id}:${index}`,text:String(word.text||'').trim(),provider_start_ms:Number(word.start_ms),provider_end_ms:Number(word.end_ms)})).filter(word=>word.text);});
     if(!alignmentInput.length)throw new Error('No provider words available for forced alignment');
     const alignment=await alignTranscript({requestId:`${request_id}:${run_id}`,audioUrl:prep.source_url,languageCode:String(prep.project.source_language||'en'),words:alignmentInput,signal});
+    if(!alignment.verified||Number(alignment.mean_confidence||0)<MIN_VERIFIED_ALIGNMENT_CONFIDENCE||Number(alignment.max_provider_shift_ms||0)>MAX_VERIFIED_ALIGNMENT_SHIFT_MS)throw new Error(`Forced alignment quality gate failed: confidence=${Number(alignment.mean_confidence||0).toFixed(3)}, max_shift_ms=${Math.round(Number(alignment.max_provider_shift_ms||0))}`);
     const alignmentArchive=await timedFetch(prep.alignment_result_upload_url,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(alignment)},signal,120000);if(!alignmentArchive.ok)throw new Error(`alignment result archive failed: HTTP ${alignmentArchive.status}`);
     const alignedByKey=new Map(alignment.words.map(word=>[word.key,word]));
     const clusters=[...new Set(turns.map(t=>t.speaker))];const plans=clusters.map((cluster,index)=>{const ts=turns.filter(t=>t.speaker===cluster),cs=ts.map(confidence).filter((n):n is number=>n!==null);return {cluster,label:label(cluster,index),color:COLORS[index%COLORS.length],confidence:cs.length?cs.reduce((a,b)=>a+b,0)/cs.length:null,turn_count:ts.length};});
