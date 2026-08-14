@@ -127,6 +127,17 @@ export async function processConsensusTranscription(job: Job<ConsensusTranscript
     bullmq_job_id: job.id,
     attempts: job.attemptsMade + 1,
   };
+  const reportExternalProgress = async (signal: AbortSignal, phase: 'dispatch_primary' | 'dispatch_secondary' | 'poll_providers' | 'aligning', progressPct: number) => {
+    try {
+      await invokeBase44Function({
+        fn: 'consensusTranscriptionWorkerStep', authToken: auth_token,
+        payload: { project_id, consensus_run_id, operation: 'external_progress', phase, progress_pct: progressPct },
+        timeoutMs: FUNCTION_CALL_TIMEOUT_MS, signal,
+      });
+    } catch (error) {
+      await _log('warn', 'consensus_progress_heartbeat_failed', { ...baseCtx, phase, progress_pct: progressPct, error: String((error as Error)?.message || error).slice(0, 240) });
+    }
+  };
 
   if (!auth_token) {
     await _log('error', 'consensus_missing_auth_token', baseCtx,
@@ -149,6 +160,7 @@ export async function processConsensusTranscription(job: Job<ConsensusTranscript
       payload: { project_id, consensus_run_id, operation: 'prepare_external' },
       timeoutMs: FUNCTION_CALL_TIMEOUT_MS, signal,
     });
+    if (prep.status === 'failed' || prep.status === 'cancelled') throw new Error(`consensus run is terminal: ${prep.status}`);
     if (!prep.needs_external_dispatch) return;
     if (!env.ASSEMBLYAI_API_KEY) throw new Error('ASSEMBLYAI_API_KEY must be configured in Railway');
     let state = await fetchJson(prep.state_get_url!, {}, true);
@@ -169,6 +181,7 @@ export async function processConsensusTranscription(job: Job<ConsensusTranscript
       state = { ...(state || {}), aai_job_id: aaiJobId, aai_dispatch_state: 'submitted', submitted_at: new Date().toISOString() };
       await putJson(prep.state_put_url!, state);
     }
+    await reportExternalProgress(signal, 'dispatch_secondary', 20);
     let scribeOk = !!rawStash?.raw;
     let scribeProviderId = String(rawStash?.raw?.request_id || '');
     let degradeReason = '';
@@ -198,6 +211,7 @@ export async function processConsensusTranscription(job: Job<ConsensusTranscript
         degradeReason = `ElevenLabs Scribe leg failed on Railway: ${String((error as Error)?.message || error).slice(0, 240)}`;
       }
     }
+    await reportExternalProgress(signal, 'poll_providers', 35);
     let aaiRaw = await fetchJson(prep.primary_raw_get_url!, {}, true);
     const primaryAlreadyArchived = aaiRaw?.status === 'completed';
     while (!aaiRaw || aaiRaw.status !== 'completed') {
@@ -206,12 +220,17 @@ export async function processConsensusTranscription(job: Job<ConsensusTranscript
       if (aaiRaw.status !== 'completed') await sleep(5000, signal);
     }
     if (!primaryAlreadyArchived) await putJson(prep.primary_raw_put_url!, aaiRaw);
+    await reportExternalProgress(signal, 'aligning', 55);
 
     let acousticVerified = false;
     if (scribeOk) {
       let acousticEvidence = await fetchJson(prep.acoustic_get_url!, {}, true);
       if (!acousticEvidence?.verified) {
-        acousticEvidence = await buildConsensusAcousticEvidence({ requestId: request_id, audioUrl: prep.source_url!, aaiRaw, scribeRaw: rawStash.raw, sourceLanguage: aaiRaw.language_code, signal });
+        acousticEvidence = await buildConsensusAcousticEvidence({
+          requestId: request_id, audioUrl: prep.source_url!, aaiRaw, scribeRaw: rawStash.raw,
+          sourceLanguage: aaiRaw.language_code, signal,
+          onProgress: async phase => reportExternalProgress(signal, 'aligning', phase === 'primary_aligned' ? 62 : 70),
+        });
         await putJson(prep.acoustic_put_url!, acousticEvidence);
       }
       acousticVerified = !!acousticEvidence?.verified;
@@ -226,12 +245,17 @@ export async function processConsensusTranscription(job: Job<ConsensusTranscript
   } catch (error) {
     if (error instanceof WorkerLockLostError || (error as Error)?.name === 'WorkerLockLostError') throw error;
     const message = String((error as Error)?.message || error).slice(0, 500);
-    await invokeBase44Function({
-      fn: 'consensusTranscriptionWorkerStep', authToken: auth_token,
-      payload: { project_id, consensus_run_id, operation: 'external_failure', error_message: message },
-      timeoutMs: FUNCTION_CALL_TIMEOUT_MS,
-    }).catch(() => undefined);
-    await _log('error', 'consensus_external_phase_failed', { ...baseCtx, error: message }, message);
+    const transient = /HTTP 429|HTTP 50[234]|timeout|timed out|ECONNRESET|fetch failed|network|aborted/i.test(message);
+    const maxAttempts = Number(job.opts.attempts || 1);
+    const finalAttempt = job.attemptsMade + 1 >= maxAttempts;
+    if (!transient || finalAttempt) {
+      await invokeBase44Function({
+        fn: 'consensusTranscriptionWorkerStep', authToken: auth_token,
+        payload: { project_id, consensus_run_id, operation: 'external_failure', error_message: message },
+        timeoutMs: FUNCTION_CALL_TIMEOUT_MS,
+      }).catch(() => undefined);
+    }
+    await _log(finalAttempt || !transient ? 'error' : 'warn', finalAttempt || !transient ? 'consensus_external_phase_failed' : 'consensus_external_phase_retrying', { ...baseCtx, error: message, transient, final_attempt: finalAttempt }, message);
     throw error;
   }
 
@@ -265,11 +289,10 @@ export async function processConsensusTranscription(job: Job<ConsensusTranscript
       note: step.note,
     }, `Tick ${tickCount} returned action=${step.action} (phase=${step.phase ?? '?'}).`);
 
-    if (step.action === 'failed') {
-      // The step already finalized the run as failed before returning; surface
-      // the error so BullMQ's retry/DLQ policy applies but the run row is truth.
-      await _log('error', 'consensus_step_failed', { ...baseCtx, error: step.error }, step.error || 'consensus step failed');
-      return { ok: false, phase: step.phase || 'failed', error: step.error || 'consensus_step_failed', duration_ms: Date.now() - t0 };
+    if (step.action === 'failed' || step.status === 'failed' || step.status === 'cancelled') {
+      const terminalError = step.error || `consensus run is terminal: ${step.status || step.phase || 'failed'}`;
+      await _log('error', 'consensus_step_failed', { ...baseCtx, error: terminalError }, terminalError);
+      throw new Error(terminalError);
     }
 
     if (step.action !== 'continue') break;
