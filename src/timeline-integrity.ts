@@ -177,6 +177,9 @@ export type IntegrityRow = {
   _alignment?: { status?: string; words?: IntegrityWord[]; max_provider_shift_ms?: number };
   timing_defect?: string;
   timing_defect_ms?: number;
+  // Applied-repair disclosure — independent of timing_defect (see DEFECT_SEVERITY).
+  onset_reconstructed?: boolean;
+  onset_absorbed_ms?: number;
 };
 
 export type IntegrityReport = {
@@ -199,10 +202,18 @@ export type IntegrityReport = {
 // Before this, a segment whose absorbed onset CAUSED an overlap was labelled a
 // divergence while its victims were labelled overlaps — so the review queue
 // pointed at casualties instead of causes.
+//
+// ONSET RECONSTRUCTION IS DELIBERATELY ABSENT HERE. It is an already-APPLIED
+// repair, not an outstanding defect, and it lives on its own independent fields
+// (onset_reconstructed / onset_absorbed_ms). Ranking it against real defects made
+// the disclosure unreachable in practice: a reconstructed onset is BY DEFINITION a
+// multi-second provider-vs-acoustic gap, so it always also tripped the divergence
+// check and was always relabelled — the ground-truth 155s repair on project
+// 6a6c561ef670f3992db756d0 produced ZERO onset-labelled rows. A repair and a defect
+// are orthogonal facts about a row; one field cannot express both without losing one.
 const DEFECT_SEVERITY: Record<string, number> = {
-  onset_reconstructed: 1,          // already repaired; disclosure only
-  provider_capture_divergence: 2,  // capture no longer describes its own audio
-  same_speaker_overlap: 3,         // attribution error; a human must judge it
+  provider_capture_divergence: 1,  // capture no longer describes its own audio
+  same_speaker_overlap: 2,         // attribution error; a human must judge it
 };
 
 function flag(row: IntegrityRow, kind: string, magnitudeMs: number): boolean {
@@ -329,7 +340,9 @@ export function auditTimelineIntegrity(
     if (!previous || Number(row.end_ms) > Number(previous.end_ms)) furthestBySpeaker.set(speaker, row);
   }
 
-  report.onset_reconstructed_rows = rows.filter((row) => row.timing_defect === 'onset_reconstructed').length;
+  // Counted from the independent disclosure flag, NOT from a defect label — the
+  // label is claimed by whichever outstanding defect the row also carries.
+  report.onset_reconstructed_rows = rows.filter((row) => row.onset_reconstructed === true).length;
   report.defect_sequences = rows
     .filter((row) => !!row.timing_defect)
     .map((row) => Number(row.sequence_index))
