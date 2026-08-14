@@ -1426,8 +1426,9 @@ export interface MEPollJobData {
 // anchor). FULLY ISOLATED to the consensus pipeline.
 //
 // SECURITY MODEL — identical to cc-cue-supersede:
-//   • Scoped JWT (30-min TTL) bound to (user, project, consensus_run_id,
-//     'consensusTranscriptionWorkerStep'). Worker forwards verbatim as X-Worker-JWT.
+//   • Scoped JWT (12-hour TTL) bound to (user, project, consensus_run_id,
+//     'consensusTranscriptionWorkerStep'). The long bounded TTL survives queueing
+//     plus dual acoustic verification under 100+ concurrent users.
 //
 // AUDIT POSTURE (SOC 2 CC7.2 / CC7.4 / CC8.1):
 //   • ConsensusTranscriptionRun is the audit row; status + current_phase +
