@@ -11,6 +11,9 @@ export type AlignmentWord = AlignmentInputWord & {
   start_ms: number;
   end_ms: number;
   confidence: number;
+  raw_start_ms?: number;
+  raw_end_ms?: number;
+  timing_repaired?: boolean;
 };
 
 export type AlignmentResult = {
@@ -25,6 +28,8 @@ export type AlignmentResult = {
   word_count: number;
   mean_confidence: number;
   max_provider_shift_ms: number;
+  timing_repair_count: number;
+  max_regression_ms: number;
   duration_ms: number;
   words: AlignmentWord[];
 };
