@@ -194,6 +194,12 @@ export type IntegrityReport = {
   worst_onset_absorbed_ms: number;
   worst_same_speaker_overlap_ms: number;
   worst_provider_divergence_ms: number;
+  // Segment-scale absorption evidence. inflated_row_count is the number of rows
+  // whose window exceeds their own provider capture by more than the divergence
+  // threshold — expected to be ZERO once alignment chunks are silence-bounded, so
+  // a non-zero value here is the regression signal for that fix.
+  worst_acoustic_inflation_ms: number;
+  inflated_row_count: number;
   defect_sequences: number[];
 };
 
@@ -282,6 +288,8 @@ export function auditTimelineIntegrity(
     worst_onset_absorbed_ms: onsetRepair?.worst_onset_absorbed_ms || 0,
     worst_same_speaker_overlap_ms: 0,
     worst_provider_divergence_ms: 0,
+    worst_acoustic_inflation_ms: 0,
+    inflated_row_count: 0,
     defect_sequences: [],
   };
 
@@ -294,6 +302,26 @@ export function auditTimelineIntegrity(
       const endGap = Math.abs(Number(word.end_ms) - Number(word.provider_end_ms));
       const gap = Math.max(Number.isFinite(startGap) ? startGap : 0, Number.isFinite(endGap) ? endGap : 0);
       if (gap > worst) worst = gap;
+    }
+    // SPAN INFLATION — the measure a per-word check structurally cannot see.
+    // Absorbed time distributed across many words keeps every individual word's
+    // shift under the threshold while the SEGMENT still ends up seconds too long.
+    // Ground truth: a row whose provider capture held 1,784ms of speech carried a
+    // 4,240ms window and was never flagged, because no single word moved far enough.
+    // Comparing the whole span against the provider's own span closes that hole, so
+    // an inflated window can never reach a reviewer silently — whatever shape the
+    // absorption takes. Same defect class (capture and acoustic timeline disagree),
+    // measured at segment scale, so the magnitude reports the worst evidence found.
+    const capture = row.aai_word_timings || [];
+    if (capture.length) {
+      const captureSpan = Number(capture[capture.length - 1].end_ms) - Number(capture[0].start_ms);
+      const acousticSpan = Number(row.end_ms) - Number(row.start_ms);
+      const inflation = acousticSpan - captureSpan;
+      if (Number.isFinite(inflation) && inflation > 0) {
+        if (inflation > report.worst_acoustic_inflation_ms) report.worst_acoustic_inflation_ms = Math.round(inflation);
+        if (inflation > PROVIDER_CAPTURE_DIVERGENCE_MS) report.inflated_row_count += 1;
+        if (inflation > worst) worst = inflation;
+      }
     }
     if (worst > PROVIDER_CAPTURE_DIVERGENCE_MS) {
       flag(row, 'provider_capture_divergence', worst);
