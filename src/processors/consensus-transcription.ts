@@ -9,11 +9,10 @@
 // browser or function budget — the same tick-resumable pattern as
 // cc-cue-supersede / hls-ingest / gltv-cascade.
 //
-// The loop calls consensusTranscriptionWorkerStep, which advances the run's phase
-// machine: queued → dispatch (submit AAI async + Scribe sync) → poll_providers
-// (poll AAI once per tick, ~40s of polling, returns 'continue' until done) →
-// awaiting_merge → arbitrating (timing-anchored alignment + confidence
-// arbitration on the AAI diarization timeline) → persisting → done. Each 'continue'
+// Railway owns both provider calls, AAI polling, immutable raw-result archival,
+// and dual forced-alignment evidence. Base44 only signs scoped storage access and
+// performs the bounded, release-gated database cutover: queued → awaiting_merge →
+// acoustic arbitration on the AAI diarization timeline → persisting → done. Each 'continue'
 // re-invokes the step; the loop terminates on 'done' (completed) or 'failed'.
 // The step is idempotent per-phase (keyed by the run's status), so a pod death
 // mid-run resumes the exact phase from the row alone (SOC 2 CC7.2).
@@ -36,15 +35,16 @@
 
 import type { Job } from 'bullmq';
 import type { ConsensusTranscriptionJobData } from '../../shared/queue-contracts.js';
-import { invokeBase44Function, logEvent, runWithLockHeartbeat } from '../base44-client.js';
+import { invokeBase44Function, logEvent, runWithLockHeartbeat, WorkerLockLostError } from '../base44-client.js';
 import { env } from '../env.js';
+import { buildConsensusAcousticEvidence } from '../consensus-acoustic-evidence.js';
 
 const FUNCTION_CALL_TIMEOUT_MS = 60_000;
 // Total wall-clock cap for the whole run's tick loop. Phase 1 parks after one
 // tick, so this is generous headroom for the Phase 2 dual-provider legs (each
 // provider transcription of a feature can take several minutes) without
 // approaching BullMQ's job ceiling on a pathological input.
-const WALL_CLOCK_CAP_MS = 25 * 60 * 1000;
+const WALL_CLOCK_CAP_MS = 2 * 60 * 60 * 1000;
 
 interface ConsensusStepResponse {
   action: 'continue' | 'done' | 'failed';
@@ -60,6 +60,12 @@ interface ConsensusStepResponse {
   state_put_url?: string;
   raw_get_url?: string;
   raw_put_url?: string;
+  primary_raw_get_url?: string;
+  primary_raw_put_url?: string;
+  acoustic_get_url?: string;
+  acoustic_put_url?: string;
+  primary_model?: string;
+  source_language?: string;
 }
 
 async function fetchJson(url: string, init: RequestInit = {}, allow404 = false): Promise<any> {
@@ -70,8 +76,27 @@ async function fetchJson(url: string, init: RequestInit = {}, allow404 = false):
   return JSON.parse(text);
 }
 async function putJson(url: string, value: unknown): Promise<void> {
-  const response = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
-  if (!response.ok) throw new Error(`consensus checkpoint upload failed: HTTP ${response.status}`);
+  let lastStatus = 0;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const response = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
+    if (response.ok) return;
+    lastStatus = response.status;
+    if (response.status < 500 && response.status !== 429) break;
+    await new Promise(resolve => setTimeout(resolve, Math.min(8000, 500 * (2 ** attempt))));
+  }
+  throw new Error(`consensus checkpoint upload failed after bounded retries: HTTP ${lastStatus}`);
+}
+function assemblyLanguage(raw?: string): string | null {
+  if (!raw || raw === 'auto') return null;
+  const value = raw.toLowerCase().replace(/_/g, '-');
+  const aliases: Record<string, string> = { 'en-us': 'en_us', 'en-gb': 'en_uk', 'en-au': 'en_au', nb: 'no', nn: 'no', no: 'no', he: 'he', iw: 'he' };
+  return aliases[value] || value.split('-')[0];
+}
+async function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('worker lock lost')); }, { once: true });
+  });
 }
 
 async function _log(
@@ -115,29 +140,33 @@ export async function processConsensusTranscription(job: Job<ConsensusTranscript
   let tickCount = 0;
   let lastStep: ConsensusStepResponse | null = null;
 
-  // Provider dispatch belongs on Railway. The Base44 step returns only signed
-  // source/checkpoint URLs; this worker performs AAI + Scribe I/O and then pins
-  // their durable IDs/results before the existing merge phase begins.
-  await runWithLockHeartbeat(job, async (signal) => {
+  // Provider dispatch belongs on Railway. Any terminal provider, archive, or
+  // acoustic failure is written back before the job is allowed to retry/DLQ.
+  try {
+    await runWithLockHeartbeat(job, async (signal) => {
     const prep = await invokeBase44Function<ConsensusStepResponse>({
       fn: 'consensusTranscriptionWorkerStep', authToken: auth_token,
       payload: { project_id, consensus_run_id, operation: 'prepare_external' },
       timeoutMs: FUNCTION_CALL_TIMEOUT_MS, signal,
     });
     if (!prep.needs_external_dispatch) return;
-    if (!env.ASSEMBLYAI_API_KEY || !env.ELEVENLABS_API_KEY) throw new Error('AAI and Scribe credentials must be configured in Railway');
-    let state = await fetchJson(prep.state_get_url!, {}, true).catch(() => null);
-    let rawStash = await fetchJson(prep.raw_get_url!, {}, true).catch(() => null);
+    if (!env.ASSEMBLYAI_API_KEY) throw new Error('ASSEMBLYAI_API_KEY must be configured in Railway');
+    let state = await fetchJson(prep.state_get_url!, {}, true);
+    let rawStash = await fetchJson(prep.raw_get_url!, {}, true);
     let aaiJobId = String(state?.aai_job_id || '');
     if (!aaiJobId) {
+      if (state?.aai_dispatch_state === 'submitting') throw new Error('AssemblyAI dispatch outcome is uncertain; refusing duplicate provider spend');
+      state = { ...(state || {}), aai_dispatch_state: 'submitting', aai_submit_started_at: new Date().toISOString() };
+      await putJson(prep.state_put_url!, state);
+      const pinnedLanguage = assemblyLanguage(prep.source_language);
       const submitted = await fetchJson('https://api.assemblyai.com/v2/transcript', {
         method: 'POST', headers: { authorization: env.ASSEMBLYAI_API_KEY, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ audio_url: prep.source_url, speaker_labels: true, speech_models: ['universal-3-5-pro'], punctuate: true, language_detection: true }),
+        body: JSON.stringify({ audio_url: prep.source_url, speaker_labels: true, speech_models: [prep.primary_model || 'universal-3-5-pro'], punctuate: true, ...(pinnedLanguage ? { language_code: pinnedLanguage } : { language_detection: true }) }),
         signal,
       });
       aaiJobId = String(submitted.id || '');
       if (!aaiJobId) throw new Error(`AssemblyAI returned no transcript id: ${submitted.error || 'unknown error'}`);
-      state = { aai_job_id: aaiJobId, submitted_at: new Date().toISOString() };
+      state = { ...(state || {}), aai_job_id: aaiJobId, aai_dispatch_state: 'submitted', submitted_at: new Date().toISOString() };
       await putJson(prep.state_put_url!, state);
     }
     let scribeOk = !!rawStash?.raw;
@@ -145,6 +174,10 @@ export async function processConsensusTranscription(job: Job<ConsensusTranscript
     let degradeReason = '';
     if (!scribeOk) {
       try {
+        if (state?.scribe_dispatch_state === 'submitting') throw new Error('Scribe dispatch outcome is uncertain; refusing duplicate provider spend');
+        if (!env.ELEVENLABS_API_KEY) throw new Error('ELEVENLABS_API_KEY is not configured in Railway');
+        state = { ...(state || {}), scribe_dispatch_state: 'submitting', scribe_submit_started_at: new Date().toISOString() };
+        await putJson(prep.state_put_url!, state);
         const form = new FormData();
         form.append('model_id', 'scribe_v2');
         form.append('source_url', prep.source_url!);
@@ -158,17 +191,49 @@ export async function processConsensusTranscription(job: Job<ConsensusTranscript
         rawStash = { raw };
         scribeProviderId = String(raw.request_id || `scribe_${Date.now()}`);
         await putJson(prep.raw_put_url!, rawStash);
+        state = { ...(state || {}), scribe_dispatch_state: 'completed', scribe_provider_job_id: scribeProviderId, scribe_completed_at: new Date().toISOString() };
+        await putJson(prep.state_put_url!, state);
         scribeOk = true;
       } catch (error) {
         degradeReason = `ElevenLabs Scribe leg failed on Railway: ${String((error as Error)?.message || error).slice(0, 240)}`;
       }
     }
+    let aaiRaw = await fetchJson(prep.primary_raw_get_url!, {}, true);
+    const primaryAlreadyArchived = aaiRaw?.status === 'completed';
+    while (!aaiRaw || aaiRaw.status !== 'completed') {
+      aaiRaw = await fetchJson(`https://api.assemblyai.com/v2/transcript/${aaiJobId}`, { headers: { authorization: env.ASSEMBLYAI_API_KEY }, signal });
+      if (aaiRaw.status === 'error') throw new Error(`AssemblyAI transcription failed: ${aaiRaw.error || 'unknown provider error'}`);
+      if (aaiRaw.status !== 'completed') await sleep(5000, signal);
+    }
+    if (!primaryAlreadyArchived) await putJson(prep.primary_raw_put_url!, aaiRaw);
+
+    let acousticVerified = false;
+    if (scribeOk) {
+      let acousticEvidence = await fetchJson(prep.acoustic_get_url!, {}, true);
+      if (!acousticEvidence?.verified) {
+        acousticEvidence = await buildConsensusAcousticEvidence({ requestId: request_id, audioUrl: prep.source_url!, aaiRaw, scribeRaw: rawStash.raw, sourceLanguage: aaiRaw.language_code, signal });
+        await putJson(prep.acoustic_put_url!, acousticEvidence);
+      }
+      acousticVerified = !!acousticEvidence?.verified;
+      if (!acousticVerified) throw new Error('Consensus acoustic verification did not produce verified evidence');
+    }
     await invokeBase44Function({
       fn: 'consensusTranscriptionWorkerStep', authToken: auth_token,
-      payload: { project_id, consensus_run_id, operation: 'mark_external_dispatched', aai_job_id: aaiJobId, scribe_ok: scribeOk, scribe_provider_job_id: scribeProviderId, degrade_reason: degradeReason },
+      payload: { project_id, consensus_run_id, operation: 'mark_external_dispatched', aai_job_id: aaiJobId, aai_completed: true, acoustic_verified: acousticVerified, scribe_ok: scribeOk, scribe_provider_job_id: scribeProviderId, degrade_reason: degradeReason },
       timeoutMs: FUNCTION_CALL_TIMEOUT_MS, signal,
     });
-  });
+    });
+  } catch (error) {
+    if (error instanceof WorkerLockLostError || (error as Error)?.name === 'WorkerLockLostError') throw error;
+    const message = String((error as Error)?.message || error).slice(0, 500);
+    await invokeBase44Function({
+      fn: 'consensusTranscriptionWorkerStep', authToken: auth_token,
+      payload: { project_id, consensus_run_id, operation: 'external_failure', error_message: message },
+      timeoutMs: FUNCTION_CALL_TIMEOUT_MS,
+    }).catch(() => undefined);
+    await _log('error', 'consensus_external_phase_failed', { ...baseCtx, error: message }, message);
+    throw error;
+  }
 
   while (true) {
     if (Date.now() - t0 > WALL_CLOCK_CAP_MS) {
