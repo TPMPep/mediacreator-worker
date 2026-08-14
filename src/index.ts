@@ -129,7 +129,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-08-14-consensus-acoustic-quality-v15',
+  build_tag: '2026-08-14-consensus-forensic-hardening-v16',
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
@@ -512,15 +512,28 @@ void seedMEPollHeartbeat(getQueue);
 import { DEFAULT_JOB_OPTIONS } from '../shared/queue-contracts.js';
 
 // ─── HTTP endpoints for Railway ──────────────────────────────────────
+async function getAlignmentHealth() {
+  if (!env.ALIGNMENT_ENGINE_URL) return { configured: false, ready: false, build_tag: null };
+  try {
+    const response = await fetch(`${env.ALIGNMENT_ENGINE_URL.replace(/\/$/, '')}/health`, { signal: AbortSignal.timeout(3000) });
+    const body = await response.json() as { ready?: boolean; build_tag?: string; provider?: string };
+    return { configured: true, ready: response.ok && body.ready === true, build_tag: body.build_tag || null, provider: body.provider || null };
+  } catch (error) {
+    return { configured: true, ready: false, build_tag: null, error: String((error as Error)?.message || error).slice(0, 200) };
+  }
+}
+
 // /health  — Railway healthcheck.
 // /enqueue — Producer-side endpoint. Base44 functions POST here to push
 //            jobs into a queue. Protected by WORKER_ENQUEUE_SECRET if set.
 const server = http.createServer(async (req, res) => {
   if (req.url === '/health' && req.method === 'GET') {
+    const alignmentEngine = await getAlignmentHealth();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ok: true,
       build_info: BUILD_INFO,
+      alignment_engine: alignmentEngine,
       s3_creds_present: s3Creds.ok,
       s3_creds_missing: s3Creds.missing,
       queues: workers.map(w => ({ name: w.name, concurrency: w.opts.concurrency, running: !w.closing })),
@@ -753,6 +766,53 @@ const server = http.createServer(async (req, res) => {
       captureError(e, { route: '/job-status', queue });
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  if (req.url === '/retry-job' && req.method === 'POST') {
+    if (!env.ENQUEUE_SECRET || req.headers['x-enqueue-secret'] !== env.ENQUEUE_SECRET) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unauthorized' }));
+      return;
+    }
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    let parsed: { queue?: string; job_id?: string; payload?: Record<string, unknown> };
+    try { parsed = JSON.parse(body); } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid JSON' }));
+      return;
+    }
+    const { queue, job_id } = parsed;
+    if (!queue || !job_id || !Object.values(QUEUE_NAMES).includes(queue as never)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'valid queue + job_id required' }));
+      return;
+    }
+    try {
+      const job = await getQueue(queue).getJob(job_id);
+      if (!job) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'job not found' }));
+        return;
+      }
+      const state = await job.getState();
+      if (state === 'completed') {
+        await job.remove();
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'terminal job removed for deterministic re-enqueue', state_before: state }));
+        return;
+      }
+      if (state !== 'active' && parsed.payload) await job.updateData({ ...(job.data as Record<string, unknown>), ...parsed.payload });
+      if (state === 'failed') await job.retry('failed');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, job_id, state_before: state, retried: state === 'failed' }));
+    } catch (error) {
+      const message = String((error as Error)?.message || error);
+      captureError(error, { route: '/retry-job', queue, job_id });
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: message }));
     }
     return;
   }
