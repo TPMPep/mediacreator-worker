@@ -1,81 +1,113 @@
 // =============================================================================
-// timeline-integrity — acoustic-onset repair + post-reconciliation timeline audit
+// timeline-integrity — timing arbitration + post-reconciliation timeline audit
 // for speaker refinement.
 // -----------------------------------------------------------------------------
-// TWO STAGES, ONE POSTURE: repair what is provably reconstructible, quarantine
-// what a human must judge, never destroy data, never veto the run.
+// THREE STAGES, ONE POSTURE: decide each disputed timing from EVIDENCE, repair
+// what is provably reconstructible, quarantine what a human must judge, never
+// destroy data, never veto the run.
 //
-// ── STAGE 1: clampAcousticOnsets (runs BEFORE the reconciler groups words) ───
-// Forced alignment must account for EVERY millisecond of audio between words.
-// Where the transcription provider left audio un-transcribed — music, scene
-// atmosphere, unintelligible overlap — the aligner has nowhere to put that time,
-// so it ABSORBS it into the ONSET of the next word. Ground truth from project
-// 6a6c561ef670f3992db756d0 (run 6a7f82ab26879b8abe258698): the single word
-// "Enhorabuena," was returned as 1,824,077 → 1,979,217 ms — a 155-SECOND word.
-// The provider captured it as 1,978,896 → 1,980,474 (1.578s). The END was
-// corroborated within 1.2s; only the onset was dragged backward across 2.5
-// minutes of non-dialogue audio. 29 of that run's 37 ceiling violations were
-// segment-INITIAL words, and there were ZERO cross-speaker overlaps inside the
-// absorbed span — nobody else speaks there, confirming the absorbed time is
-// genuinely unaccounted audio rather than mis-attributed dialogue.
+// ── STAGE 0: restoreDivergedCaptures — plausibility arbitration ──────────────
+// Two timelines describe every word: the transcription provider's measured
+// capture, and the acoustic forced-alignment window. When they disagree by
+// seconds, ONE of them is wrong and the reconciler must not decide the line
+// break and the speaker from the wrong one.
 //
-// WHY THIS MATTERS BEYOND DISPLAY: the reconciler derives a segment's window
-// from its first word's start and last word's end, so one absorbed onset became
-// a 155-second segment. That window drives the rythmo band, voice-generation
-// time-fit, and export placement — a dub stretched across 2.5 minutes.
+// THE RULE THIS REPLACED WAS WRONG, and the evidence is unambiguous. Policy v3
+// said "provider wins any divergence beyond the threshold." Ground truth,
+// project 6a7d874aa2ddd372f426a4df row 28 ("Now its state media are reporting
+// millions of people"): the provider captured 9 words / ~50 characters inside
+// 1,346ms — 37 characters per second, against a conversational 14. Physically
+// impossible. The aligner placed the same words across 2,761ms (18 cps), which
+// also fits exactly in the measured gap between the neighbouring rows. Under v3
+// the provider would have overwritten a CORRECT acoustic timeline with an
+// impossible one; the only thing that stopped it was the monotonicity guard
+// refusing the write. A guard accidentally preventing a corrupting repair is not
+// a policy working — it is a policy surviving.
 //
-// WHY THE QUALITY GATE DID NOT CATCH IT — BY DESIGN: assertAlignmentQuality
-// judges the DISTRIBUTION (p99 6,973ms under the 30,000ms ceiling; >30s outlier
-// ratio 0.00072 under the 0.005 limit). Refusing to veto a paid run over a
-// handful of outlier words is the correct posture and is deliberately unchanged.
-// The gap was that a word the gate TOLERATED still silently defined a segment
-// window. This module closes that gap at the point of CONSUMPTION.
+// THE DISCRIMINATOR IS PLAUSIBILITY, NOT PROVENANCE. Neither actor is
+// authoritative by identity; each candidate window is judged against the same
+// rate-aware ceiling used everywhere else in the pipeline, plus a floor below
+// which a window describes no speech at all:
+//   • aligned implausible, provider plausible  → restore the provider window
+//       (row 16 "News.": provider 210ms, aligner stretched it to 2,000ms across
+//        1.86s of untranscribed station-ident music — real absorption)
+//   • provider implausible, aligned plausible  → KEEP the aligned window and
+//       record that the provider's timing was rejected (row 28 above; row 29,
+//       where the provider emitted six ZERO-WIDTH words)
+//   • both plausible                            → keep aligned; it is measured
+//       against the audio, which is why alignment runs at all
+//   • neither plausible                         → change nothing, flag for a
+//       human (row 17: five words stacked at 93,986→93,987, and a provider
+//       alternative running at 57 cps — no substitution can rescue this)
 //
-// THE REPAIR REUSES A PROVEN POLICY, it does not invent one. The rate-aware
-// ceiling below is the SAME policy as lib/segment-shaping.js's Pass 0 word-
-// duration guard, which exists for the MIRROR-IMAGE defect (a provider padding a
-// word's END forward) and documents that it never touches a start — so it is
-// structurally unable to catch onset absorption. Here we keep the corroborated
-// END and pull the START forward to (end − ceiling), never earlier than the
-// previous word's end. The absorbed span then surfaces as an HONEST, visible
-// timeline gap — never fabricated words, never a silently inflated window.
-// A repaired onset is a DERIVED value, so it is always attributed: the row is
-// flagged 'onset_reconstructed' and the count lands on the run.
+// ALIGNMENT COLLAPSE is now detected explicitly. When the aligner runs out of
+// room it stacks several words on ONE instant (row 17's five 1ms words share a
+// single window; row 29 stacks six). Max per-word divergence there was 944ms —
+// UNDER the 1,500ms threshold — so no previous check saw it, and five words
+// would render on the rythmo band at the same moment with nothing flagged. Any
+// run of COLLAPSE_STACK_MIN_WORDS identical windows is a defect regardless of
+// divergence.
+//
+// RUNS ARE ARBITRATED TOGETHER, not word by word. A provider window substituted
+// alone collides with neighbours still on the aligned timeline; the whole
+// contiguous disputed run moves as one, and only if it fits between the last
+// accepted word and the next one. MONOTONICITY IS NEVER TRADED FOR A REPAIR.
+//
+// ── STAGE 1: clampAcousticOnsets (before the reconciler groups words) ────────
+// Forced alignment must account for EVERY millisecond between words. Where the
+// provider left audio un-transcribed — music, atmosphere, unintelligible or
+// foreign speech — the aligner has nowhere to put that time and ABSORBS it into
+// the ONSET of the next word. Ground truth (project 6a6c561ef670f3992db756d0):
+// "Enhorabuena," returned as a 155-SECOND word; the provider captured 1.578s.
+// The END was corroborated, only the onset was dragged. The reconciler derives a
+// segment window from its first word's start, so one absorbed onset became a
+// 155-second segment driving the rythmo band, the dub time-fit and the export.
+// The repair keeps the corroborated END and pulls the START forward, never
+// earlier than the previous word's end, so the absorbed span surfaces as an
+// HONEST visible gap. It reuses the SAME ceiling as lib/segment-shaping.js's
+// Pass 0 word-duration guard (which exists for the mirror-image defect and
+// documents that it never moves a start).
 // PARITY: src/lib/__tests__/word-duration-ceiling-parity.test.js locks these
 // constants against lib/segment-shaping.js. A drift is a failing test.
 //
-// ── STAGE 2: auditTimelineIntegrity (runs AFTER grouping, BEFORE staging) ───
-//   • SAME-SPEAKER OVERLAP is ALWAYS a data defect. One person cannot talk over
-//     themselves, so an overlap means a word was attributed to the wrong
-//     segment. Sub-ceiling overlaps are boundary rounding and are repaired by
-//     pulling the earlier segment's end back. Anything larger is flagged and
-//     left byte-intact — trimming it silently would destroy the evidence.
-//   • PROVIDER-CAPTURE DIVERGENCE: aai_word_timings is the IMMUTABLE provider
-//     capture while the window comes from the ACOUSTIC timeline. A small
-//     difference is expected alignment shift; a multi-second one means the
-//     capture no longer describes the same audio as its own segment. The rythmo
-//     band renders from that capture, which is how this reaches an operator as
-//     "the words don't match what I hear."
+// ── STAGE 2: auditTimelineIntegrity (after grouping, before staging) ─────────
+//   • SAME-SPEAKER OVERLAP is ALWAYS a defect — one person cannot talk over
+//     themselves, so a word was attributed to the wrong segment. Sub-ceiling
+//     overlaps are boundary rounding and repaired; anything larger is flagged on
+//     BOTH sides and left byte-intact, because the overlap IS the evidence.
+//   • PROVIDER-CAPTURE DIVERGENCE / SPAN INFLATION: the capture and the acoustic
+//     window disagree about the same audio. Words whose provider timing STAGE 0
+//     already rejected are excluded — re-flagging a dispute the system has
+//     resolved on evidence would send an operator to review a correct line.
 //
 // CROSS-SPEAKER overlap is intentionally NEVER flagged: two people genuinely can
 // speak at once and the final mixer sums overlapping clips by design.
 //
-// SOC 2 CC7.4 / CC8.1 — every repair is counted and every defect is attributable
-// to the run that detected it, from the row alone.
+// SOC 2 CC7.4 / CC8.1 — every decision is counted, disclosed on the row, and
+// attributable to the run that made it, from the row alone.
 // =============================================================================
 
-// v3 adds STAGE 0 (restoreDivergedCaptures). Pinned onto every report, so a run
-// delivered under v2 is never retroactively reinterpreted under v3's rules.
-export const TIMELINE_INTEGRITY_POLICY_VERSION = 3;
+// v4 replaces v3's "provider wins" rule with plausibility arbitration and adds
+// alignment-collapse detection. Pinned onto every report, so a run delivered
+// under an earlier policy is never retroactively reinterpreted under v4's rules.
+export const TIMELINE_INTEGRITY_POLICY_VERSION = 4;
 
 // Below this, an overlap is boundary rounding between two adjacent same-speaker
 // groups and is safe to repair deterministically.
 export const AUTO_REPAIR_CEILING_MS = 250;
 // Ignore sub-frame noise entirely — not a defect, not worth a repair record.
 export const OVERLAP_EPSILON_MS = 10;
-// A provider word whose own window sits this far from its acoustically-verified
-// window is not drift; it is a misplaced or smeared capture.
+// Beyond this, a provider window and its acoustic window no longer describe the
+// same audio, so one of them must be rejected on evidence.
 export const PROVIDER_CAPTURE_DIVERGENCE_MS = 1500;
+// A window shorter than this carries no speech. Observed floor across a real
+// 734-word run: p5 = 41ms, while collapsed words come back at 1ms. It is a
+// FLOOR ON EVIDENCE, not on word length — a genuinely clipped function word
+// whose two timelines AGREE is left alone, because agreement is corroboration.
+export const MIN_PLAUSIBLE_WORD_MS = 40;
+// This many consecutive words sharing one identical window is an aligner
+// collapse, not a coincidence.
+export const COLLAPSE_STACK_MIN_WORDS = 3;
 
 // ── Rate-aware word-duration ceiling (mirrors lib/segment-shaping.js) ────────
 // 14 cps is the conversational-pace fallback the translation pipeline uses; the
@@ -102,6 +134,9 @@ export type AlignedWord = {
   onset_absorbed_ms?: number;
   capture_restored?: boolean;
   capture_divergence_ms?: number;
+  provider_timing_rejected?: boolean;
+  provider_timing_rejected_ms?: number;
+  alignment_collapsed?: boolean;
 };
 
 export type OnsetRepairReport = {
@@ -114,106 +149,186 @@ export type ProviderWindow = { start_ms: number; end_ms: number };
 
 export type CaptureRestoreReport = {
   capture_restored_words: number;
+  provider_timing_rejected_words: number;
+  alignment_collapse_words: number;
+  /** Retained name: disputed words no substitution could resolve (= collapse words). */
   unrestorable_words: number;
   worst_restored_divergence_ms: number;
+  worst_rejected_provider_divergence_ms: number;
   restored_keys: string[];
+  rejected_keys: string[];
+  collapsed_keys: string[];
 };
 
+/** Is this window a physically possible utterance of `text`? */
+function windowPlausible(text: string | undefined, start: unknown, end: unknown): boolean {
+  const s = Number(start);
+  const e = Number(end);
+  if (!Number.isFinite(s) || !Number.isFinite(e)) return false;
+  const duration = e - s;
+  return duration >= MIN_PLAUSIBLE_WORD_MS && duration <= maxWordDurationMs(text);
+}
+
 /**
- * STAGE 0 — restore the provider's measured window for any word whose
- * acoustically-aligned window diverges beyond the trust threshold.
+ * STAGE 0 — arbitrate every disputed word between the provider's measured
+ * capture and the acoustic alignment window, on plausibility.
  *
- * THE INCOHERENCE THIS REMOVES: the audit downstream already declares a word
- * with multi-second provider-vs-acoustic divergence untrustworthy — and then the
- * reconciler used that same rejected value to decide the two most consequential
- * facts about the line: WHERE IT BREAKS and WHO IS SPEAKING. Flagging a number
- * as unreliable and then making irreversible decisions from it is not a policy;
- * it is two policies disagreeing inside one pass.
+ * Emits exactly one disclosure per resolved word:
+ *   capture_restored           the provider window replaced an implausible aligned one
+ *   provider_timing_rejected   the aligned window was kept over an implausible provider one
+ *   alignment_collapsed        neither window is usable; nothing changed, a human must judge
  *
- * GROUND TRUTH (project 6a6c561ef670f3992db756d0): the word "prices." was
- * captured by the provider at 241,077 → 241,547 and aligned at 241,973 →
- * 243,473 — a 1,926ms divergence, flagged as a defect. Consequences of trusting
- * the aligned value: the gap after the preceding word "oil" (ends 240,963)
- * became ~1,010ms instead of 114ms, crossing the 650ms breath boundary in
- * lib/segment-shaping.js, so the word was split onto its own line; and that
- * line now sat inside a span pyannote had correctly attributed to a DIFFERENT
- * speaker (an untranscribed foreign-language voice), so the word inherited the
- * wrong speaker. One rejected timing produced a spurious line break AND a
- * misattributed speaker — both of which reached the operator as separate,
- * unexplained defects.
- *
- * WHY THE PROVIDER WINS THIS TIE, specifically: the provider is the actor that
- * heard the word and emitted it, so its window is direct evidence. The aligner
- * is normally the more precise of the two — that is why it runs — but its
- * failure mode is structural, not noisy: it must account for every millisecond
- * between words, so wherever the provider left audio untranscribed (music, room
- * tone, unintelligible or foreign speech) it has nowhere to put that time and
- * slides a real word across it. A multi-second disagreement is therefore the
- * SIGNATURE of that failure, not evidence of a better measurement. Below the
- * threshold the aligned value is kept unconditionally.
- *
- * MONOTONICITY IS NEVER TRADED AWAY. Substituting one word's window inside an
- * otherwise-aligned stream could push it behind a word already accepted. A
- * restore is therefore applied ONLY when the provider window is internally
- * valid AND starts at or after the furthest accepted end. Otherwise the aligned
- * value is left exactly as it was and counted as unrestorable — where the
- * existing divergence check still flags it, so an unrepairable word is quietly
- * dropped from neither the timeline nor the audit.
- *
- * NOTHING IS DESTROYED: the raw provider response and the raw alignment
- * response are both archived to immutable storage before this runs, and
- * aai_word_timings keeps the untouched provider capture. Every restored word is
- * disclosed on its row (capture_restored) and counted on the run.
- *
- * SOC 2 CC7.4 / CC8.1 — a derived timing decision is never silent, and the
- * policy that produced it is pinned per run.
+ * NOTHING IS DESTROYED: both raw provider responses are archived to immutable
+ * storage before this runs, and aai_word_timings keeps the untouched capture.
  */
 export function restoreDivergedCaptures(
   words: AlignedWord[],
   providerByKey: Map<string, ProviderWindow>,
 ): { words: AlignedWord[]; report: CaptureRestoreReport } {
+  const list = words || [];
   const restoredKeys: string[] = [];
-  let unrestorable = 0;
-  let worst = 0;
+  const rejectedKeys: string[] = [];
+  const collapsedKeys: string[] = [];
+  let worstRestored = 0;
+  let worstRejected = 0;
+
+  // ── Prepass: aligner collapses (N identical windows in a row) ─────────────
+  const stacked = new Array(list.length).fill(false);
+  for (let i = 0; i < list.length;) {
+    let j = i + 1;
+    while (
+      j < list.length
+      && Number(list[j]?.start_ms) === Number(list[i]?.start_ms)
+      && Number(list[j]?.end_ms) === Number(list[i]?.end_ms)
+    ) j++;
+    if (j - i >= COLLAPSE_STACK_MIN_WORDS) for (let k = i; k < j; k++) stacked[k] = true;
+    i = j;
+  }
+
+  const providerAt = (index: number): ProviderWindow | null => providerByKey.get(String(list[index]?.key)) || null;
+
+  const divergenceAt = (index: number): number => {
+    const provider = providerAt(index);
+    const word = list[index];
+    if (!provider || !word) return 0;
+    const gap = Math.max(
+      Math.abs(Number(word.start_ms) - Number(provider.start_ms)),
+      Math.abs(Number(word.end_ms) - Number(provider.end_ms)),
+    );
+    return Number.isFinite(gap) ? gap : 0;
+  };
+
+  // A word is DISPUTED when the two timelines cannot both be describing it: they
+  // disagree by seconds, the aligner collapsed it while the provider measured a
+  // real word, or it sits inside a collapse stack. Two tiny windows that AGREE
+  // are not disputed — agreement is corroboration, not a defect.
+  const disputed = (index: number): boolean => {
+    const word = list[index];
+    if (!Number.isFinite(Number(word?.start_ms)) || !Number.isFinite(Number(word?.end_ms))) return false;
+    if (stacked[index]) return true;
+    if (divergenceAt(index) > PROVIDER_CAPTURE_DIVERGENCE_MS) return true;
+    const provider = providerAt(index);
+    const alignedDuration = Number(word.end_ms) - Number(word.start_ms);
+    const providerDuration = provider ? Number(provider.end_ms) - Number(provider.start_ms) : 0;
+    return alignedDuration < MIN_PLAUSIBLE_WORD_MS && providerDuration >= MIN_PLAUSIBLE_WORD_MS;
+  };
+
   const out: AlignedWord[] = [];
   let furthestEnd = -Infinity;
+  const accept = (word: AlignedWord) => {
+    out.push(word);
+    const end = Number(word?.end_ms);
+    if (Number.isFinite(end)) furthestEnd = Math.max(furthestEnd, end);
+  };
 
-  for (const word of words || []) {
-    const alignedStart = Number(word?.start_ms);
-    const alignedEnd = Number(word?.end_ms);
-    const keep = () => {
-      out.push(word);
-      if (Number.isFinite(alignedEnd)) furthestEnd = Math.max(furthestEnd, alignedEnd);
-    };
+  for (let index = 0; index < list.length;) {
+    if (!disputed(index)) { accept(list[index]); index++; continue; }
 
-    const provider = providerByKey.get(String(word?.key));
-    if (!provider || !Number.isFinite(alignedStart) || !Number.isFinite(alignedEnd)) { keep(); continue; }
+    // Collect the whole contiguous disputed run — it is arbitrated as one unit.
+    let end = index;
+    while (end + 1 < list.length && disputed(end + 1)) end++;
+    const run = list.slice(index, end + 1);
+    const runIsStacked = stacked.slice(index, end + 1).some(Boolean);
 
-    const providerStart = Number(provider.start_ms);
-    const providerEnd = Number(provider.end_ms);
-    const divergence = Math.max(Math.abs(alignedStart - providerStart), Math.abs(alignedEnd - providerEnd));
-    if (!Number.isFinite(divergence) || divergence <= PROVIDER_CAPTURE_DIVERGENCE_MS) { keep(); continue; }
+    // The next word already accepted on the aligned timeline bounds any restore.
+    let nextAlignedStart = Infinity;
+    for (let look = end + 1; look < list.length; look++) {
+      if (disputed(look)) continue;
+      nextAlignedStart = Number(list[look].start_ms);
+      break;
+    }
 
-    const usable = Number.isFinite(providerStart)
-      && Number.isFinite(providerEnd)
-      && providerEnd > providerStart
-      && providerStart >= furthestEnd;
-    if (!usable) { unrestorable += 1; keep(); continue; }
+    const alignedPlausible = !runIsStacked
+      && run.every((word) => windowPlausible(word.text, word.start_ms, word.end_ms));
 
-    const rounded = Math.round(divergence);
-    if (rounded > worst) worst = rounded;
-    restoredKeys.push(String(word.key));
-    out.push({ ...word, start_ms: providerStart, end_ms: providerEnd, capture_restored: true, capture_divergence_ms: rounded });
-    furthestEnd = Math.max(furthestEnd, providerEnd);
+    const providerRun = run.map((word) => providerByKey.get(String(word.key)) || null);
+    let providerPlausible = providerRun.every((provider, offset) =>
+      !!provider && windowPlausible(run[offset].text, provider.start_ms, provider.end_ms));
+    if (providerPlausible) {
+      for (let offset = 1; offset < providerRun.length && providerPlausible; offset++) {
+        if (Number(providerRun[offset]!.start_ms) < Number(providerRun[offset - 1]!.end_ms)) providerPlausible = false;
+      }
+      const first = Number(providerRun[0]!.start_ms);
+      const last = Number(providerRun[providerRun.length - 1]!.end_ms);
+      if (first < furthestEnd || last > nextAlignedStart) providerPlausible = false;
+    }
+
+    if (providerPlausible && !alignedPlausible) {
+      // The aligned window cannot be an utterance of this text; the provider's can.
+      run.forEach((word, offset) => {
+        const provider = providerRun[offset]!;
+        const divergence = Math.round(Math.max(
+          Math.abs(Number(word.start_ms) - Number(provider.start_ms)),
+          Math.abs(Number(word.end_ms) - Number(provider.end_ms)),
+        ));
+        if (divergence > worstRestored) worstRestored = divergence;
+        restoredKeys.push(String(word.key));
+        accept({
+          ...word,
+          start_ms: Number(provider.start_ms),
+          end_ms: Number(provider.end_ms),
+          capture_restored: true,
+          capture_divergence_ms: divergence,
+        });
+      });
+    } else if (alignedPlausible) {
+      // The acoustic window holds up and the provider's does not (or is merely
+      // far away). Keep the measured-against-audio value and SAY SO — a silent
+      // "we ignored the transcriber here" is exactly what must never happen.
+      run.forEach((word, offset) => {
+        const divergence = Math.round(divergenceAt(index + offset));
+        if (divergence > worstRejected) worstRejected = divergence;
+        rejectedKeys.push(String(word.key));
+        accept({
+          ...word,
+          provider_timing_rejected: true,
+          provider_timing_rejected_ms: divergence,
+          ...(providerRun[offset] ? {} : {}),
+        });
+      });
+    } else {
+      // Neither timeline is usable. Change nothing; this is a review item.
+      run.forEach((word) => {
+        collapsedKeys.push(String(word.key));
+        accept({ ...word, alignment_collapsed: true });
+      });
+    }
+
+    index = end + 1;
   }
 
   return {
     words: out,
     report: {
       capture_restored_words: restoredKeys.length,
-      unrestorable_words: unrestorable,
-      worst_restored_divergence_ms: worst,
+      provider_timing_rejected_words: rejectedKeys.length,
+      alignment_collapse_words: collapsedKeys.length,
+      unrestorable_words: collapsedKeys.length,
+      worst_restored_divergence_ms: worstRestored,
+      worst_rejected_provider_divergence_ms: worstRejected,
       restored_keys: restoredKeys.slice(0, 200),
+      rejected_keys: rejectedKeys.slice(0, 200),
+      collapsed_keys: collapsedKeys.slice(0, 200),
     },
   };
 }
@@ -227,7 +342,9 @@ export function restoreDivergedCaptures(
  * the raw provider response is archived untouched before this runs.
  *
  * A word's END is always kept — it is the corroborated edge. Only an onset that
- * implies a physically impossible duration is moved.
+ * implies a physically impossible duration is moved. Words STAGE 0 already
+ * resolved keep their decision: a restored window is the provider's own
+ * measurement and a collapsed word has no trustworthy edge to reason from.
  */
 export function clampAcousticOnsets(words: AlignedWord[]): { words: AlignedWord[]; report: OnsetRepairReport } {
   const repairedKeys: string[] = [];
@@ -238,7 +355,7 @@ export function clampAcousticOnsets(words: AlignedWord[]): { words: AlignedWord[
   for (const word of words || []) {
     const start = Number(word?.start_ms);
     const end = Number(word?.end_ms);
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || word.capture_restored === true || word.alignment_collapsed === true) {
       out.push(word);
       if (Number.isFinite(end)) previousEnd = Math.max(previousEnd, end);
       continue;
@@ -276,7 +393,14 @@ export function clampAcousticOnsets(words: AlignedWord[]): { words: AlignedWord[
   };
 }
 
-export type IntegrityWord = { text?: string; start_ms: number; end_ms: number; provider_start_ms?: number; provider_end_ms?: number };
+export type IntegrityWord = {
+  text?: string;
+  start_ms: number;
+  end_ms: number;
+  provider_start_ms?: number;
+  provider_end_ms?: number;
+  provider_timing_rejected?: boolean;
+};
 export type IntegrityRow = {
   sequence_index: number;
   start_ms: number;
@@ -289,39 +413,52 @@ export type IntegrityRow = {
   _alignment?: { status?: string; words?: IntegrityWord[]; max_provider_shift_ms?: number };
   timing_defect?: string;
   timing_defect_ms?: number;
-  // Applied-repair disclosure — independent of timing_defect (see DEFECT_SEVERITY).
+  // Applied-repair / decision disclosure — independent of timing_defect (see DEFECT_SEVERITY).
   onset_reconstructed?: boolean;
   onset_absorbed_ms?: number;
   capture_restored?: boolean;
   capture_restored_ms?: number;
+  provider_timing_rejected?: boolean;
+  provider_timing_rejected_ms?: number;
+  alignment_collapsed?: boolean;
 };
 
 export type IntegrityReport = {
   policy_version: number;
   auto_repair_ceiling_ms: number;
   provider_divergence_threshold_ms: number;
+  min_plausible_word_ms: number;
   same_speaker_overlap_repairs: number;
   same_speaker_overlap_defects: number;
   provider_capture_defects: number;
+  // Rows carrying words the aligner collapsed onto one instant where no provider
+  // substitution was possible. Invisible before policy v4: max per-word
+  // divergence in the ground-truth case was 944ms, under the flagging threshold,
+  // so five words rendered at the same moment with nothing flagged.
+  alignment_collapse_defects: number;
+  alignment_collapse_words: number;
   onset_reconstructed_rows: number;
   onset_absorption_repairs: number;
   worst_onset_absorbed_ms: number;
-  // STAGE 0 evidence. capture_restored_words counts words whose rejected aligned
-  // window was replaced by the provider's measured one; unrestorable_capture_words
-  // counts words that could NOT be restored without breaking chronological order
-  // and therefore remain flagged for a human. A rising unrestorable count means
-  // the aligner is drifting far enough to reorder the timeline, which no
-  // downstream repair can fix — it has to be addressed upstream.
+  // STAGE 0 arbitration evidence. capture_restored_* counts words whose
+  // implausible aligned window was replaced by the provider's measured one;
+  // provider_timing_rejected_* counts the OPPOSITE decision — an implausible
+  // provider capture (e.g. 9 words inside 1,346ms, or zero-width words) where
+  // the acoustic window was kept. Both are decisions the system made on its own
+  // and both must be countable, or "what did it change, and why?" is unanswerable.
   capture_restored_words: number;
   capture_restored_rows: number;
+  provider_timing_rejected_words: number;
+  provider_timing_rejected_rows: number;
   unrestorable_capture_words: number;
   worst_restored_divergence_ms: number;
+  worst_rejected_provider_divergence_ms: number;
   worst_same_speaker_overlap_ms: number;
   worst_provider_divergence_ms: number;
-  // Segment-scale absorption evidence. inflated_row_count is the number of rows
-  // whose window exceeds their own provider capture by more than the divergence
-  // threshold — expected to be ZERO once alignment chunks are silence-bounded, so
-  // a non-zero value here is the regression signal for that fix.
+  // Segment-scale absorption evidence. Rows whose window exceeds their own
+  // provider capture by more than the threshold — skipped where the provider
+  // capture itself was rejected, since comparing against a value already judged
+  // impossible produces a defect that describes nothing.
   worst_acoustic_inflation_ms: number;
   inflated_row_count: number;
   defect_sequences: number[];
@@ -329,21 +466,19 @@ export type IntegrityReport = {
 
 // Severity ordering for the single timing_defect label a row can carry. A row is
 // labelled by its MOST actionable finding, never by whichever check ran first.
-// Before this, a segment whose absorbed onset CAUSED an overlap was labelled a
-// divergence while its victims were labelled overlaps — so the review queue
-// pointed at casualties instead of causes.
 //
-// ONSET RECONSTRUCTION IS DELIBERATELY ABSENT HERE. It is an already-APPLIED
-// repair, not an outstanding defect, and it lives on its own independent fields
-// (onset_reconstructed / onset_absorbed_ms). Ranking it against real defects made
-// the disclosure unreachable in practice: a reconstructed onset is BY DEFINITION a
-// multi-second provider-vs-acoustic gap, so it always also tripped the divergence
-// check and was always relabelled — the ground-truth 155s repair on project
-// 6a6c561ef670f3992db756d0 produced ZERO onset-labelled rows. A repair and a defect
-// are orthogonal facts about a row; one field cannot express both without losing one.
+// APPLIED DECISIONS ARE DELIBERATELY ABSENT HERE (onset_reconstructed,
+// capture_restored, provider_timing_rejected). They are things the system DID,
+// not things a human must judge, and they live on their own independent fields.
+// Ranking them against real defects made the disclosure unreachable in practice:
+// a reconstructed onset is BY DEFINITION a multi-second gap, so it always also
+// tripped the divergence check and was always relabelled — the ground-truth 155s
+// repair produced ZERO onset-labelled rows. A decision and a defect are
+// orthogonal facts; one field cannot express both without losing one.
 const DEFECT_SEVERITY: Record<string, number> = {
   provider_capture_divergence: 1,  // capture no longer describes its own audio
-  same_speaker_overlap: 2,         // attribution error; a human must judge it
+  alignment_collapse: 2,           // words stacked on one instant; unrepairable
+  same_speaker_overlap: 3,         // attribution error; a human must judge it
 };
 
 function flag(row: IntegrityRow, kind: string, magnitudeMs: number): boolean {
@@ -388,12 +523,13 @@ function recomputeMaxShift(words: IntegrityWord[] | undefined): number {
  * STAGE 2 — audit and (where safe) repair the reconciled timeline IN PLACE.
  *
  * @param rows reconciled output segments, carrying `_alignment.words`. Rows a
- *             Stage-1 onset repair touched arrive pre-flagged 'onset_reconstructed';
- *             a more actionable finding here upgrades that label.
+ *             STAGE 0/1 decision touched arrive pre-disclosed on their own
+ *             fields; a more actionable finding here adds a defect label.
  * @param formatTimecode caller's timecode formatter, so this module never owns a
  *                       second frame-rate convention that could drift from the
  *                       reconciler's own.
  * @param onsetRepair Stage-1 summary, folded into the run-level report.
+ * @param captureRestore Stage-0 arbitration summary, folded into the report.
  */
 export function auditTimelineIntegrity(
   rows: IntegrityRow[],
@@ -405,16 +541,22 @@ export function auditTimelineIntegrity(
     policy_version: TIMELINE_INTEGRITY_POLICY_VERSION,
     auto_repair_ceiling_ms: AUTO_REPAIR_CEILING_MS,
     provider_divergence_threshold_ms: PROVIDER_CAPTURE_DIVERGENCE_MS,
+    min_plausible_word_ms: MIN_PLAUSIBLE_WORD_MS,
     same_speaker_overlap_repairs: 0,
     same_speaker_overlap_defects: 0,
     provider_capture_defects: 0,
+    alignment_collapse_defects: 0,
+    alignment_collapse_words: captureRestore?.alignment_collapse_words || 0,
     onset_reconstructed_rows: 0,
     onset_absorption_repairs: onsetRepair?.onset_absorption_repairs || 0,
     worst_onset_absorbed_ms: onsetRepair?.worst_onset_absorbed_ms || 0,
     capture_restored_words: captureRestore?.capture_restored_words || 0,
     capture_restored_rows: 0,
+    provider_timing_rejected_words: captureRestore?.provider_timing_rejected_words || 0,
+    provider_timing_rejected_rows: 0,
     unrestorable_capture_words: captureRestore?.unrestorable_words || 0,
     worst_restored_divergence_ms: captureRestore?.worst_restored_divergence_ms || 0,
+    worst_rejected_provider_divergence_ms: captureRestore?.worst_rejected_provider_divergence_ms || 0,
     worst_same_speaker_overlap_ms: 0,
     worst_provider_divergence_ms: 0,
     worst_acoustic_inflation_ms: 0,
@@ -425,24 +567,34 @@ export function auditTimelineIntegrity(
   // ── Pass 1: provider capture vs acoustic truth ────────────────────────────
   for (const row of rows) {
     if (row.is_music) continue;
+
+    // A collapse is unrepairable and already the most specific finding available
+    // for this row, so it is flagged unconditionally.
+    if (row.alignment_collapsed === true) {
+      flag(row, 'alignment_collapse', 0);
+      report.alignment_collapse_defects += 1;
+    }
+
     let worst = 0;
     for (const word of row._alignment?.words || []) {
+      // STAGE 0 judged this word's provider timing impossible and kept the
+      // acoustic value on evidence. Measuring the gap to a rejected number would
+      // re-raise a dispute the system already resolved.
+      if (word.provider_timing_rejected === true) continue;
       const startGap = Math.abs(Number(word.start_ms) - Number(word.provider_start_ms));
       const endGap = Math.abs(Number(word.end_ms) - Number(word.provider_end_ms));
       const gap = Math.max(Number.isFinite(startGap) ? startGap : 0, Number.isFinite(endGap) ? endGap : 0);
       if (gap > worst) worst = gap;
     }
     // SPAN INFLATION — the measure a per-word check structurally cannot see.
-    // Absorbed time distributed across many words keeps every individual word's
-    // shift under the threshold while the SEGMENT still ends up seconds too long.
+    // Absorbed time spread across many words keeps every individual word's shift
+    // under the threshold while the SEGMENT still ends up seconds too long.
     // Ground truth: a row whose provider capture held 1,784ms of speech carried a
-    // 4,240ms window and was never flagged, because no single word moved far enough.
-    // Comparing the whole span against the provider's own span closes that hole, so
-    // an inflated window can never reach a reviewer silently — whatever shape the
-    // absorption takes. Same defect class (capture and acoustic timeline disagree),
-    // measured at segment scale, so the magnitude reports the worst evidence found.
+    // 4,240ms window and was never flagged, because no single word moved far
+    // enough. Skipped when the provider capture was rejected — its span is the
+    // value already judged impossible.
     const capture = row.aai_word_timings || [];
-    if (capture.length) {
+    if (capture.length && row.provider_timing_rejected !== true) {
       const captureSpan = Number(capture[capture.length - 1].end_ms) - Number(capture[0].start_ms);
       const acousticSpan = Number(row.end_ms) - Number(row.start_ms);
       const inflation = acousticSpan - captureSpan;
@@ -497,10 +649,11 @@ export function auditTimelineIntegrity(
     if (!previous || Number(row.end_ms) > Number(previous.end_ms)) furthestBySpeaker.set(speaker, row);
   }
 
-  // Counted from the independent disclosure flag, NOT from a defect label — the
+  // Counted from the independent disclosure flags, NOT from defect labels — a
   // label is claimed by whichever outstanding defect the row also carries.
   report.onset_reconstructed_rows = rows.filter((row) => row.onset_reconstructed === true).length;
   report.capture_restored_rows = rows.filter((row) => row.capture_restored === true).length;
+  report.provider_timing_rejected_rows = rows.filter((row) => row.provider_timing_rejected === true).length;
   report.defect_sequences = rows
     .filter((row) => !!row.timing_defect)
     .map((row) => Number(row.sequence_index))
