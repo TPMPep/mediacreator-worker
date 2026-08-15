@@ -218,10 +218,31 @@ export function restoreDivergedCaptures(
     return Number.isFinite(gap) ? gap : 0;
   };
 
+  // Which segment a word belongs to. Word keys are `${segment_id}:${index}`.
+  // Runs are arbitrated WITHIN one segment and never across a boundary: the flat
+  // list spans the whole programme, so an unbroken run would merge a dispute in
+  // one row with an unrelated dispute in the next and decide both by the WORSE of
+  // the two. Observed doing exactly that: row 29's collapsed words dragged row 28
+  // into their verdict, so a row whose acoustic timing was entirely sound was
+  // labelled a collapse. A verdict must be reached on the evidence of the words it
+  // describes, not on its neighbour's.
+  const segmentOf = (index: number): string => {
+    const key = String(list[index]?.key || '');
+    const cut = key.lastIndexOf(':');
+    return cut > 0 ? key.slice(0, cut) : key;
+  };
+
   // A word is DISPUTED when the two timelines cannot both be describing it: they
   // disagree by seconds, the aligner collapsed it while the provider measured a
-  // real word, or it sits inside a collapse stack. Two tiny windows that AGREE
-  // are not disputed — agreement is corroboration, not a defect.
+  // SUBSTANTIALLY real word, or it sits inside a collapse stack. Two short windows
+  // that roughly agree are not disputed — agreement is corroboration, not a defect.
+  //
+  // The degenerate rule requires the provider to claim at least 3x the evidence
+  // floor, because a hair-under-floor aligned window whose provider counterpart is
+  // also short describes the same brief word from both sides. Observed without
+  // that margin: a 39ms "to" against a 97ms capture — a 58ms difference nobody can
+  // hear — was escalated into a reviewable defect. A review queue that includes
+  // correct lines trains an operator to ignore it.
   const disputed = (index: number): boolean => {
     const word = list[index];
     if (!Number.isFinite(Number(word?.start_ms)) || !Number.isFinite(Number(word?.end_ms))) return false;
@@ -230,7 +251,7 @@ export function restoreDivergedCaptures(
     const provider = providerAt(index);
     const alignedDuration = Number(word.end_ms) - Number(word.start_ms);
     const providerDuration = provider ? Number(provider.end_ms) - Number(provider.start_ms) : 0;
-    return alignedDuration < MIN_PLAUSIBLE_WORD_MS && providerDuration >= MIN_PLAUSIBLE_WORD_MS;
+    return alignedDuration < MIN_PLAUSIBLE_WORD_MS && providerDuration >= MIN_PLAUSIBLE_WORD_MS * 3;
   };
 
   const out: AlignedWord[] = [];
@@ -244,9 +265,12 @@ export function restoreDivergedCaptures(
   for (let index = 0; index < list.length;) {
     if (!disputed(index)) { accept(list[index]); index++; continue; }
 
-    // Collect the whole contiguous disputed run — it is arbitrated as one unit.
+    // Collect the contiguous disputed run WITHIN THIS SEGMENT — arbitrated as one
+    // unit, because substituting one word alone would collide with neighbours still
+    // on the aligned timeline.
+    const segment = segmentOf(index);
     let end = index;
-    while (end + 1 < list.length && disputed(end + 1)) end++;
+    while (end + 1 < list.length && disputed(end + 1) && segmentOf(end + 1) === segment) end++;
     const run = list.slice(index, end + 1);
     const runIsStacked = stacked.slice(index, end + 1).some(Boolean);
 
@@ -306,12 +330,22 @@ export function restoreDivergedCaptures(
           ...(providerRun[offset] ? {} : {}),
         });
       });
-    } else {
-      // Neither timeline is usable. Change nothing; this is a review item.
+    } else if (runIsStacked) {
+      // Neither timeline is usable AND the aligner genuinely stacked these words
+      // onto one instant. Change nothing; this is a review item, and the ONLY
+      // condition that earns the collapse label — claiming a collapse on a row
+      // whose words are spread normally would tell an operator something plainly
+      // untrue about their own transcript.
       run.forEach((word) => {
         collapsedKeys.push(String(word.key));
         accept({ ...word, alignment_collapsed: true });
       });
+    } else {
+      // An unresolved dispute that is NOT a collapse: neither window is usable,
+      // but the words are not stacked. Nothing is changed and nothing is claimed —
+      // the row falls through to the divergence check in STAGE 2, which is the
+      // honest description of what happened.
+      run.forEach((word) => accept(word));
     }
 
     index = end + 1;
