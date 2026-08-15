@@ -23,22 +23,29 @@ async function sleep(ms:number,signal:AbortSignal){await new Promise<void>((reso
 export async function processSpeakerDiarization(job:Job<SpeakerDiarizationJobData>){
   const started=Date.now();
   const {project_id,run_id,job_run_id,request_id,user_email,auth_token}=job.data;
-  const call=async <T=any>(operation:string,payload:Record<string,unknown>={},signal?:AbortSignal):Promise<T>=>{
+  // Generalised invoker. `call` (below) remains the speakerDiarizationWorkerStep
+  // operation dispatcher; `post` lets this processor also reach a SEPARATE Base44
+  // function \u2014 persistTimelineIntegrityReport \u2014 with the identical bounded
+  // transient-retry budget, instead of duplicating the retry loop.
+  const post=async <T=any>(fn:string,payload:Record<string,unknown>,signal?:AbortSignal,label?:string):Promise<T>=>{
+    const what=label||fn;
     const maxAttempts=6;
     for(let attempt=1;attempt<=maxAttempts;attempt++){
-      try{return await invokeBase44Function<T>({fn:'speakerDiarizationWorkerStep',authToken:auth_token,payload:{project_id,run_id,job_run_id,operation,...payload},timeoutMs:170000,signal});}
+      try{return await invokeBase44Function<T>({fn,authToken:auth_token,payload,timeoutMs:170000,signal});}
       catch(error){
         const message=String((error as Error)?.message||error);
         const transient=/rate limit|HTTP 429|HTTP 50[234]|timeout|timed out|ECONNRESET|fetch failed|network/i.test(message);
         if(!transient||attempt===maxAttempts||signal?.aborted)throw error;
         const ceiling=Math.min(20_000,1_000*(2**(attempt-1)));
         const delay=Math.max(500,Math.floor(Math.random()*ceiling));
-        console.warn(`[speaker-diarization] ${operation} transient failure; retry ${attempt}/${maxAttempts} in ${delay}ms: ${message.slice(0,200)}`);
+        console.warn(`[speaker-diarization] ${what} transient failure; retry ${attempt}/${maxAttempts} in ${delay}ms: ${message.slice(0,200)}`);
         if(signal)await sleep(delay,signal);else await new Promise(resolve=>setTimeout(resolve,delay));
       }
     }
-    throw new Error(`${operation} retry budget exhausted`);
+    throw new Error(`${what} retry budget exhausted`);
   };
+  const call=<T=any>(operation:string,payload:Record<string,unknown>={},signal?:AbortSignal):Promise<T>=>
+    post<T>('speakerDiarizationWorkerStep',{project_id,run_id,job_run_id,operation,...payload},signal,operation);
   try{return await runWithLockHeartbeat(job,async signal=>{
     if(!env.PYANNOTE_API_KEY)throw new Error('PYANNOTE_API_KEY is not configured in Railway');
     const prep=await call<any>('prepare',{},signal); if(prep.action==='done')return {ok:true,already_terminal:true};
@@ -80,8 +87,20 @@ export async function processSpeakerDiarization(job:Job<SpeakerDiarizationJobDat
     // where attribution gets lost (defect labels landed, run ids came back null).
     for(const row of output)if(row.timing_defect||row.onset_reconstructed)row.timing_defect_run_id=run_id;
     if(integrity.same_speaker_overlap_defects||integrity.provider_capture_defects)await logEvent({function_name:'bullmq:speaker-diarization',level:'warn',event:'timeline_integrity_defects_flagged',message:`Flagged ${integrity.same_speaker_overlap_defects} same-speaker overlap and ${integrity.provider_capture_defects} provider-capture defect(s) for human review; transcript was not modified.`,context:{project_id,run_id,job_run_id,request_id,...integrity}});
+    // EVIDENCE BEFORE CUTOVER. The integrity report is persisted as a typed
+    // TimelineIntegrityReport row and READ BACK before a single transcript row is
+    // staged. Ordering is the guarantee: if evidence cannot be recorded, nothing
+    // has been mutated yet, so aborting is free \u2014 and the cached pyannote
+    // provider_job_id means a retry never re-spends on the provider. This exists
+    // because the report previously lived as an unverified key in a free-form
+    // checkpoint blob and vanished silently across multiple runs while every
+    // neighbouring value persisted. A refined transcript must never be able to
+    // exist without its audit evidence. SOC 2 CC7.4 / CC8.1.
+    const evidence=await post<{verified?:boolean;report_id?:string}>('persistTimelineIntegrityReport',{project_id,run_id,job_run_id,request_id,report:integrity,source_segment_count:source.length,output_segment_count:output.length},signal,'persist_timeline_integrity');
+    if(!evidence?.verified)throw new Error('timeline_integrity_evidence_unverified: refusing transcript cutover without verified audit evidence');
+    await logEvent({function_name:'bullmq:speaker-diarization',event:'timeline_integrity_evidence_verified',context:{project_id,run_id,job_run_id,request_id,report_id:evidence.report_id||null}});
     for(let i=0;i<output.length;i+=50){await call('stage_segments',{segments:output.slice(i,i+50)},signal);await call('heartbeat',{progress_pct:Math.min(96,82+Math.floor(i/output.length*14))},signal);}
     const cs=plans.map(p=>p.confidence).filter((n):n is number=>n!==null),avg=cs.length?cs.reduce((a,b)=>a+b,0)/cs.length:null;await call('finalize',{timeline_integrity:integrity,raw_result_key:prep.raw_result_key,provider_job_id:providerId,source_segment_count:source.length,output_segment_count:output.length,detected_speaker_count:clusters.length,split_count:splits,reassigned_word_count:reassigned,unresolved_word_count:unresolved,average_confidence:avg,speaker_counts:counts,alignment:{status:'verified',provider:alignment.provider,model:alignment.model,model_revision:alignment.model_revision,language_code:alignment.language_code,word_count:alignment.word_count,mean_confidence:alignment.mean_confidence,max_provider_shift_ms:alignment.max_provider_shift_ms,duration_ms:alignment.duration_ms,raw_result_key:prep.alignment_result_key}},signal);
     await logEvent({function_name:'bullmq:speaker-diarization',event:'speaker_diarization_completed',duration_ms:Date.now()-started,context:{project_id,run_id,job_run_id,request_id,provider_job_id:providerId,output_segments:output.length,speakers:clusters.length}});return {ok:true,action:'done'};
-  });}catch(error){const message=String((error as Error)?.message||error).slice(0,500),max=Number(job.opts.attempts||1),terminal=job.attemptsMade+1>=max||/not configured|No source|no usable turns|No active transcript|staging|Translation started|Forced alignment HTTP 4|word-count mismatch|token mismatch|invalid alignment|Missing provider word/i.test(message);if(terminal)await call('terminal_failure',{terminal_failure:message}).catch(()=>{});await logEvent({function_name:'bullmq:speaker-diarization',level:terminal?'error':'warn',event:terminal?'speaker_diarization_failed':'speaker_diarization_retrying',message,context:{project_id,run_id,job_run_id,request_id,user_email,attempt:job.attemptsMade+1,max_attempts:max}});throw error;}
+  });}catch(error){const message=String((error as Error)?.message||error).slice(0,500),max=Number(job.opts.attempts||1),terminal=job.attemptsMade+1>=max||/not configured|No source|no usable turns|No active transcript|staging|Translation started|Forced alignment HTTP 4|word-count mismatch|token mismatch|invalid alignment|Missing provider word|timeline_integrity_evidence_unverified/i.test(message);if(terminal)await call('terminal_failure',{terminal_failure:message}).catch(()=>{});await logEvent({function_name:'bullmq:speaker-diarization',level:terminal?'error':'warn',event:terminal?'speaker_diarization_failed':'speaker_diarization_retrying',message,context:{project_id,run_id,job_run_id,request_id,user_email,attempt:job.attemptsMade+1,max_attempts:max}});throw error;}
 }
