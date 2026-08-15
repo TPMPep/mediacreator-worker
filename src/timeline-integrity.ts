@@ -64,7 +64,9 @@
 // to the run that detected it, from the row alone.
 // =============================================================================
 
-export const TIMELINE_INTEGRITY_POLICY_VERSION = 2;
+// v3 adds STAGE 0 (restoreDivergedCaptures). Pinned onto every report, so a run
+// delivered under v2 is never retroactively reinterpreted under v3's rules.
+export const TIMELINE_INTEGRITY_POLICY_VERSION = 3;
 
 // Below this, an overlap is boundary rounding between two adjacent same-speaker
 // groups and is safe to repair deterministically.
@@ -98,6 +100,8 @@ export type AlignedWord = {
   confidence?: number;
   onset_reconstructed?: boolean;
   onset_absorbed_ms?: number;
+  capture_restored?: boolean;
+  capture_divergence_ms?: number;
 };
 
 export type OnsetRepairReport = {
@@ -105,6 +109,114 @@ export type OnsetRepairReport = {
   worst_onset_absorbed_ms: number;
   repaired_keys: string[];
 };
+
+export type ProviderWindow = { start_ms: number; end_ms: number };
+
+export type CaptureRestoreReport = {
+  capture_restored_words: number;
+  unrestorable_words: number;
+  worst_restored_divergence_ms: number;
+  restored_keys: string[];
+};
+
+/**
+ * STAGE 0 — restore the provider's measured window for any word whose
+ * acoustically-aligned window diverges beyond the trust threshold.
+ *
+ * THE INCOHERENCE THIS REMOVES: the audit downstream already declares a word
+ * with multi-second provider-vs-acoustic divergence untrustworthy — and then the
+ * reconciler used that same rejected value to decide the two most consequential
+ * facts about the line: WHERE IT BREAKS and WHO IS SPEAKING. Flagging a number
+ * as unreliable and then making irreversible decisions from it is not a policy;
+ * it is two policies disagreeing inside one pass.
+ *
+ * GROUND TRUTH (project 6a6c561ef670f3992db756d0): the word "prices." was
+ * captured by the provider at 241,077 → 241,547 and aligned at 241,973 →
+ * 243,473 — a 1,926ms divergence, flagged as a defect. Consequences of trusting
+ * the aligned value: the gap after the preceding word "oil" (ends 240,963)
+ * became ~1,010ms instead of 114ms, crossing the 650ms breath boundary in
+ * lib/segment-shaping.js, so the word was split onto its own line; and that
+ * line now sat inside a span pyannote had correctly attributed to a DIFFERENT
+ * speaker (an untranscribed foreign-language voice), so the word inherited the
+ * wrong speaker. One rejected timing produced a spurious line break AND a
+ * misattributed speaker — both of which reached the operator as separate,
+ * unexplained defects.
+ *
+ * WHY THE PROVIDER WINS THIS TIE, specifically: the provider is the actor that
+ * heard the word and emitted it, so its window is direct evidence. The aligner
+ * is normally the more precise of the two — that is why it runs — but its
+ * failure mode is structural, not noisy: it must account for every millisecond
+ * between words, so wherever the provider left audio untranscribed (music, room
+ * tone, unintelligible or foreign speech) it has nowhere to put that time and
+ * slides a real word across it. A multi-second disagreement is therefore the
+ * SIGNATURE of that failure, not evidence of a better measurement. Below the
+ * threshold the aligned value is kept unconditionally.
+ *
+ * MONOTONICITY IS NEVER TRADED AWAY. Substituting one word's window inside an
+ * otherwise-aligned stream could push it behind a word already accepted. A
+ * restore is therefore applied ONLY when the provider window is internally
+ * valid AND starts at or after the furthest accepted end. Otherwise the aligned
+ * value is left exactly as it was and counted as unrestorable — where the
+ * existing divergence check still flags it, so an unrepairable word is quietly
+ * dropped from neither the timeline nor the audit.
+ *
+ * NOTHING IS DESTROYED: the raw provider response and the raw alignment
+ * response are both archived to immutable storage before this runs, and
+ * aai_word_timings keeps the untouched provider capture. Every restored word is
+ * disclosed on its row (capture_restored) and counted on the run.
+ *
+ * SOC 2 CC7.4 / CC8.1 — a derived timing decision is never silent, and the
+ * policy that produced it is pinned per run.
+ */
+export function restoreDivergedCaptures(
+  words: AlignedWord[],
+  providerByKey: Map<string, ProviderWindow>,
+): { words: AlignedWord[]; report: CaptureRestoreReport } {
+  const restoredKeys: string[] = [];
+  let unrestorable = 0;
+  let worst = 0;
+  const out: AlignedWord[] = [];
+  let furthestEnd = -Infinity;
+
+  for (const word of words || []) {
+    const alignedStart = Number(word?.start_ms);
+    const alignedEnd = Number(word?.end_ms);
+    const keep = () => {
+      out.push(word);
+      if (Number.isFinite(alignedEnd)) furthestEnd = Math.max(furthestEnd, alignedEnd);
+    };
+
+    const provider = providerByKey.get(String(word?.key));
+    if (!provider || !Number.isFinite(alignedStart) || !Number.isFinite(alignedEnd)) { keep(); continue; }
+
+    const providerStart = Number(provider.start_ms);
+    const providerEnd = Number(provider.end_ms);
+    const divergence = Math.max(Math.abs(alignedStart - providerStart), Math.abs(alignedEnd - providerEnd));
+    if (!Number.isFinite(divergence) || divergence <= PROVIDER_CAPTURE_DIVERGENCE_MS) { keep(); continue; }
+
+    const usable = Number.isFinite(providerStart)
+      && Number.isFinite(providerEnd)
+      && providerEnd > providerStart
+      && providerStart >= furthestEnd;
+    if (!usable) { unrestorable += 1; keep(); continue; }
+
+    const rounded = Math.round(divergence);
+    if (rounded > worst) worst = rounded;
+    restoredKeys.push(String(word.key));
+    out.push({ ...word, start_ms: providerStart, end_ms: providerEnd, capture_restored: true, capture_divergence_ms: rounded });
+    furthestEnd = Math.max(furthestEnd, providerEnd);
+  }
+
+  return {
+    words: out,
+    report: {
+      capture_restored_words: restoredKeys.length,
+      unrestorable_words: unrestorable,
+      worst_restored_divergence_ms: worst,
+      restored_keys: restoredKeys.slice(0, 200),
+    },
+  };
+}
 
 /**
  * STAGE 1 — pull absorbed onsets forward to a plausible word start.
@@ -180,6 +292,8 @@ export type IntegrityRow = {
   // Applied-repair disclosure — independent of timing_defect (see DEFECT_SEVERITY).
   onset_reconstructed?: boolean;
   onset_absorbed_ms?: number;
+  capture_restored?: boolean;
+  capture_restored_ms?: number;
 };
 
 export type IntegrityReport = {
@@ -192,6 +306,16 @@ export type IntegrityReport = {
   onset_reconstructed_rows: number;
   onset_absorption_repairs: number;
   worst_onset_absorbed_ms: number;
+  // STAGE 0 evidence. capture_restored_words counts words whose rejected aligned
+  // window was replaced by the provider's measured one; unrestorable_capture_words
+  // counts words that could NOT be restored without breaking chronological order
+  // and therefore remain flagged for a human. A rising unrestorable count means
+  // the aligner is drifting far enough to reorder the timeline, which no
+  // downstream repair can fix — it has to be addressed upstream.
+  capture_restored_words: number;
+  capture_restored_rows: number;
+  unrestorable_capture_words: number;
+  worst_restored_divergence_ms: number;
   worst_same_speaker_overlap_ms: number;
   worst_provider_divergence_ms: number;
   // Segment-scale absorption evidence. inflated_row_count is the number of rows
@@ -275,6 +399,7 @@ export function auditTimelineIntegrity(
   rows: IntegrityRow[],
   formatTimecode: (ms: number) => string,
   onsetRepair?: OnsetRepairReport,
+  captureRestore?: CaptureRestoreReport,
 ): IntegrityReport {
   const report: IntegrityReport = {
     policy_version: TIMELINE_INTEGRITY_POLICY_VERSION,
@@ -286,6 +411,10 @@ export function auditTimelineIntegrity(
     onset_reconstructed_rows: 0,
     onset_absorption_repairs: onsetRepair?.onset_absorption_repairs || 0,
     worst_onset_absorbed_ms: onsetRepair?.worst_onset_absorbed_ms || 0,
+    capture_restored_words: captureRestore?.capture_restored_words || 0,
+    capture_restored_rows: 0,
+    unrestorable_capture_words: captureRestore?.unrestorable_words || 0,
+    worst_restored_divergence_ms: captureRestore?.worst_restored_divergence_ms || 0,
     worst_same_speaker_overlap_ms: 0,
     worst_provider_divergence_ms: 0,
     worst_acoustic_inflation_ms: 0,
@@ -371,6 +500,7 @@ export function auditTimelineIntegrity(
   // Counted from the independent disclosure flag, NOT from a defect label — the
   // label is claimed by whichever outstanding defect the row also carries.
   report.onset_reconstructed_rows = rows.filter((row) => row.onset_reconstructed === true).length;
+  report.capture_restored_rows = rows.filter((row) => row.capture_restored === true).length;
   report.defect_sequences = rows
     .filter((row) => !!row.timing_defect)
     .map((row) => Number(row.sequence_index))
