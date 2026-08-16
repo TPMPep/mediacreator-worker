@@ -24,6 +24,18 @@ export type AlignmentWord = AlignmentInputWord & {
   unresolved?: boolean;
   /** This word sat against the edge of the audio the engine was allowed to search. */
   search_window_exhausted?: boolean;
+  /** Machine-readable reason this word has no credible placement (engine policy v3+). */
+  unresolved_reason?: string;
+  // ── Per-word expansion attribution (engine expansion policy v3+) ───────────
+  // Stamped on EVERY word so an expansion is attributable to the exact words it
+  // affected. Absent on results from an engine that predates v3 — treat missing
+  // values as unknown, never as zero, and never infer them from chunk totals.
+  chunk_index?: number;
+  alignment_pass?: number;
+  expansion_lead_ms?: number;
+  expansion_trail_ms?: number;
+  search_window_start_ms?: number;
+  search_window_end_ms?: number;
   /** Overlap (ms) with the neighbouring chunk's measured result, when they disagreed. */
   cross_chunk_overlap_ms?: number;
 };
