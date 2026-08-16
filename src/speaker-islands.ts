@@ -25,10 +25,19 @@
 //   So shortness is ONE signal among several, and it is never sufficient:
 //
 //     S1 atomic          ≤ ISLAND_MAX_WORDS words AND ≤ ISLAND_MAX_DURATION_MS.
-//     S2 sandwich        both neighbours exist, share ONE speaker as each other,
-//                        and that speaker is NOT this row's. MANDATORY — without
-//                        it there is no competing attribution to prefer, so
-//                        there is nothing to be suspicious about.
+//     S2 attachment      the row is ATTACHED to an adjacent row of a DIFFERENT
+//                        speaker: the seam between them is below the turn floor
+//                        AND the text of one continues into the other, either
+//                        forward (this row is the HEAD of the next utterance —
+//                        the observed shape) or backward (its TAIL). MANDATORY,
+//                        because without a competing attribution the evidence
+//                        could favour there is nothing to be suspicious about.
+//                        The SYMMETRIC case — both neighbours being one other
+//                        speaker (a "sandwich") — is a STRONG SUPPORTING signal
+//                        and its own sufficient path, but it is NOT required:
+//                        live evidence showed the real defect at a boundary
+//                        where the preceding line belonged to a THIRD speaker,
+//                        so a symmetric-only gate could never have fired on it.
 //     S3 seam continuity the gap to at least ONE neighbour is below the normal
 //                        conversational seam floor, i.e. this row runs straight
 //                        into surrounding speech rather than standing alone after
@@ -50,10 +59,20 @@
 //                        without case simply do not produce this signal, which
 //                        is why it is never required on its own.
 //
-//   DECISION (policy v1): S1 and S2 are mandatory. With overlap evidence (S4)
-//   one supporting signal is enough. WITHOUT overlap evidence both S3 and S5 are
-//   required — the deliberately stronger bar, so a quiet clean interjection
-//   between two same-speaker lines is left alone.
+//   DECISION (policy v2): S1 is always mandatory, and a row must qualify through
+//   ONE of two independent paths, so neither can silently weaken the other:
+//     DIRECTIONAL — attachment (S2) is mandatory, which means lexical continuity
+//       (S5) into a tight-seam (S3) neighbour of a different speaker is REQUIRED,
+//       and on top of that at least one of: a same-speaker sandwich, measured
+//       competing activity (S4), or a CONTACT seam (a boundary within rounding
+//       distance, i.e. one continuous utterance split across a speaker change).
+//     SYMMETRIC — the original sandwich path, unchanged: both neighbours are one
+//       other speaker and, with overlap evidence, one supporting signal suffices,
+//       while without it both S3 and S5 are required. This is what keeps a quiet
+//       clean interjection between two same-speaker lines untouched.
+//   Continuity being mandatory on the directional path is precisely what leaves a
+//   genuine interruption, a rapid speaker change and a legitimate one-word answer
+//   alone: each of those closes its own sentence, or the neighbour opens a new one.
 //
 // WHAT FIRING MEANS — AND WHAT IT NEVER DOES
 //   Nothing is merged, moved or reassigned. pyannote's attribution stays on the
@@ -71,7 +90,7 @@
 // =============================================================================
 
 /** Bumped whenever a signal, threshold or the combination rule changes. */
-export const SPEAKER_ISLAND_POLICY_VERSION = 1;
+export const SPEAKER_ISLAND_POLICY_VERSION = 2;
 
 /** S1 — an island is atomic: this many words at most … */
 export const ISLAND_MAX_WORDS = 2;
@@ -79,6 +98,13 @@ export const ISLAND_MAX_WORDS = 2;
 export const ISLAND_MAX_DURATION_MS = 400;
 /** S3 — gap below which two rows are continuous speech rather than a turn. */
 export const ISLAND_MAX_SEAM_GAP_MS = 300;
+/**
+ * A CONTACT seam: two rows that touch within boundary-rounding distance. On the
+ * directional path this is evidence in its own right, because a speaker change at
+ * a zero-width boundary in the middle of one sentence is not a turn — it is one
+ * utterance split across two attributions.
+ */
+export const ISLAND_CONTACT_SEAM_MS = 40;
 /** S4 — simultaneous speaker activity must be real, not boundary rounding. */
 export const ISLAND_MIN_OVERLAP_MS = 100;
 /** S4 — how far either side of the row competing activity still counts. */
@@ -204,41 +230,74 @@ export function evaluateSpeakerIsland(
   turns: IslandTurn[] = [],
 ): IslandVerdict | null {
   if (!row || row.is_music === true) return null;
-  if (!previous || !next || previous.is_music === true || next.is_music === true) return null;
-
   const self = speakerKey(row);
-  const before = speakerKey(previous);
-  const after = speakerKey(next);
-  // S2 — mandatory. Without one surrounding speaker on both sides there is no
-  // competing attribution the evidence could favour.
-  if (!self || !before || before !== after || before === self) return null;
+  if (!self) return null;
 
+  // S1 — mandatory on BOTH paths. Nothing about the surrounding context can make
+  // a substantial row an island.
   const wordCount = countWords(row);
   const durationMs = Math.max(0, num(row.end_ms) - num(row.start_ms));
   const atomic = wordCount > 0 && wordCount <= ISLAND_MAX_WORDS && durationMs <= ISLAND_MAX_DURATION_MS;
   if (!atomic) return null;
 
-  const gapBefore = Math.max(0, num(row.start_ms) - num(previous.end_ms));
-  const gapAfter = Math.max(0, num(next.start_ms) - num(row.end_ms));
-  const seamContinuity = Math.min(gapBefore, gapAfter) <= ISLAND_MAX_SEAM_GAP_MS;
+  // A neighbour is only a candidate attachment if it is dialogue attributed to a
+  // DIFFERENT speaker. Same-speaker neighbours are ordinary continuation.
+  const candidate = (other: IslandRow | undefined): boolean =>
+    !!other && other.is_music !== true && !!speakerKey(other) && speakerKey(other) !== self;
+
+  const gapBefore = previous ? Math.max(0, num(row.start_ms) - num(previous.end_ms)) : null;
+  const gapAfter = next ? Math.max(0, num(next.start_ms) - num(row.end_ms)) : null;
+  const tight = (gap: number | null): boolean => gap !== null && gap <= ISLAND_MAX_SEAM_GAP_MS;
+
+  // S2 DIRECTIONAL ATTACHMENT. Forward = this row is the HEAD of the next
+  // utterance (it does not close a sentence and the next text cannot open one).
+  // Backward = this row is the TAIL of the previous one. Forward wins if both,
+  // because a fragment reads as belonging to the utterance it runs into.
+  const forward = candidate(next)
+    && tight(gapAfter)
+    && !endsSentence(String(row.source_text || ''))
+    && startsMidSentence(String(next!.source_text || ''));
+  const backward = candidate(previous)
+    && tight(gapBefore)
+    && !endsSentence(String(previous!.source_text || ''))
+    && startsMidSentence(String(row.source_text || ''));
+
+  const sandwich = candidate(previous) && candidate(next)
+    && speakerKey(previous) === speakerKey(next);
+
+  // Attachment target — the neighbour whose utterance this row belongs to, and
+  // therefore whose speaker the surrounding evidence favours. On the symmetric
+  // path with no directional attachment, the sandwich speaker is that answer.
+  const attachedToNext = forward || (!backward && sandwich && !!next);
+  const target = (attachedToNext ? next : previous) as IslandRow | undefined;
+  if (!target) return null;
+  const seamGap = attachedToNext ? gapAfter : gapBefore;
 
   const overlapEvidenceAvailable = turns.length > 0;
-  const overlapMs = measureCompetingActivityMs(row, String(previous.cluster || ''), turns);
+  const overlapMs = measureCompetingActivityMs(row, String(target.cluster || ''), turns);
   const overlapping = overlapMs >= ISLAND_MIN_OVERLAP_MS;
+  const contact = seamGap !== null && seamGap <= ISLAND_CONTACT_SEAM_MS;
+  const attached = forward || backward;
 
-  const continuous = !endsSentence(String(row.source_text || ''))
-    && startsMidSentence(String(next.source_text || ''));
+  // DIRECTIONAL PATH — continuity into a tight-seam different-speaker neighbour,
+  // corroborated by a sandwich, measured overlap, or a contact seam.
+  const directional = attached && (sandwich || overlapping || contact);
 
-  const supporting = (seamContinuity ? 1 : 0) + (continuous ? 1 : 0);
-  // With measured overlap one supporting signal suffices; without it, BOTH are
-  // required — a legitimate short turn in clean audio must stay validated.
-  const detected = overlapping ? supporting >= 1 : supporting === 2;
-  if (!detected) return null;
+  // SYMMETRIC PATH — the original sandwich rule, deliberately unchanged so the
+  // previously-covered ambiguous-overlap case keeps its verdict.
+  const seamContinuity = tight(gapBefore) || tight(gapAfter);
+  const symmetricSupport = (seamContinuity ? 1 : 0) + (attached ? 1 : 0);
+  const symmetric = sandwich && (overlapping ? symmetricSupport >= 1 : symmetricSupport === 2);
 
-  const signals = ['atomic_row', 'same_speaker_sandwich'];
+  if (!directional && !symmetric) return null;
+
+  const signals = ['atomic_row'];
+  if (attached) signals.push('directional_attachment', attachedToNext ? 'attached_to_next' : 'attached_to_previous');
+  if (sandwich) signals.push('same_speaker_sandwich');
   if (seamContinuity) signals.push('sub_seam_gap_to_neighbour');
+  if (contact) signals.push('contact_seam');
   if (overlapping) signals.push('competing_speaker_activity');
-  if (continuous) signals.push('lexical_continuity');
+  if (attached) signals.push('lexical_continuity');
 
   return {
     detected: true,
@@ -246,16 +305,17 @@ export function evaluateSpeakerIsland(
     policy_version: SPEAKER_ISLAND_POLICY_VERSION,
     word_count: wordCount,
     duration_ms: Math.round(durationMs),
-    gap_before_ms: Math.round(gapBefore),
-    gap_after_ms: Math.round(gapAfter),
+    gap_before_ms: gapBefore === null ? null : Math.round(gapBefore),
+    gap_after_ms: gapAfter === null ? null : Math.round(gapAfter),
     overlap_ms: overlapMs,
     overlap_evidence_available: overlapEvidenceAvailable,
     provider_speaker_id: String(row.speaker_id || ''),
     provider_speaker_label: String(row.speaker_label || ''),
-    suggested_speaker_id: String(previous.speaker_id || ''),
-    suggested_speaker_label: String(previous.speaker_label || ''),
+    // EVIDENCE ONLY — never written to the row's speaker. The operator rules.
+    suggested_speaker_id: String(target.speaker_id || ''),
+    suggested_speaker_label: String(target.speaker_label || ''),
     reason_code: SPEAKER_ISLAND_REASON_CODE,
-    reason: `Short speaker island inside overlapping speech; surrounding evidence favors ${String(previous.speaker_label || 'the neighbouring speaker')}.`,
+    reason: `Short speaker island inside overlapping speech; surrounding evidence favors ${String(target.speaker_label || 'the neighbouring speaker')}.`,
   };
 }
 
