@@ -11,6 +11,10 @@ import { getRedis, closeRedis } from './redis.js';
 import { initSentry, captureError, flushSentry } from './sentry.js';
 import { logEvent } from './base44-client.js';
 import { QUEUE_NAMES } from '../shared/queue-contracts.js';
+// Single source of truth for the build fingerprint. Lives in its own module so
+// processors can stamp it onto the evidence they persist without importing this
+// entry point (which would be circular).
+import { BUILD_TAG } from './build-tag.js';
 
 import { processVoiceGen } from './processors/voice-gen.js';
 // v2 voice-gen orchestrator (2026-05-18) — handles the fan-out phase that
@@ -129,7 +133,7 @@ initSentry();
 // identifies the source-tree version.
 // =============================================================================
 const BUILD_INFO = {
-  build_tag: '2026-08-16-validated-boundary-reconstruction-v29-segment-state-model',
+  build_tag: BUILD_TAG,
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
