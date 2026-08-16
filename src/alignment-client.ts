@@ -14,6 +14,18 @@ export type AlignmentWord = AlignmentInputWord & {
   raw_start_ms?: number;
   raw_end_ms?: number;
   timing_repaired?: boolean;
+  /**
+   * The engine could not place this word even after bounded adaptive expansion.
+   * Its window is NOT validated timing. The provider's measurement stays on the
+   * row as fallback evidence, but the segment must be quarantined
+   * (UNRESOLVED_TIMING) rather than treated as clean — "a provider timestamp
+   * exists" is not proof of placement.
+   */
+  unresolved?: boolean;
+  /** This word sat against the edge of the audio the engine was allowed to search. */
+  search_window_exhausted?: boolean;
+  /** Overlap (ms) with the neighbouring chunk's measured result, when they disagreed. */
+  cross_chunk_overlap_ms?: number;
 };
 
 export type AlignmentResult = {
@@ -38,6 +50,16 @@ export type AlignmentResult = {
   timing_repair_count: number;
   max_regression_ms: number;
   duration_ms: number;
+  // ── Adaptive search expansion evidence (engine expansion policy v2+) ───────
+  // Absent on results from an engine that predates adaptive expansion; treat a
+  // missing value as "no expansion was possible", never as "none was needed".
+  expansion_policy_version?: number;
+  alignment_pass_count?: number;
+  expanded_chunk_count?: number;
+  total_expansion_ms?: number;
+  max_expansion_ms?: number;
+  unresolved_word_count?: number;
+  cross_chunk_overlaps?: Array<{ chunk_index: number; overlap_ms: number }>;
   words: AlignmentWord[];
 };
 
