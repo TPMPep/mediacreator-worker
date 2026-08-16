@@ -40,7 +40,12 @@
 // evidence already persisted on the row, so an auditor can recompute it.
 // =============================================================================
 
-export const SEGMENT_STATE_POLICY_VERSION = 1;
+// v2 adds near-zero final acceptance as an unresolved cause. A word whose final
+// window sits below the evidence floor with no corroboration from the other
+// timeline occupies no audio — it is an absence of measurement, not a short word
+// — so a row carrying one cannot be called validated merely because the duration
+// is technically greater than zero.
+export const SEGMENT_STATE_POLICY_VERSION = 2;
 
 export type SegmentState =
   | 'VALIDATED'
@@ -62,6 +67,11 @@ export type SegmentStateInput = {
   unresolved_alignment_word_count?: number;
   /** Words the engine placed only because its search region ran out of audio. */
   search_window_exhausted_word_count?: number;
+  /**
+   * Words whose FINAL accepted window is below the evidence floor and which the
+   * provider timeline did not independently corroborate as brief speech.
+   */
+  near_zero_unresolved_word_count?: number;
   /** Aligner stacked words onto one instant and no substitution was usable. */
   alignment_collapsed?: boolean;
   /** Outstanding defect label from the timeline-integrity audit. */
@@ -96,12 +106,14 @@ const count = (value: unknown): number => {
 export function deriveSegmentState(row: SegmentStateInput): SegmentStateVerdict {
   const unresolvedWords = count(row.unresolved_alignment_word_count);
   const exhaustedWords = count(row.search_window_exhausted_word_count);
+  const nearZeroWords = count(row.near_zero_unresolved_word_count);
   const speakerUnresolved = count(row.speaker_unresolved_word_count);
   const collapsed = row.alignment_collapsed === true || row.timing_defect === 'alignment_collapse';
   const overlap = row.timing_defect === 'same_speaker_overlap';
   const divergence = row.timing_defect === 'provider_capture_divergence';
 
-  const unresolved_timing = unresolvedWords > 0 || exhaustedWords > 0 || collapsed || overlap || divergence;
+  const unresolved_timing = unresolvedWords > 0 || exhaustedWords > 0 || nearZeroWords > 0
+    || collapsed || overlap || divergence;
   const unresolved_speaker = speakerUnresolved > 0;
 
   const verdict = (timing_state: SegmentState, timing_state_reason: string): SegmentStateVerdict => ({
@@ -122,6 +134,9 @@ export function deriveSegmentState(row: SegmentStateInput): SegmentStateVerdict 
     }
     if (exhaustedWords > 0) {
       return verdict('UNRESOLVED_TIMING', `${exhaustedWords} word(s) were placed against the edge of the available audio, so their position is not proven.`);
+    }
+    if (nearZeroWords > 0) {
+      return verdict('UNRESOLVED_TIMING', `${nearZeroWords} word(s) ended up with a window too short to contain any speech, and the transcriber's own measurement does not agree that they are that brief.`);
     }
     if (collapsed) {
       return verdict('UNRESOLVED_TIMING', 'Several words were placed at the same instant and no usable alternative timing existed; a re-transcribe of this line is usually the cleanest fix.');
@@ -158,6 +173,8 @@ export function deriveSegmentState(row: SegmentStateInput): SegmentStateVerdict 
 export function summariseSegmentStates(rows: Array<{ timing_state?: string }>): {
   counts: Record<SegmentState, number>;
   blocking_count: number;
+  total_segment_count: number;
+  policy_version: number;
 } {
   const counts = {
     VALIDATED: 0,
@@ -173,5 +190,11 @@ export function summariseSegmentStates(rows: Array<{ timing_state?: string }>): 
   return {
     counts,
     blocking_count: BLOCKING_STATES.reduce((total, state) => total + counts[state], 0),
+    // Carried so a consumer can verify the counts SUM to the rows they describe.
+    // A state total that does not reconcile to the row count means some row holds
+    // an unrecognised state, which must surface as a failure rather than a
+    // silently smaller number.
+    total_segment_count: (rows || []).length,
+    policy_version: SEGMENT_STATE_POLICY_VERSION,
   };
 }
