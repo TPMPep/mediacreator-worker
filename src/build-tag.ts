@@ -14,4 +14,4 @@
 // tag on the evidence row proves which code actually produced that row.
 // =============================================================================
 
-export const BUILD_TAG = '2026-08-16-evidence-relative-arbitration-v30-policy5-final-acceptance';
+export const BUILD_TAG = '2026-08-16-speaker-island-seam-continuity-v32-segstate-policy3';
