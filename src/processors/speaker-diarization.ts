@@ -7,6 +7,7 @@ import { assertFinalWordAcceptance, auditTimelineIntegrity, clampAcousticOnsets,
 import { BUILD_TAG } from '../build-tag.js';
 import { deriveSegmentBoundaries } from '../segment-boundaries.js';
 import { deriveSegmentState, summariseSegmentStates } from '../segment-state.js';
+import { detectSpeakerIslands } from '../speaker-islands.js';
 
 const API = 'https://api.pyannote.ai/v1';
 const COLORS = ['blue','purple','green','amber','red','pink','cyan','orange'];
@@ -87,7 +88,7 @@ export async function processSpeakerDiarization(job:Job<SpeakerDiarizationJobDat
     const clusters=[...new Set(turns.map(t=>t.speaker))];const plans=clusters.map((cluster,index)=>{const ts=turns.filter(t=>t.speaker===cluster),cs=ts.map(confidence).filter((n):n is number=>n!==null);return {cluster,label:label(cluster,index),color:COLORS[index%COLORS.length],confidence:cs.length?cs.reduce((a,b)=>a+b,0)/cs.length:null,turn_count:ts.length};});
     const staged=await call<any>('stage_speakers',{speakers:plans},signal);const speakers=Object.fromEntries(staged.speakers.map((s:any)=>[s.diarization_cluster_id,s]));
     const output:any[]=[],counts:Record<string,number>={};let splits=0,unresolved=0,reassigned=0;const cursor={i:0};
-    for(const segment of source){const providerWords=segment.aai_word_timings||[];if(!providerWords.length&&segment.is_music){const t=best(turns,Number(segment.start_ms),Number(segment.end_ms),cursor),cluster=t?.speaker||clusters[0],sp=speakers[cluster];counts[cluster]=(counts[cluster]||0)+1;output.push({sequence_index:output.length,start_ms:segment.start_ms,end_ms:segment.end_ms,tc_in:tc(segment.start_ms,prep.project.frame_rate||25),tc_out:tc(segment.end_ms,prep.project.frame_rate||25),speaker_id:sp.id,speaker_label:sp.label,speaker_color:sp.color,source_text:segment.source_text,source_text_status:segment.source_text_status||'machine',confidence:segment.confidence,avg_word_confidence:segment.avg_word_confidence,aai_word_timings:[],provider_name:segment.provider_name,version_number:segment.version_number||1,_alignment:{status:'not_applicable',model:alignment.model,model_revision:alignment.model_revision,language_code:alignment.language_code,words:[],mean_confidence:0,max_provider_shift_ms:0,raw_result_key:prep.alignment_result_key},is_music:true,music_source:segment.music_source,music_context:segment.music_context||'foreground'});continue;}const acousticWords=providerWords.map((word,index)=>{const aligned=alignedByKey.get(`${segment.id}:${index}`);if(!aligned)throw new Error(`Missing forced alignment result for ${segment.id}:${index}`);// The per-word repair disclosures MUST travel onto the object the row is built
+    for(const segment of source){const providerWords=segment.aai_word_timings||[];if(!providerWords.length&&segment.is_music){const t=best(turns,Number(segment.start_ms),Number(segment.end_ms),cursor),cluster=t?.speaker||clusters[0],sp=speakers[cluster];counts[cluster]=(counts[cluster]||0)+1;output.push({sequence_index:output.length,start_ms:segment.start_ms,end_ms:segment.end_ms,tc_in:tc(segment.start_ms,prep.project.frame_rate||25),tc_out:tc(segment.end_ms,prep.project.frame_rate||25),speaker_id:sp.id,speaker_label:sp.label,speaker_color:sp.color,source_text:segment.source_text,source_text_status:segment.source_text_status||'machine',confidence:segment.confidence,avg_word_confidence:segment.avg_word_confidence,aai_word_timings:[],provider_name:segment.provider_name,version_number:segment.version_number||1,_alignment:{status:'not_applicable',model:alignment.model,model_revision:alignment.model_revision,language_code:alignment.language_code,words:[],mean_confidence:0,max_provider_shift_ms:0,raw_result_key:prep.alignment_result_key},_cluster:cluster,is_music:true,music_source:segment.music_source,music_context:segment.music_context||'foreground'});continue;}const acousticWords=providerWords.map((word,index)=>{const aligned=alignedByKey.get(`${segment.id}:${index}`);if(!aligned)throw new Error(`Missing forced alignment result for ${segment.id}:${index}`);// The per-word repair disclosures MUST travel onto the object the row is built
 // from. They previously did not: the flags were set on the aligned word and this
 // mapping rebuilt the object from the PROVIDER word, silently dropping them — so
 // `onset_reconstructed` could never be true on any row, and a run that applied 3
@@ -107,6 +108,10 @@ unresolvedEvidence=g.words.map((w,wordIndex)=>({w,wordIndex})).filter(({w})=>w.u
 // supplied ONLY when this row is the sole group of its source segment \u2014 a split
 // row has no comparable provider boundary, so it is always fully derived.
 _boundary_words:g.words.map(w=>({start_ms:Number(w.start_ms),end_ms:Number(w.end_ms)})),
+// Diarization cluster this row was attributed to. Derivation input for the
+// speaker-island rule's overlap evidence (turns are per cluster, rows per
+// speaker) — stripped before staging like every other transient field.
+_cluster:g.cluster,
 provider_boundary_start_ms:groups.length===1?Number(segment.start_ms):null,
 provider_boundary_end_ms:groups.length===1?Number(segment.end_ms):null,
 // Quarantine evidence. Counted per row so the state model and the export gate can
@@ -143,6 +148,17 @@ speaker_unresolved_word_count:g.words.filter(w=>w.speaker_unresolved===true).len
     const boundaries=deriveSegmentBoundaries(output,{durationMs:Number(prep.project.duration_ms||0)||undefined});
     output.forEach(row=>{row.tc_in=tc(row.start_ms,prep.project.frame_rate||25);row.tc_out=tc(row.end_ms,prep.project.frame_rate||25);});
     if(boundaries.provider_contradictions_prevented||boundaries.rows_derived)await logEvent({function_name:'bullmq:speaker-diarization',level:'warn',event:'segment_boundaries_rederived',message:`Re-derived ${boundaries.rows_derived} segment boundary(ies) from validated word timings and kept ${boundaries.rows_stable} at their provider value; ${boundaries.provider_contradictions_prevented} provider boundary(ies) had cut inside their own validated words (worst extension ${boundaries.worst_extension_ms}ms, worst reduction ${boundaries.worst_reduction_ms}ms).`,context:{project_id,run_id,job_run_id,request_id,...boundaries}});
+    // SPEAKER-ATTRIBUTION ISLANDS — the one place a COVERED word can still be an
+    // unproven speaker. Diarization gives one label per instant, so where two
+    // voices are genuinely audible that label is a choice; the multi-signal rule
+    // (atomic row + same-speaker sandwich + seam/overlap/continuity evidence)
+    // says when the surrounding evidence disputes it. Runs AFTER boundary
+    // reconstruction so seam gaps are measured against the windows that actually
+    // ship, and BEFORE the state model so the verdict is part of the same
+    // deterministic derivation. Nothing is merged or reassigned here.
+    const islands=detectSpeakerIslands(output.map(row=>({sequence_index:row.sequence_index,start_ms:Number(row.start_ms),end_ms:Number(row.end_ms),speaker_id:row.speaker_id,speaker_label:row.speaker_label,source_text:row.source_text,is_music:row.is_music===true,word_count:Array.isArray(row.aai_word_timings)?row.aai_word_timings.length:undefined,cluster:row._cluster})),{turns:turns.map(t=>({cluster:t.speaker,start_ms:Math.round(Number(t.start)*1000),end_ms:Math.round(Number(t.end)*1000)}))});
+    islands.verdicts.forEach((verdict,index)=>{if(!verdict)return;const row=output[index];row.speaker_island_in_overlap=true;row.speaker_island_reason=verdict.reason;if(row._alignment)row._alignment.speaker_island=verdict;});
+    if(islands.detected_count)await logEvent({function_name:'bullmq:speaker-diarization',level:'warn',event:'speaker_islands_quarantined',message:`${islands.detected_count} short speaker island(s) sit inside speech attributed to one surrounding speaker; their attribution is not proven and they are quarantined for an operator ruling. pyannote's own attribution is preserved and nothing was merged or reassigned.`,context:{project_id,run_id,job_run_id,request_id,detected_count:islands.detected_count,speaker_island_policy_version:islands.policy_version,lines:islands.verdicts.map((v,i)=>v?{line_number:Number(output[i].sequence_index??0)+1,signals:v.signals,overlap_ms:v.overlap_ms,provider_speaker_label:v.provider_speaker_label,suggested_speaker_label:v.suggested_speaker_label}:null).filter(Boolean).slice(0,50)}});
     const integrity=auditTimelineIntegrity(output,(ms:number)=>tc(ms,prep.project.frame_rate||25),onsetRepair.report,captureRestore.report,acceptance.report);
     // Attribution travels WITH the finding. The worker owns the audit, so it stamps
     // the run id onto every row it flagged or repaired instead of leaving the
@@ -156,7 +172,7 @@ speaker_unresolved_word_count:g.words.filter(w=>w.speaker_unresolved===true).len
     // an operator can look at, never proof of placement. `_boundary_words` is
     // dropped here \u2014 it is derivation input, and the persisted evidence of the
     // final word timeline is the TranscriptAlignmentEvidence row.
-    for(const row of output){Object.assign(row,deriveSegmentState(row));row.timing_state_run_id=run_id;delete row._boundary_words;}
+    for(const row of output){Object.assign(row,deriveSegmentState(row));row.timing_state_run_id=run_id;delete row._boundary_words;delete row._cluster;}
     const segmentStates=summariseSegmentStates(output);
     if(segmentStates.blocking_count)await logEvent({function_name:'bullmq:speaker-diarization',level:'warn',event:'segment_states_unresolved',message:`${segmentStates.blocking_count} segment(s) could not be validated and are quarantined: ${segmentStates.counts.UNRESOLVED_TIMING} with unproven timing, ${segmentStates.counts.UNRESOLVED_SPEAKER} with unproven speaker attribution. They stay visible and editable; a production export must block on them until an operator rules.`,context:{project_id,run_id,job_run_id,request_id,...segmentStates.counts,blocking_count:segmentStates.blocking_count,unresolved_alignment_words:Number(alignment.unresolved_word_count||0)}});
     if(integrity.same_speaker_overlap_defects||integrity.provider_capture_defects)await logEvent({function_name:'bullmq:speaker-diarization',level:'warn',event:'timeline_integrity_defects_flagged',message:`Flagged ${integrity.same_speaker_overlap_defects} same-speaker overlap and ${integrity.provider_capture_defects} provider-capture defect(s) for human review; transcript was not modified.`,context:{project_id,run_id,job_run_id,request_id,...integrity}});
