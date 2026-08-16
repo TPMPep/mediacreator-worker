@@ -45,7 +45,12 @@
 // timeline occupies no audio — it is an absence of measurement, not a short word
 // — so a row carrying one cannot be called validated merely because the duration
 // is technically greater than zero.
-export const SEGMENT_STATE_POLICY_VERSION = 2;
+// v3 adds the SPEAKER ISLAND as an unresolved-speaker cause. Diarization returns
+// one speaker per instant, so on genuinely overlapping speech that single label is
+// a choice rather than a measurement — and a covered word previously made the row
+// VALIDATED with no signal to the operator. See speaker-islands.ts for the
+// multi-signal rule; a row only reaches here already judged, never on duration.
+export const SEGMENT_STATE_POLICY_VERSION = 3;
 
 export type SegmentState =
   | 'VALIDATED'
@@ -78,6 +83,16 @@ export type SegmentStateInput = {
   timing_defect?: string;
   /** Words no pyannote turn covered. */
   speaker_unresolved_word_count?: number;
+  /**
+   * A pyannote turn DID cover this row, but the multi-signal speaker-island rule
+   * judged the attribution unproven because the surrounding evidence favours
+   * another speaker (see speaker-islands.ts). Held separately from
+   * speaker_unresolved_word_count because the two are different facts: there the
+   * provider was silent, here it answered and its answer is disputed on evidence.
+   */
+  speaker_island_in_overlap?: boolean;
+  /** Plain-English reason supplied by the island rule, naming the favoured speaker. */
+  speaker_island_reason?: string;
   /** Disclosed, already-applied system decisions. */
   capture_restored?: boolean;
   provider_timing_rejected?: boolean;
@@ -114,7 +129,8 @@ export function deriveSegmentState(row: SegmentStateInput): SegmentStateVerdict 
 
   const unresolved_timing = unresolvedWords > 0 || exhaustedWords > 0 || nearZeroWords > 0
     || collapsed || overlap || divergence;
-  const unresolved_speaker = speakerUnresolved > 0;
+  const speakerIsland = row.speaker_island_in_overlap === true;
+  const unresolved_speaker = speakerUnresolved > 0 || speakerIsland;
 
   const verdict = (timing_state: SegmentState, timing_state_reason: string): SegmentStateVerdict => ({
     timing_state,
@@ -148,7 +164,11 @@ export function deriveSegmentState(row: SegmentStateInput): SegmentStateVerdict 
   }
 
   if (unresolved_speaker) {
-    return verdict('UNRESOLVED_SPEAKER', `No speaker turn covered ${speakerUnresolved} word(s) on this line, so its attribution was inherited from a neighbour rather than measured.`);
+    if (speakerUnresolved > 0) {
+      return verdict('UNRESOLVED_SPEAKER', `No speaker turn covered ${speakerUnresolved} word(s) on this line, so its attribution was inherited from a neighbour rather than measured.`);
+    }
+    return verdict('UNRESOLVED_SPEAKER', row.speaker_island_reason
+      || 'Short speaker island inside overlapping speech; the surrounding evidence favors another speaker, so this attribution is not proven.');
   }
 
   if (row.is_music === true) {
