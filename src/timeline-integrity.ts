@@ -90,7 +90,18 @@
 // v4 replaces v3's "provider wins" rule with plausibility arbitration and adds
 // alignment-collapse detection. Pinned onto every report, so a run delivered
 // under an earlier policy is never retroactively reinterpreted under v4's rules.
-export const TIMELINE_INTEGRITY_POLICY_VERSION = 4;
+// v5 adds the EVIDENCE-RELATIVE arbitration bound and the final near-zero
+// acceptance check. v4 judged an aligned window only against the rate ceiling,
+// whose floor (WORD_MAX_DURATION_FLOOR_MS) grants EVERY short word a 1,500ms
+// allowance — so a word the transcriber measured at ~210ms could be stretched to
+// exactly 1,500ms through untranscribed music and be judged "plausible", because
+// 1,500ms IS the ceiling for any word under ~8 characters. That is a structural
+// blind spot, not a tuning miss: the generic floor exists so a genuinely long
+// word is never falsely rejected, which makes it useless as an absorption bound.
+// v5 therefore adds a SECOND, independent bound derived from evidence about THIS
+// word (see evidenceCeilingMs) and applies whichever is tighter. The shared
+// shaping constants are unchanged — this bound lives only in arbitration.
+export const TIMELINE_INTEGRITY_POLICY_VERSION = 5;
 
 // Below this, an overlap is boundary rounding between two adjacent same-speaker
 // groups and is safe to repair deterministically.
@@ -124,6 +135,69 @@ export function maxWordDurationMs(text: string | undefined): number {
   return Math.max(WORD_MAX_DURATION_FLOOR_MS, Math.round(chars * WORD_MS_PER_CHAR * WORD_DURATION_SAFETY_FACTOR));
 }
 
+/** Duration this word would occupy at conversational pace. No safety factor. */
+export function typicalWordDurationMs(text: string | undefined): number {
+  const chars = String(text || '').replace(/\s+/g, '').length || 1;
+  return chars * WORD_MS_PER_CHAR;
+}
+
+/**
+ * Is the PROVIDER's measured duration credible as a reading of this text?
+ *
+ * The provider's number is evidence, never automatic truth — and it is only
+ * usable as a bound on the aligner when it could itself be a real utterance of
+ * the word. A capture more than WORD_DURATION_SAFETY_FACTOR times FASTER than
+ * conversational pace is not a measurement of that word; it is a compressed or
+ * collapsed timestamp (the mirror of the too-long case, and the reason the
+ * aligner legitimately expands such words). Using the SAME safety factor in both
+ * directions is deliberate: one documented tolerance, symmetric, no new number.
+ *
+ * Worked both ways, from the two general defect classes:
+ *   "News."       5 chars → pace 357ms → credible floor 143ms → capture 210ms
+ *                 IS credible, so it may bound the aligner.
+ *   "leadership." 11 chars → pace 786ms → credible floor 314ms → capture 115ms
+ *                 is NOT credible, so it may NOT bound the aligner and the
+ *                 acoustic expansion stands.
+ */
+export function providerCaptureCredible(text: string | undefined, providerDurationMs: number): boolean {
+  if (!Number.isFinite(providerDurationMs) || providerDurationMs < MIN_PLAUSIBLE_WORD_MS) return false;
+  return providerDurationMs >= typicalWordDurationMs(text) / WORD_DURATION_SAFETY_FACTOR;
+}
+
+/**
+ * The ceiling an ALIGNED window must respect, given the evidence for this word.
+ *
+ * Always the rate ceiling; additionally bounded by the provider's own measurement
+ * when that measurement is credible. The provider-relative bound is that same
+ * WORD_DURATION_SAFETY_FACTOR applied to a real measurement instead of to a
+ * generic pace, plus MIN_PLAUSIBLE_WORD_MS of slack — a difference smaller than
+ * the evidence floor is not measurable evidence of inflation.
+ *
+ * Rate-aware and evidence-relative by construction: no per-word constant, no
+ * absolute duration rule, and it degrades to exactly the v4 behaviour whenever
+ * no credible provider capture exists (missing capture, or a capture too short
+ * to be believed). Scales with speech rate, language and word length because
+ * both inputs do.
+ */
+export function evidenceCeilingMs(text: string | undefined, providerDurationMs: number | null): number {
+  const rateCeiling = maxWordDurationMs(text);
+  if (providerDurationMs === null || !providerCaptureCredible(text, providerDurationMs)) return rateCeiling;
+  return Math.min(rateCeiling, Math.round(providerDurationMs * WORD_DURATION_SAFETY_FACTOR + MIN_PLAUSIBLE_WORD_MS));
+}
+
+/**
+ * A sub-floor duration is only evidence of a genuinely brief word when the OTHER
+ * timeline independently reports a brief word too. Corroboration threshold is
+ * the evidence floor times the same safety factor — the widest capture that can
+ * still be describing a very short function word rather than a normal one.
+ * "a" at 39ms against a ~50ms capture is corroborated; a word the aligner
+ * returned at 1ms against a ~320ms capture is not.
+ */
+export function nearZeroCorroborated(providerDurationMs: number | null): boolean {
+  if (providerDurationMs === null || !Number.isFinite(providerDurationMs) || providerDurationMs <= 0) return false;
+  return providerDurationMs <= MIN_PLAUSIBLE_WORD_MS * WORD_DURATION_SAFETY_FACTOR;
+}
+
 export type AlignedWord = {
   key: string;
   text: string;
@@ -140,6 +214,21 @@ export type AlignedWord = {
   /** Engine could not place this word after bounded expansion — quarantine, never fallback. */
   unresolved?: boolean;
   search_window_exhausted?: boolean;
+  /** Timing this word held before an arbitration decision replaced it. */
+  prior_start_ms?: number;
+  prior_end_ms?: number;
+  /** Machine-readable arbitration decision + the evidence it was made on. */
+  arbitration_reason?: string;
+  arbitration_ceiling_ms?: number;
+  arbitration_provider_duration_ms?: number | null;
+  arbitration_aligned_duration_ms?: number;
+  /** Why this word has no credible placement (engine reason, or a v5 acceptance failure). */
+  unresolved_reason?: string;
+  /** Per-word expansion attribution stamped by the alignment engine (policy v3+). */
+  expansion_lead_ms?: number;
+  expansion_trail_ms?: number;
+  alignment_pass?: number;
+  chunk_index?: number;
 };
 
 export type OnsetRepairReport = {
@@ -163,13 +252,91 @@ export type CaptureRestoreReport = {
   collapsed_keys: string[];
 };
 
-/** Is this window a physically possible utterance of `text`? */
-function windowPlausible(text: string | undefined, start: unknown, end: unknown): boolean {
+export type FinalAcceptanceReport = {
+  /** Words whose final window has no duration at all. Never acceptable. */
+  zero_width_words: number;
+  /** Words below the evidence floor after every repair and substitution. */
+  near_zero_words: number;
+  /** Sub-floor words the other timeline independently corroborated as brief. */
+  near_zero_corroborated_words: number;
+  /** Sub-floor words with no corroboration — quarantined, never displayed as valid. */
+  near_zero_unresolved_words: number;
+  zero_width_keys: string[];
+  near_zero_unresolved_keys: string[];
+  near_zero_corroborated_keys: string[];
+};
+
+/**
+ * FINAL ACCEPTANCE — the last gate before words become segment boundaries.
+ *
+ * "Greater than zero" is not a validity test. A word the aligner returned at 1ms
+ * occupies no audio, and substituting or clamping cannot invent a position for
+ * it; it is an absence of measurement. This pass runs AFTER arbitration and the
+ * onset clamp, on the timeline that will actually be persisted, and marks every
+ * remaining sub-floor word unresolved UNLESS the other timeline independently
+ * reports a comparably brief word (genuinely clipped function words — "a",
+ * "the" — which are real speech and must not be quarantined).
+ *
+ * It never changes a timing: it only decides what may be called validated.
+ */
+export function assertFinalWordAcceptance(
+  words: AlignedWord[],
+  providerByKey: Map<string, ProviderWindow>,
+): { words: AlignedWord[]; report: FinalAcceptanceReport } {
+  const report: FinalAcceptanceReport = {
+    zero_width_words: 0,
+    near_zero_words: 0,
+    near_zero_corroborated_words: 0,
+    near_zero_unresolved_words: 0,
+    zero_width_keys: [],
+    near_zero_unresolved_keys: [],
+    near_zero_corroborated_keys: [],
+  };
+  const out = (words || []).map((word) => {
+    const duration = Number(word.end_ms) - Number(word.start_ms);
+    if (!Number.isFinite(duration) || duration >= MIN_PLAUSIBLE_WORD_MS) return word;
+    const provider = providerByKey.get(String(word.key)) || null;
+    const providerDuration = provider ? Number(provider.end_ms) - Number(provider.start_ms) : null;
+    if (duration <= 0) {
+      report.zero_width_words += 1;
+      if (report.zero_width_keys.length < 200) report.zero_width_keys.push(String(word.key));
+      return { ...word, unresolved: true, unresolved_reason: 'zero_width_final_window' };
+    }
+    report.near_zero_words += 1;
+    if (nearZeroCorroborated(providerDuration)) {
+      report.near_zero_corroborated_words += 1;
+      if (report.near_zero_corroborated_keys.length < 200) report.near_zero_corroborated_keys.push(String(word.key));
+      return word;
+    }
+    report.near_zero_unresolved_words += 1;
+    if (report.near_zero_unresolved_keys.length < 200) report.near_zero_unresolved_keys.push(String(word.key));
+    return {
+      ...word,
+      unresolved: true,
+      unresolved_reason: 'final_window_below_evidence_floor_uncorroborated',
+    };
+  });
+  return { words: out, report };
+}
+
+/**
+ * Is this window a physically possible utterance of `text`?
+ *
+ * `providerDurationMs` supplies the independent evidence for the upper bound
+ * (see evidenceCeilingMs). Pass null when judging the PROVIDER's own window —
+ * a measurement must not be used to bound itself.
+ */
+function windowPlausible(
+  text: string | undefined,
+  start: unknown,
+  end: unknown,
+  providerDurationMs: number | null = null,
+): boolean {
   const s = Number(start);
   const e = Number(end);
   if (!Number.isFinite(s) || !Number.isFinite(e)) return false;
   const duration = e - s;
-  return duration >= MIN_PLAUSIBLE_WORD_MS && duration <= maxWordDurationMs(text);
+  return duration >= MIN_PLAUSIBLE_WORD_MS && duration <= evidenceCeilingMs(text, providerDurationMs);
 }
 
 /**
@@ -246,14 +413,27 @@ export function restoreDivergedCaptures(
   // that margin: a 39ms "to" against a 97ms capture — a 58ms difference nobody can
   // hear — was escalated into a reviewable defect. A review queue that includes
   // correct lines trains an operator to ignore it.
+  const providerDurationAt = (index: number): number | null => {
+    const provider = providerAt(index);
+    if (!provider) return null;
+    const duration = Number(provider.end_ms) - Number(provider.start_ms);
+    return Number.isFinite(duration) ? duration : null;
+  };
+
   const disputed = (index: number): boolean => {
     const word = list[index];
     if (!Number.isFinite(Number(word?.start_ms)) || !Number.isFinite(Number(word?.end_ms))) return false;
     if (stacked[index]) return true;
     if (divergenceAt(index) > PROVIDER_CAPTURE_DIVERGENCE_MS) return true;
-    const provider = providerAt(index);
     const alignedDuration = Number(word.end_ms) - Number(word.start_ms);
-    const providerDuration = provider ? Number(provider.end_ms) - Number(provider.start_ms) : 0;
+    const providerDuration = providerDurationAt(index);
+    // INFLATION, independent of divergence. An absorbed word keeps its
+    // corroborated edge, so its start and end can each sit inside the 1.5s
+    // divergence threshold while the DURATION is several times the evidence —
+    // which is exactly how absorption reached delivery unflagged. Judging the
+    // duration against evidence is what makes the class detectable at all.
+    if (alignedDuration > evidenceCeilingMs(word.text, providerDuration)) return true;
+    if (providerDuration === null) return false;
     return alignedDuration < MIN_PLAUSIBLE_WORD_MS && providerDuration >= MIN_PLAUSIBLE_WORD_MS * 3;
   };
 
@@ -285,37 +465,69 @@ export function restoreDivergedCaptures(
       break;
     }
 
+    // The aligned window is judged against BOTH bounds (rate + this word's own
+    // provider evidence). The provider window is judged against the rate bound
+    // only — a measurement cannot bound itself.
     const alignedPlausible = !runIsStacked
-      && run.every((word) => windowPlausible(word.text, word.start_ms, word.end_ms));
+      && run.every((word, offset) =>
+        windowPlausible(word.text, word.start_ms, word.end_ms, providerDurationAt(index + offset)));
 
     const providerRun = run.map((word) => providerByKey.get(String(word.key)) || null);
     let providerPlausible = providerRun.every((provider, offset) =>
       !!provider && windowPlausible(run[offset].text, provider.start_ms, provider.end_ms));
+    // Candidate substitution windows, seam-clamped. A provider capture can start
+    // a few ms before the last ACCEPTED aligned word ends, because the two
+    // timelines round their shared boundary differently. Refusing the whole
+    // substitution over that would discard a correct repair on a rounding
+    // artifact, so the seam is clamped forward — but only within
+    // AUTO_REPAIR_CEILING_MS, the same ceiling this module already uses to
+    // decide that an overlap is rounding rather than a real attribution error.
+    // Anything larger is a genuine chronology conflict and refuses the run.
+    let providerWindows: ProviderWindow[] | null = null;
     if (providerPlausible) {
-      for (let offset = 1; offset < providerRun.length && providerPlausible; offset++) {
-        if (Number(providerRun[offset]!.start_ms) < Number(providerRun[offset - 1]!.end_ms)) providerPlausible = false;
+      const windows = providerRun.map((provider) => ({ start_ms: Number(provider!.start_ms), end_ms: Number(provider!.end_ms) }));
+      const seamShortfall = Number.isFinite(furthestEnd) ? furthestEnd - windows[0].start_ms : 0;
+      if (seamShortfall > 0) {
+        if (seamShortfall <= AUTO_REPAIR_CEILING_MS) windows[0].start_ms = furthestEnd;
+        else providerPlausible = false;
       }
-      const first = Number(providerRun[0]!.start_ms);
-      const last = Number(providerRun[providerRun.length - 1]!.end_ms);
-      if (first < furthestEnd || last > nextAlignedStart) providerPlausible = false;
+      for (let offset = 1; offset < windows.length && providerPlausible; offset++) {
+        if (windows[offset].start_ms < windows[offset - 1].end_ms) providerPlausible = false;
+      }
+      // Every clamped window must still be a possible utterance, and the run must
+      // still fit before the next accepted aligned word.
+      if (providerPlausible) {
+        const fits = windows.every((window, offset) => windowPlausible(run[offset].text, window.start_ms, window.end_ms));
+        if (!fits || windows[windows.length - 1].end_ms > nextAlignedStart) providerPlausible = false;
+      }
+      if (providerPlausible) providerWindows = windows;
     }
 
     if (providerPlausible && !alignedPlausible) {
       // The aligned window cannot be an utterance of this text; the provider's can.
       run.forEach((word, offset) => {
-        const provider = providerRun[offset]!;
+        const provider = providerWindows![offset];
         const divergence = Math.round(Math.max(
           Math.abs(Number(word.start_ms) - Number(provider.start_ms)),
           Math.abs(Number(word.end_ms) - Number(provider.end_ms)),
         ));
         if (divergence > worstRestored) worstRestored = divergence;
         restoredKeys.push(String(word.key));
+        const providerDuration = providerDurationAt(index + offset);
         accept({
           ...word,
+          // Prior (rejected) timing preserved beside the accepted one so the
+          // decision is reversible by evidence from the row alone.
+          prior_start_ms: Number(word.start_ms),
+          prior_end_ms: Number(word.end_ms),
           start_ms: Number(provider.start_ms),
           end_ms: Number(provider.end_ms),
           capture_restored: true,
           capture_divergence_ms: divergence,
+          arbitration_reason: 'aligned_window_inflated_beyond_evidence',
+          arbitration_ceiling_ms: evidenceCeilingMs(word.text, providerDuration),
+          arbitration_provider_duration_ms: providerDuration,
+          arbitration_aligned_duration_ms: Math.round(Number(word.end_ms) - Number(word.start_ms)),
         });
       });
     } else if (alignedPlausible) {
@@ -326,11 +538,17 @@ export function restoreDivergedCaptures(
         const divergence = Math.round(divergenceAt(index + offset));
         if (divergence > worstRejected) worstRejected = divergence;
         rejectedKeys.push(String(word.key));
+        const providerDuration = providerDurationAt(index + offset);
         accept({
           ...word,
           provider_timing_rejected: true,
           provider_timing_rejected_ms: divergence,
-          ...(providerRun[offset] ? {} : {}),
+          arbitration_reason: providerDuration !== null && !providerCaptureCredible(word.text, providerDuration)
+            ? 'provider_capture_too_short_to_be_credible'
+            : 'provider_capture_not_a_possible_utterance',
+          arbitration_ceiling_ms: evidenceCeilingMs(word.text, providerDuration),
+          arbitration_provider_duration_ms: providerDuration,
+          arbitration_aligned_duration_ms: Math.round(Number(word.end_ms) - Number(word.start_ms)),
         });
       });
     } else if (runIsStacked) {
@@ -504,6 +722,14 @@ export type IntegrityReport = {
   // impossible produces a defect that describes nothing.
   worst_acoustic_inflation_ms: number;
   inflated_row_count: number;
+  // Final-acceptance evidence (policy v5). "Greater than zero" was never a
+  // validity test; these count what the last gate judged, split by outcome so a
+  // reviewer can tell a corroborated clipped function word from an absence of
+  // measurement without re-deriving either.
+  zero_width_words: number;
+  near_zero_words: number;
+  near_zero_corroborated_words: number;
+  near_zero_unresolved_words: number;
   defect_sequences: number[];
 };
 
@@ -583,6 +809,7 @@ export function auditTimelineIntegrity(
   formatTimecode: (ms: number) => string,
   onsetRepair?: OnsetRepairReport,
   captureRestore?: CaptureRestoreReport,
+  acceptance?: FinalAcceptanceReport,
 ): IntegrityReport {
   const report: IntegrityReport = {
     policy_version: TIMELINE_INTEGRITY_POLICY_VERSION,
@@ -608,6 +835,10 @@ export function auditTimelineIntegrity(
     worst_provider_divergence_ms: 0,
     worst_acoustic_inflation_ms: 0,
     inflated_row_count: 0,
+    zero_width_words: acceptance?.zero_width_words || 0,
+    near_zero_words: acceptance?.near_zero_words || 0,
+    near_zero_corroborated_words: acceptance?.near_zero_corroborated_words || 0,
+    near_zero_unresolved_words: acceptance?.near_zero_unresolved_words || 0,
     defect_sequences: [],
   };
 
