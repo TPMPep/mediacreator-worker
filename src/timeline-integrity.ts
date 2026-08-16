@@ -137,6 +137,9 @@ export type AlignedWord = {
   provider_timing_rejected?: boolean;
   provider_timing_rejected_ms?: number;
   alignment_collapsed?: boolean;
+  /** Engine could not place this word after bounded expansion — quarantine, never fallback. */
+  unresolved?: boolean;
+  search_window_exhausted?: boolean;
 };
 
 export type OnsetRepairReport = {
@@ -455,6 +458,12 @@ export type IntegrityRow = {
   provider_timing_rejected?: boolean;
   provider_timing_rejected_ms?: number;
   alignment_collapsed?: boolean;
+  // Alignment-engine quarantine evidence. A row carrying either count has words
+  // whose placement was never proven; STAGE 0 may still have substituted the
+  // provider window as the least-bad visible value, which is exactly why these
+  // counts are independent of every repair disclosure above.
+  unresolved_alignment_word_count?: number;
+  search_window_exhausted_word_count?: number;
 };
 
 export type IntegrityReport = {
@@ -513,6 +522,10 @@ const DEFECT_SEVERITY: Record<string, number> = {
   provider_capture_divergence: 1,  // capture no longer describes its own audio
   alignment_collapse: 2,           // words stacked on one instant; unrepairable
   same_speaker_overlap: 3,         // attribution error; a human must judge it
+  // Ranked highest because it is the only finding that says the audio a word
+  // occupies was never successfully analysed. Every other label describes a
+  // disagreement between two measurements; this one describes the absence of one.
+  unresolved_timing: 4,
 };
 
 function flag(row: IntegrityRow, kind: string, magnitudeMs: number): boolean {
@@ -601,6 +614,12 @@ export function auditTimelineIntegrity(
   // ── Pass 1: provider capture vs acoustic truth ────────────────────────────
   for (const row of rows) {
     if (row.is_music) continue;
+
+    // The alignment engine reported words it could not place. This outranks every
+    // measurement disagreement: the row is quarantined and must never be presented
+    // as clean because a provider timestamp happens to exist for those words.
+    const unplaced = Number(row.unresolved_alignment_word_count || 0) + Number(row.search_window_exhausted_word_count || 0);
+    if (unplaced > 0) flag(row, 'unresolved_timing', 0);
 
     // A collapse is unrepairable and already the most specific finding available
     // for this row, so it is flagged unconditionally.
