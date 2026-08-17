@@ -12,6 +12,12 @@
 // when they do the RUN still succeeds while quietly omitting whatever the newer
 // code would have sent. The tag in /health only proves what index.ts said; the
 // tag on the evidence row proves which code actually produced that row.
+//
+// THE TAG MUST CHANGE ON EVERY CODE CHANGE. Run 6a828358aadccfd208542700 proved
+// why: two different code states shipped under one identical tag, so /health
+// reported the expected build while the running image was missing the clearance
+// aggregation added later. A build tag that does not move makes deployment
+// unfalsifiable — the one thing it exists to prove.
 // =============================================================================
 
-export const BUILD_TAG = '2026-08-17-timeline-integrity-v6-segstate-v4-island-v2-alignment-policy-passthrough';
+export const BUILD_TAG = '2026-08-17c-clearance-evidence-reconciliation-v1-per-word-policy-pin-timeline-integrity-v6-segstate-v4';
