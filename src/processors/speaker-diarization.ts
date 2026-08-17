@@ -1,6 +1,6 @@
 import type { Job } from 'bullmq';
 import type { SpeakerDiarizationJobData } from '../../shared/queue-contracts.js';
-import { invokeBase44Function, logEvent, runWithLockHeartbeat } from '../base44-client.js';
+import { WorkerStandDownError, invokeBase44Function, logEvent, runWithLockHeartbeat } from '../base44-client.js';
 import { env } from '../env.js';
 import { alignTranscript, assertAlignmentQuality } from '../alignment-client.js';
 import { TIMELINE_INTEGRITY_POLICY_VERSION, assertFinalWordAcceptance, auditTimelineIntegrity, clampAcousticOnsets, reconcileResolvedUnresolvedWords, restoreDivergedCaptures } from '../timeline-integrity.js';
@@ -214,5 +214,25 @@ speaker_unresolved_word_count:g.words.filter(w=>w.speaker_unresolved===true).len
     for(let i=0;i<output.length;i+=50){await call('stage_segments',{segments:output.slice(i,i+50)},signal);await call('heartbeat',{progress_pct:Math.min(96,82+Math.floor(i/output.length*14))},signal);}
     const cs=plans.map(p=>p.confidence).filter((n):n is number=>n!==null),avg=cs.length?cs.reduce((a,b)=>a+b,0)/cs.length:null;await call('finalize',{worker_build_tag:BUILD_TAG,timeline_integrity:integrity,segment_states:{...segmentStates.counts,blocking_count:segmentStates.blocking_count,policy_version:segmentStates.policy_version},boundary_policy:boundaries,final_acceptance:acceptance.report,raw_result_key:prep.raw_result_key,provider_job_id:providerId,source_segment_count:source.length,output_segment_count:output.length,detected_speaker_count:clusters.length,split_count:splits,reassigned_word_count:reassigned,unresolved_word_count:unresolved,average_confidence:avg,speaker_counts:counts,alignment:{status:'verified',provider:alignment.provider,model:alignment.model,model_revision:alignment.model_revision,language_code:alignment.language_code,word_count:alignment.word_count,mean_confidence:alignment.mean_confidence,max_provider_shift_ms:alignment.max_provider_shift_ms,duration_ms:alignment.duration_ms,expansion_policy_version:Number(alignment.expansion_policy_version||0),alignment_pass_count:Number(alignment.alignment_pass_count||0),expanded_chunk_count:Number(alignment.expanded_chunk_count||0),max_expansion_ms:Number(alignment.max_expansion_ms||0),unresolved_word_count:Number(alignment.unresolved_word_count||0),raw_result_key:prep.alignment_result_key}},signal);
     await logEvent({function_name:'bullmq:speaker-diarization',event:'speaker_diarization_completed',duration_ms:Date.now()-started,context:{project_id,run_id,job_run_id,request_id,provider_job_id:providerId,output_segments:output.length,speakers:clusters.length}});return {ok:true,action:'done'};
-  });}catch(error){const message=String((error as Error)?.message||error).slice(0,500),max=Number(job.opts.attempts||1),terminal=job.attemptsMade+1>=max||/not configured|No source|no usable turns|No active transcript|staging|Translation started|Forced alignment HTTP 4|word-count mismatch|token mismatch|invalid alignment|Missing provider word|timeline_integrity_evidence_unverified/i.test(message);if(terminal)await call('terminal_failure',{terminal_failure:message}).catch(()=>{});await logEvent({function_name:'bullmq:speaker-diarization',level:terminal?'error':'warn',event:terminal?'speaker_diarization_failed':'speaker_diarization_retrying',message,context:{project_id,run_id,job_run_id,request_id,user_email,attempt:job.attemptsMade+1,max_attempts:max}});throw error;}
+  });}catch(error){
+    // ── INTENTIONAL STAND-DOWN — the single-flight guard working ──────────────
+    // Another run holds the project's DiarizationClaim, so this run is NOT the
+    // owner and must stop touching the project immediately. This is a decision,
+    // not a defect, and it is handled BEFORE the failure path so that:
+    //   • the remaining BullMQ attempts are NOT consumed (we return, not throw),
+    //   • `terminal_failure` is NOT called, so the run is never stamped as an
+    //     infrastructure error and — critically — the cleanup path that restores
+    //     superseded rows never runs, which is what triplicated the transcript
+    //     on project 6a7c9797e3e4026fabd4c592,
+    //   • the WINNING run's claim is neither released nor modified: nothing is
+    //     written here at all.
+    // The producer already recorded this contender as `superseded` with
+    // release_reason='lost_race', so the durable audit row exists; this log is
+    // the worker-side half of that record and names the incumbent owner.
+    // SOC 2 CC7.2 / CC8.1.
+    if(error instanceof WorkerStandDownError){
+      await logEvent({function_name:'bullmq:speaker-diarization',level:'info',event:'speaker_diarization_stood_down',message:`Stood down: another refinement run owns this project's single-flight claim. No transcript row was touched and no retry was consumed.`,duration_ms:Date.now()-started,context:{project_id,run_id,job_run_id,request_id,user_email,incumbent_run_id:error.incumbentRunId,refused_operation:error.refusedOperation,detail:error.detail.slice(0,300),attempt:job.attemptsMade+1,max_attempts:Number(job.opts.attempts||1)}});
+      return {ok:true,stood_down:true,incumbent_run_id:error.incumbentRunId};
+    }
+    const message=String((error as Error)?.message||error).slice(0,500),max=Number(job.opts.attempts||1),terminal=job.attemptsMade+1>=max||/not configured|No source|no usable turns|No active transcript|staging|Translation started|Forced alignment HTTP 4|word-count mismatch|token mismatch|invalid alignment|Missing provider word|timeline_integrity_evidence_unverified/i.test(message);if(terminal)await call('terminal_failure',{terminal_failure:message}).catch(()=>{});await logEvent({function_name:'bullmq:speaker-diarization',level:terminal?'error':'warn',event:terminal?'speaker_diarization_failed':'speaker_diarization_retrying',message,context:{project_id,run_id,job_run_id,request_id,user_email,attempt:job.attemptsMade+1,max_attempts:max}});throw error;}
 }
