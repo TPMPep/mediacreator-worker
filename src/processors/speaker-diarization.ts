@@ -3,7 +3,7 @@ import type { SpeakerDiarizationJobData } from '../../shared/queue-contracts.js'
 import { invokeBase44Function, logEvent, runWithLockHeartbeat } from '../base44-client.js';
 import { env } from '../env.js';
 import { alignTranscript, assertAlignmentQuality } from '../alignment-client.js';
-import { assertFinalWordAcceptance, auditTimelineIntegrity, clampAcousticOnsets, reconcileResolvedUnresolvedWords, restoreDivergedCaptures } from '../timeline-integrity.js';
+import { TIMELINE_INTEGRITY_POLICY_VERSION, assertFinalWordAcceptance, auditTimelineIntegrity, clampAcousticOnsets, reconcileResolvedUnresolvedWords, restoreDivergedCaptures } from '../timeline-integrity.js';
 import { BUILD_TAG } from '../build-tag.js';
 import { deriveSegmentBoundaries } from '../segment-boundaries.js';
 import { deriveSegmentState, summariseSegmentStates } from '../segment-state.js';
@@ -113,7 +113,13 @@ unresolvedEvidence=g.words.map((w,wordIndex)=>({w,wordIndex})).filter(({w})=>w.u
 // a later stage provably resolved, naming BOTH reasons and BOTH timelines, so
 // "why is this row a disclosed override rather than a quarantine?" is answerable
 // from the evidence record alone and the withdrawal is independently recomputable.
-unresolved_cleared_words:g.words.map((w,wordIndex)=>({w,wordIndex})).filter(({w})=>w.unresolved_cleared===true).slice(0,100).map(({w,wordIndex})=>({text:String(w.text||''),word_index:wordIndex,provider_start_ms:Number(w.provider_word.start_ms),provider_end_ms:Number(w.provider_word.end_ms),aligned_start_ms:w.prior_start_ms??Number(w.start_ms),aligned_end_ms:w.prior_end_ms??Number(w.end_ms),display_start_ms:Number(w.start_ms),display_end_ms:Number(w.end_ms),cleared_reason:String(w.unresolved_cleared_reason||''),prior_unresolved_reason:String(w.unresolved_prior_reason||''),arbitration_reason:String(w.arbitration_reason||''),capture_restored:w.capture_restored===true})),unresolved_cleared_word_count:g.words.filter(w=>w.unresolved_cleared===true).length,search_window_exhausted_word_count:g.words.filter(w=>w.search_window_exhausted===true).length,near_zero_unresolved_word_count:g.words.filter(w=>w.unresolved===true&&String(w.unresolved_reason||'').startsWith('final_window_below_evidence_floor')).length,expansion_policy_version:Number(alignment.expansion_policy_version||0),max_expansion_ms:Math.max(0,...g.words.map(w=>Math.max(Number(w.expansion_lead_ms||0),Number(w.expansion_trail_ms||0)))),max_alignment_pass:Math.max(0,...g.words.map(w=>Number(w.alignment_pass||0)))},
+unresolved_cleared_words:g.words.map((w,wordIndex)=>({w,wordIndex})).filter(({w})=>w.unresolved_cleared===true).slice(0,100).map(({w,wordIndex})=>({text:String(w.text||''),word_index:wordIndex,provider_start_ms:Number(w.provider_word.start_ms),provider_end_ms:Number(w.provider_word.end_ms),aligned_start_ms:w.prior_start_ms??Number(w.start_ms),aligned_end_ms:w.prior_end_ms??Number(w.end_ms),display_start_ms:Number(w.start_ms),display_end_ms:Number(w.end_ms),cleared_reason:String(w.unresolved_cleared_reason||''),prior_unresolved_reason:String(w.unresolved_prior_reason||''),
+// The policy that produced THIS withdrawal, pinned on the entry rather than left to
+// be inferred from the run's report. A withdrawal is the one decision that makes a
+// delivered line less blocked, so "which rule set cleared this word?" must be
+// answerable from the entry alone, even years later against a moved policy.
+policy_version:TIMELINE_INTEGRITY_POLICY_VERSION,
+arbitration_reason:String(w.arbitration_reason||''),capture_restored:w.capture_restored===true})),unresolved_cleared_word_count:g.words.filter(w=>w.unresolved_cleared===true).length,search_window_exhausted_word_count:g.words.filter(w=>w.search_window_exhausted===true).length,near_zero_unresolved_word_count:g.words.filter(w=>w.unresolved===true&&String(w.unresolved_reason||'').startsWith('final_window_below_evidence_floor')).length,expansion_policy_version:Number(alignment.expansion_policy_version||0),max_expansion_ms:Math.max(0,...g.words.map(w=>Math.max(Number(w.expansion_lead_ms||0),Number(w.expansion_trail_ms||0)))),max_alignment_pass:Math.max(0,...g.words.map(w=>Number(w.alignment_pass||0)))},
 // The VALIDATED word span this row's final boundary is derived from, plus the
 // provider's own segment boundary as evidence beside it. The provider boundary is
 // supplied ONLY when this row is the sole group of its source segment \u2014 a split
