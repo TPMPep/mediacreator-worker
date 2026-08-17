@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-08-17f-r2-diarization-single-flight-stand-down';
+export const BUILD_TAG = '2026-08-17f-r3-stand-down-contract-module';
