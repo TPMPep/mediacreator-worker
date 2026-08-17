@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-08-17d-r2-clearance-evidence-reconciliation-per-word-policy-pin-timeline-integrity-v6-segstate-v4';
+export const BUILD_TAG = '2026-08-17f-r2-diarization-single-flight-stand-down';
