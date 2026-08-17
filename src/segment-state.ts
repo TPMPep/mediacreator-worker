@@ -50,7 +50,11 @@
 // a choice rather than a measurement — and a covered word previously made the row
 // VALIDATED with no signal to the operator. See speaker-islands.ts for the
 // multi-signal rule; a row only reaches here already judged, never on duration.
-export const SEGMENT_STATE_POLICY_VERSION = 3;
+// v4 recognises the reconciliation clearance (timeline-integrity policy v6) as a
+// disclosed system override. A row whose earlier quarantine was withdrawn on
+// evidence is deliverable, but it is NOT untouched: the system replaced or
+// corroborated a timing and must say so in the state an operator reads.
+export const SEGMENT_STATE_POLICY_VERSION = 4;
 
 export type SegmentState =
   | 'VALIDATED'
@@ -93,6 +97,15 @@ export type SegmentStateInput = {
   speaker_island_in_overlap?: boolean;
   /** Plain-English reason supplied by the island rule, naming the favoured speaker. */
   speaker_island_reason?: string;
+  /**
+   * [Reconciliation, policy v4] Words on this row whose engine-set unresolved
+   * verdict a later stage provably resolved (an implausible aligned window replaced
+   * by the provider's credible capture, or a brief window the provider
+   * independently corroborated). Never reduces a quarantine on its own — the row's
+   * remaining unresolved counts still decide that — but it does mean the delivered
+   * timing carries a disclosed correction, so the row is VALIDATED_WITH_OVERRIDE.
+   */
+  unresolved_cleared_word_count?: number;
   /** Disclosed, already-applied system decisions. */
   capture_restored?: boolean;
   provider_timing_rejected?: boolean;
@@ -179,6 +192,7 @@ export function deriveSegmentState(row: SegmentStateInput): SegmentStateVerdict 
   if (row.provider_timing_rejected === true) overrides.push("the transcriber's timing was overruled as physically impossible");
   if (row.capture_restored === true) overrides.push("the audio check's timing was replaced by the transcriber's measured window");
   if (row.onset_reconstructed === true) overrides.push('a word start was pulled forward out of untranscribed audio');
+  if (count(row.unresolved_cleared_word_count) > 0) overrides.push(`${count(row.unresolved_cleared_word_count)} word(s) the aligner could not place credibly were resolved from the transcriber's own measurement`);
   if (count(row.alignment_expansion_ms) > 0) overrides.push(`the audio search was extended ${count(row.alignment_expansion_ms)}ms beyond the transcriber's segment boundary`);
   if (row.boundary_source === 'validated_words') overrides.push('the segment boundary was re-derived from the validated words');
 
