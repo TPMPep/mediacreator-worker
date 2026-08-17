@@ -14,4 +14,4 @@
 // tag on the evidence row proves which code actually produced that row.
 // =============================================================================
 
-export const BUILD_TAG = '2026-08-16-timeline-integrity-v6-unresolved-reconciliation-v34-segstate-policy4';
+export const BUILD_TAG = '2026-08-17-timeline-integrity-v6-segstate-v4-island-v2-alignment-policy-passthrough';
