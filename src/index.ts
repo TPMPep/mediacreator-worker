@@ -520,8 +520,31 @@ async function getAlignmentHealth() {
   if (!env.ALIGNMENT_ENGINE_URL) return { configured: false, ready: false, build_tag: null };
   try {
     const response = await fetch(`${env.ALIGNMENT_ENGINE_URL.replace(/\/$/, '')}/health`, { signal: AbortSignal.timeout(3000) });
-    const body = await response.json() as { ready?: boolean; build_tag?: string; provider?: string };
-    return { configured: true, ready: response.ok && body.ready === true, build_tag: body.build_tag || null, provider: body.provider || null };
+    const body = await response.json() as {
+      ready?: boolean; build_tag?: string; provider?: string;
+      expansion_policy_version?: number; max_expansion_passes?: number; edge_padding_ms?: number;
+    };
+    return {
+      configured: true,
+      ready: response.ok && body.ready === true,
+      build_tag: body.build_tag || null,
+      provider: body.provider || null,
+      // POLICY PASSTHROUGH. The engine's own /health already publishes these, but
+      // this worker was dropping them — so the ONE number the transcript evidence
+      // pins as provenance (expansion_policy_version, stamped on every
+      // TranscriptAlignmentEvidence row) was not observable from the deployed
+      // stack at all. "Which expansion policy is actually running?" had to be
+      // inferred from a build-tag string, and an inferred policy version is a
+      // guess that happens to be checkable — the exact failure class this
+      // evidence chain exists to remove. Surfacing it here makes the deployed
+      // value provable before a refinement is ever enqueued. SOC 2 CC8.1.
+      expansion_policy_version: Number.isFinite(Number(body.expansion_policy_version))
+        ? Number(body.expansion_policy_version) : null,
+      max_expansion_passes: Number.isFinite(Number(body.max_expansion_passes))
+        ? Number(body.max_expansion_passes) : null,
+      edge_padding_ms: Number.isFinite(Number(body.edge_padding_ms))
+        ? Number(body.edge_padding_ms) : null,
+    };
   } catch (error) {
     return { configured: true, ready: false, build_tag: null, error: String((error as Error)?.message || error).slice(0, 200) };
   }
