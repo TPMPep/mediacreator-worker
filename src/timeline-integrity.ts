@@ -101,7 +101,21 @@
 // v5 therefore adds a SECOND, independent bound derived from evidence about THIS
 // word (see evidenceCeilingMs) and applies whichever is tighter. The shared
 // shaping constants are unchanged — this bound lives only in arbitration.
-export const TIMELINE_INTEGRITY_POLICY_VERSION = 5;
+// v6 adds the RECONCILIATION PASS. The alignment engine decides a word is
+// unresolved by judging its ALIGNED window alone, and it does so BEFORE Stage-0
+// arbitration and final acceptance — the two stages that exist to settle exactly
+// those disputes. Nothing then reconciled the earlier verdict, so a word whose
+// dispute was resolved on evidence (its implausible aligned window replaced by a
+// credible provider capture, or its brief window independently corroborated by
+// the provider) still shipped as "could not be placed in the audio". Measured on
+// a real 56-line programme that was 15 of 20 quarantined rows — a review queue
+// three quarters false positive, which trains an operator to ignore it. This is
+// the same false-positive class the report already refuses to raise in the mirror
+// direction (a rejected provider capture is deliberately NOT flagged as a
+// defect); v6 applies that principle to the restore direction too. No threshold
+// moves, no repair changes: the pass only decides what may stop being called
+// unresolved, and every clearance is disclosed on the word and the row.
+export const TIMELINE_INTEGRITY_POLICY_VERSION = 6;
 
 // Below this, an overlap is boundary rounding between two adjacent same-speaker
 // groups and is safe to repair deterministically.
@@ -210,6 +224,15 @@ export type AlignedWord = {
   capture_divergence_ms?: number;
   provider_timing_rejected?: boolean;
   provider_timing_rejected_ms?: number;
+  /**
+   * [Policy v6] A later stage provably RESOLVED the dispute the engine flagged on
+   * this word, so its unresolved verdict was cleared. Disclosed, never silent: the
+   * clearance carries its own reason and the engine reason it replaced, so an
+   * auditor can recompute the decision from the word alone.
+   */
+  unresolved_cleared?: boolean;
+  unresolved_cleared_reason?: string;
+  unresolved_prior_reason?: string;
   alignment_collapsed?: boolean;
   /** Engine could not place this word after bounded expansion — quarantine, never fallback. */
   unresolved?: boolean;
@@ -316,6 +339,120 @@ export function assertFinalWordAcceptance(
       unresolved_reason: 'final_window_below_evidence_floor_uncorroborated',
     };
   });
+  return { words: out, report };
+}
+
+/**
+ * The DEGENERATE window scale — below this a window is not a short measurement,
+ * it is the absence of one (the 1ms artifact a collapsed aligner returns).
+ *
+ * DERIVED from the two constants already in force rather than introduced as a new
+ * threshold: the evidence floor divided by the same safety factor arbitration
+ * uses everywhere else. It exists because corroboration alone cannot separate a
+ * genuinely clipped function word from a collapse artifact: a 1ms word whose
+ * provider capture is 80ms satisfies the corroboration relation exactly as a 39ms
+ * word whose capture is 80ms does, and clearing the first would quietly launder a
+ * collapse into a validated timing. Collapse handling itself is untouched.
+ */
+export const DEGENERATE_WINDOW_MS = MIN_PLAUSIBLE_WORD_MS / WORD_DURATION_SAFETY_FACTOR;
+
+export type UnresolvedReconciliationReport = {
+  unresolved_cleared_words: number;
+  unresolved_cleared_rows: number;
+  cleared_by_restore: number;
+  cleared_by_corroboration: number;
+  cleared_keys: string[];
+};
+
+/**
+ * RECONCILIATION — the pass that stops the system re-reporting a dispute it has
+ * already settled. Runs LAST, after arbitration, the onset clamp and final
+ * acceptance, on the exact timeline that will be persisted.
+ *
+ * It never changes a timing and it never clears anything on its own authority. A
+ * word's engine-set unresolved verdict is withdrawn only where a later stage
+ * PROVABLY resolved that same word, by one of exactly two routes:
+ *
+ *   1. CAPTURE RESTORE — Stage-0 replaced the implausible aligned window with the
+ *      provider's measured capture, and the substituted window is itself a
+ *      possible utterance of this word's own text (judged against the rate bound
+ *      only, because a measurement must not bound itself). The dispute the engine
+ *      raised is precisely the dispute that substitution answered.
+ *   2. PROVIDER CORROBORATION — final acceptance explicitly classified the word
+ *      near-zero CORROBORATED, i.e. the provider timeline independently reports a
+ *      comparably brief word. Its own rule already accepts these as real speech.
+ *
+ * Nothing else is ever cleared. A zero-width window, an uncorroborated sub-floor
+ * window, an exhausted search region, a collapse stack, a degenerate window and a
+ * genuine two-timeline disagreement all remain unresolved and export-blocking —
+ * those are the cases where no evidence resolved anything, and quarantining them
+ * is the system working.
+ *
+ * SOC 2 CC7.4 / CC8.1 — every clearance is recorded on the word (reason + the
+ * engine reason it replaced) and counted on the row and the run, so the row lands
+ * in VALIDATED_WITH_OVERRIDE rather than VALIDATED: the system made a correction
+ * and must say so at delivery time, not only in a log.
+ */
+export function reconcileResolvedUnresolvedWords(
+  words: AlignedWord[],
+  providerByKey: Map<string, ProviderWindow>,
+  acceptance?: FinalAcceptanceReport,
+): { words: AlignedWord[]; report: UnresolvedReconciliationReport } {
+  const corroborated = new Set((acceptance?.near_zero_corroborated_keys || []).map(String));
+  const report: UnresolvedReconciliationReport = {
+    unresolved_cleared_words: 0,
+    unresolved_cleared_rows: 0,
+    cleared_by_restore: 0,
+    cleared_by_corroboration: 0,
+    cleared_keys: [],
+  };
+  const rowsTouched = new Set<string>();
+  const out = (words || []).map((word) => {
+    if (word.unresolved !== true) return word;
+
+    // ── Never eligible, whatever else is true of the word ──────────────────────
+    if (word.alignment_collapsed === true) return word;
+    if (word.search_window_exhausted === true) return word;
+    const priorReason = String(word.unresolved_reason || '');
+    if (priorReason.startsWith('search_region_exhausted')) return word;
+    if (priorReason === 'zero_width_final_window') return word;
+    if (priorReason.startsWith('final_window_below_evidence_floor')) return word;
+    if (priorReason === 'alignment_collapse_no_usable_window') return word;
+
+    const start = Number(word.start_ms);
+    const end = Number(word.end_ms);
+    const duration = end - start;
+    if (!Number.isFinite(duration) || duration < DEGENERATE_WINDOW_MS) return word;
+
+    const provider = providerByKey.get(String(word.key)) || null;
+    const providerDuration = provider ? Number(provider.end_ms) - Number(provider.start_ms) : null;
+
+    let clearance = '';
+    if (word.capture_restored === true && windowPlausible(word.text, start, end)) {
+      clearance = 'resolved_by_capture_restore';
+    } else if (corroborated.has(String(word.key)) && providerDuration !== null && providerDuration > 0) {
+      clearance = 'resolved_by_provider_corroboration';
+    }
+    if (!clearance) return word;
+
+    report.unresolved_cleared_words += 1;
+    if (clearance === 'resolved_by_capture_restore') report.cleared_by_restore += 1;
+    else report.cleared_by_corroboration += 1;
+    if (report.cleared_keys.length < 200) report.cleared_keys.push(String(word.key));
+    const key = String(word.key);
+    const cut = key.lastIndexOf(':');
+    rowsTouched.add(cut > 0 ? key.slice(0, cut) : key);
+
+    return {
+      ...word,
+      unresolved: false,
+      unresolved_reason: '',
+      unresolved_cleared: true,
+      unresolved_cleared_reason: clearance,
+      unresolved_prior_reason: priorReason || String(word.arbitration_reason || ''),
+    };
+  });
+  report.unresolved_cleared_rows = rowsTouched.size;
   return { words: out, report };
 }
 
@@ -730,6 +867,10 @@ export type IntegrityReport = {
   near_zero_words: number;
   near_zero_corroborated_words: number;
   near_zero_unresolved_words: number;
+  /** [Policy v6] Words whose engine-set unresolved verdict a later stage resolved. */
+  unresolved_cleared_words: number;
+  /** [Policy v6] Distinct rows carrying at least one such cleared word. */
+  unresolved_cleared_rows: number;
   defect_sequences: number[];
 };
 
@@ -810,6 +951,7 @@ export function auditTimelineIntegrity(
   onsetRepair?: OnsetRepairReport,
   captureRestore?: CaptureRestoreReport,
   acceptance?: FinalAcceptanceReport,
+  reconciliation?: UnresolvedReconciliationReport,
 ): IntegrityReport {
   const report: IntegrityReport = {
     policy_version: TIMELINE_INTEGRITY_POLICY_VERSION,
@@ -839,6 +981,12 @@ export function auditTimelineIntegrity(
     near_zero_words: acceptance?.near_zero_words || 0,
     near_zero_corroborated_words: acceptance?.near_zero_corroborated_words || 0,
     near_zero_unresolved_words: acceptance?.near_zero_unresolved_words || 0,
+    // Policy v6 reconciliation. Held as its own counters because "we withdrew an
+    // earlier quarantine on evidence" is a distinct fact from every repair and
+    // every defect: a rising value means the engine and the arbitration stages are
+    // disagreeing more often, which is an upstream signal, not a delivery risk.
+    unresolved_cleared_words: reconciliation?.unresolved_cleared_words || 0,
+    unresolved_cleared_rows: reconciliation?.unresolved_cleared_rows || 0,
     defect_sequences: [],
   };
 
