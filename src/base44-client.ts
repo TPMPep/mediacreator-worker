@@ -63,76 +63,14 @@ export class WorkerLockLostError extends Error {
   }
 }
 
-/**
- * Distinctive error thrown when a Base44 function answers HTTP 409 with an
- * explicit `{ stand_down: true }` — an INTENTIONAL, EXPECTED outcome, not a
- * failure.
- *
- * WHY THIS CLASS EXISTS (incident 2026-08-17, project 6a7c9797e3e4026fabd4c592).
- * Speaker refinement is now single-flight per PROJECT: exactly one run may stage
- * rows or cut a transcript over, and every other contender is told to stand down.
- * A losing run is the guard WORKING. Without a distinct class, that answer looks
- * to the worker exactly like a server error: the job burns its full BullMQ retry
- * budget re-asking a question already settled, `terminal_failure` fires and marks
- * the run failed with an error message, and the operator sees five "failed"
- * refinements where the truthful record is "one ran, four correctly declined".
- *
- * THE DISTINCTION IS DELIBERATELY NARROW. Only a 409 carrying an explicit
- * `stand_down: true` is treated this way. Every other 409 — a genuine conflict
- * such as a per-segment re-transcribe already in flight, or a cost-quota refusal
- * — keeps its ordinary `HTTP 409` error shape and its normal retry/failure
- * handling. Suppressing real conflicts by status code alone would trade one
- * silent failure for another.
- *
- * NOTHING IS MUTATED on this path: the losing run must never release, reclaim or
- * modify the winning run's claim, so the stand-down is a pure early exit.
- *
- * SOC 2 CC7.2 — an intentional concurrency refusal is recorded as such and is
- * distinguishable from an infrastructure failure; CC8.1 — the incumbent run that
- * owns the claim is named in the record.
- */
-export class WorkerStandDownError extends Error {
-  readonly standDown = true as const;
-  readonly incumbentRunId: string | null;
-  readonly refusedOperation: string | null;
-  readonly detail: string;
-  constructor(fn: string, info: StandDownInfo) {
-    super(`base44 ${fn} → stand down: ${info.message || 'another run owns the project claim'}`);
-    this.name = 'WorkerStandDownError';
-    this.incumbentRunId = info.incumbent_run_id ?? null;
-    this.refusedOperation = info.operation ?? null;
-    this.detail = info.message || '';
-  }
-}
-
-export interface StandDownInfo {
-  message?: string;
-  incumbent_run_id?: string | null;
-  operation?: string | null;
-}
-
-/**
- * Classify a non-OK response as an intentional stand-down.
- *
- * Requires BOTH the 409 status AND an explicit boolean-true `stand_down` field in
- * a JSON body. A body that merely mentions the words, a string `"true"`, or a 409
- * without the field is NOT a stand-down — it is a real conflict and must
- * propagate. Returns the incumbent run id when the function supplied one so the
- * worker's record names who actually owns the project.
- */
-export function parseStandDown(status: number, body: string): StandDownInfo | null {
-  if (status !== 409) return null;
-  let parsed: unknown;
-  try { parsed = JSON.parse(body); } catch { return null; }
-  if (!parsed || typeof parsed !== 'object') return null;
-  const row = parsed as Record<string, unknown>;
-  if (row.stand_down !== true) return null;
-  return {
-    message: typeof row.message === 'string' ? row.message : (typeof row.error === 'string' ? row.error : ''),
-    incumbent_run_id: typeof row.incumbent_run_id === 'string' ? row.incumbent_run_id : null,
-    operation: typeof row.operation === 'string' ? row.operation : null,
-  };
-}
+// The stand-down wire contract lives in its own env-free module (./stand-down)
+// so it is verifiable in CI without Redis credentials — env.ts exits the process
+// on a missing UPSTASH_REDIS_REST_URL, which made the contract's regression suite
+// fail to load rather than run. Re-exported here so every existing import site is
+// unchanged and there is exactly ONE definition of the contract.
+export { WorkerStandDownError, parseStandDown } from './stand-down.js';
+export type { StandDownInfo } from './stand-down.js';
+import { parseStandDown, WorkerStandDownError } from './stand-down.js';
 
 // =============================================================================
 // PLATFORM GATEWAY 403 RESILIENCE LAYER
