@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-08-17f-r3-stand-down-contract-module';
+export const BUILD_TAG = '2026-08-19a-r1-policy-v8-symmetric-seam-clamp';
