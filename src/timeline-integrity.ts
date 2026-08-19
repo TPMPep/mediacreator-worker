@@ -115,7 +115,58 @@
 // defect); v6 applies that principle to the restore direction too. No threshold
 // moves, no repair changes: the pass only decides what may stop being called
 // unresolved, and every clearance is disclosed on the word and the row.
-export const TIMELINE_INTEGRITY_POLICY_VERSION = 6;
+// v7 makes the DISPUTE PREDICATE SYMMETRIC. Arbitration already judged an aligned
+// window that is too LONG against this word's own evidence and, where the provider
+// capture was a possible utterance, restored it. The mirror case — an aligned
+// window too SHORT to be a measurement at all, against a provider capture that IS
+// a possible utterance — was gated behind `providerDuration >= MIN_PLAUSIBLE_WORD_MS
+// * 3`, a bare multiplier rather than an evidence relation. That gate left a dead
+// zone no later stage could rescue: measured on a real 295-row programme, 53 words
+// across 46 rows (16% of the run, export-blocked) were unstressed function words
+// ("a", "I", "to", "of", "an") where the aligner returned a 10ms grid placeholder
+// while the transcriber measured an ordinary 64-97ms word. Too short for the
+// restore gate (needed >=120ms), too degenerate for reconciliation to clear
+// (below DEGENERATE_WINDOW_MS, and deliberately so — clearing a 10ms window would
+// launder an artifact into a validated timing). The dispute was resolvable on
+// evidence the whole time; nothing was resolving it, because the too-short
+// direction had no restore path. v7 gives it the SAME path the too-long direction
+// has always had, gated on the SAME relations (windowPlausible for the provider
+// window, nearZeroCorroborated for the agreement case), and REMOVES the x3
+// multiplier — a net reduction in unexplained constants, not an addition. No
+// threshold moves. Collapse, exhausted-search, zero-width-without-a-plausible-
+// provider-window and genuine two-timeline disagreement are all untouched, and a
+// restored word still lands in VALIDATED_WITH_OVERRIDE via the existing
+// capture_restored + unresolved_cleared disclosure — never silently VALIDATED.
+// v8 makes the SEAM CLAMP SYMMETRIC. Stage 0 substitutes a provider window only if
+// the run still fits between the last accepted aligned word and the next one, and
+// it already tolerates the LEADING edge arriving a few ms early — the two timelines
+// round their shared boundary differently, so refusing a whole repair over that
+// would discard a correct substitution on an artifact nobody can hear. That
+// tolerance was never applied to the TRAILING edge, which was a hard refusal, and
+// the asymmetry had no justification: the same rounding produces the same overrun
+// at the other end of the window. Ground truth, project 6a85757eb3fb1626eb1fea43
+// row 29 ("The Ministry's going to have..."): the aligner returned a 39ms grid
+// placeholder for the reduced "to" in "going to have", the transcriber measured an
+// ordinary 120ms word, arbitration correctly judged the dispute resolvable — and
+// then refused the substitution because the provider capture ends at 94,960ms
+// while the next accepted word begins at 94,949ms. An 11ms overrun, 23 times
+// smaller than the tolerance the leading edge is granted, export-blocked a line
+// whose timing both timelines agreed on to within 10ms at the start. v8 clamps the
+// trailing edge within the SAME AUTO_REPAIR_CEILING_MS, re-checks that every
+// clamped window is still a possible utterance and still chronologically ordered,
+// and refuses anything larger as a genuine conflict. No threshold moves and no new
+// constant is introduced — the module's own documented rounding tolerance is simply
+// applied at both ends. It is deliberately NOT a new clearance route: the word gets
+// a real measured window rather than being declared valid at 39ms, so the existing
+// capture_restored disclosure carries it to VALIDATED_WITH_OVERRIDE. Verified
+// non-permissive against the sibling defect on the same asset (row 17's spurious
+// "place", whose leading seam conflict is 349ms) — that row stays blocked.
+// v8 also fixes an AUDIT-HONESTY defect v7 introduced: the restore branch hardcoded
+// 'aligned_window_inflated_beyond_evidence', so a DEFLATION restore recorded that
+// the aligned window was too long when it was too short. The reason is now
+// direction-aware; an audit field that states the opposite of what happened is
+// worse than no field.
+export const TIMELINE_INTEGRITY_POLICY_VERSION = 8;
 
 // Below this, an overlap is boundary rounding between two adjacent same-speaker
 // groups and is safe to repair deterministically.
@@ -571,7 +622,39 @@ export function restoreDivergedCaptures(
     // duration against evidence is what makes the class detectable at all.
     if (alignedDuration > evidenceCeilingMs(word.text, providerDuration)) return true;
     if (providerDuration === null) return false;
-    return alignedDuration < MIN_PLAUSIBLE_WORD_MS && providerDuration >= MIN_PLAUSIBLE_WORD_MS * 3;
+    if (alignedDuration >= MIN_PLAUSIBLE_WORD_MS) return false;
+    // Malformed (negative) window — not a dispute between two measurements.
+    if (alignedDuration < 0) return false;
+
+    // DEFLATION [policy v7] — the exact mirror of the inflation rule above.
+    //
+    // A sub-floor aligned window is only a DISPUTE when there is something to
+    // dispute it WITH: the provider's window must itself be a possible utterance
+    // of this word's own text, judged by the same windowPlausible relation Stage 0
+    // already uses on the provider run (rate bound only — a measurement cannot
+    // bound itself). Where the provider offers nothing plausible, no substitution
+    // exists, the word is NOT disputed, and it stays on the quarantine path
+    // exactly as before.
+    const provider = providerAt(index);
+    if (!provider || !windowPlausible(word.text, provider.start_ms, provider.end_ms)) return false;
+
+    // Two cases, both decided on relations already in force:
+    //
+    // 1. DEGENERATE aligned window — below DEGENERATE_WINDOW_MS the window is not
+    //    a short measurement, it is the absence of one (the 10ms grid placeholder
+    //    the aligner returns for an unstressed monosyllable, or a 1ms artifact).
+    //    A plausible provider capture is strictly better evidence than an absence,
+    //    so the dispute is real and Stage 0 arbitrates it.
+    if (alignedDuration < DEGENERATE_WINDOW_MS) return true;
+
+    // 2. SUB-FLOOR but not degenerate — a dispute only when the provider does NOT
+    //    corroborate it as a genuinely brief word. This is what preserves the
+    //    anti-noise rule the x3 multiplier was reaching for: a 39ms "to" against a
+    //    97ms capture is corroborated (a 58ms difference nobody can hear), stays
+    //    undisputed, and is accepted by final acceptance as real speech. Only where
+    //    the two timelines genuinely disagree about whether speech occurred does
+    //    the word reach arbitration.
+    return !nearZeroCorroborated(providerDuration);
   };
 
   const out: AlignedWord[] = [];
@@ -631,11 +714,29 @@ export function restoreDivergedCaptures(
       for (let offset = 1; offset < windows.length && providerPlausible; offset++) {
         if (windows[offset].start_ms < windows[offset - 1].end_ms) providerPlausible = false;
       }
-      // Every clamped window must still be a possible utterance, and the run must
-      // still fit before the next accepted aligned word.
+      // TRAILING SEAM [policy v8] — the exact mirror of the leading clamp above,
+      // and for the identical reason: the two timelines round their shared boundary
+      // differently at BOTH edges of a window. Granting the tolerance at one end
+      // and refusing at the other discarded correct repairs on an inaudible
+      // artifact (an 11ms overrun on the ground-truth case). Same ceiling, same
+      // meaning — beyond it, this is a real chronology conflict and the run is
+      // refused rather than forced.
+      if (providerPlausible) {
+        const last = windows.length - 1;
+        const tailOverrun = Number.isFinite(nextAlignedStart) ? windows[last].end_ms - nextAlignedStart : 0;
+        if (tailOverrun > 0) {
+          if (tailOverrun <= AUTO_REPAIR_CEILING_MS) windows[last].end_ms = nextAlignedStart;
+          else providerPlausible = false;
+        }
+      }
+      // Every clamped window must STILL be a possible utterance, the run must still
+      // be internally ordered after both clamps, and it must still fit before the
+      // next accepted aligned word. A clamp that leaves a window sub-floor is not a
+      // repair, so it is refused here rather than persisted as a validated timing.
       if (providerPlausible) {
         const fits = windows.every((window, offset) => windowPlausible(run[offset].text, window.start_ms, window.end_ms));
-        if (!fits || windows[windows.length - 1].end_ms > nextAlignedStart) providerPlausible = false;
+        const ordered = windows.every((window, offset) => offset === 0 || window.start_ms >= windows[offset - 1].end_ms);
+        if (!fits || !ordered || windows[windows.length - 1].end_ms > nextAlignedStart) providerPlausible = false;
       }
       if (providerPlausible) providerWindows = windows;
     }
@@ -661,7 +762,15 @@ export function restoreDivergedCaptures(
           end_ms: Number(provider.end_ms),
           capture_restored: true,
           capture_divergence_ms: divergence,
-          arbitration_reason: 'aligned_window_inflated_beyond_evidence',
+          // DIRECTION-AWARE [policy v8]. v7 gave the too-short direction a restore
+          // path but left this label hardcoded to the too-long one, so a deflation
+          // restore recorded that the aligned window was inflated beyond evidence —
+          // the exact opposite of what happened. An audit field that misstates its
+          // own decision is worse than an absent one, so the reason now follows the
+          // aligned duration that was actually replaced.
+          arbitration_reason: Number(word.end_ms) - Number(word.start_ms) < MIN_PLAUSIBLE_WORD_MS
+            ? 'aligned_window_below_evidence_floor'
+            : 'aligned_window_inflated_beyond_evidence',
           arbitration_ceiling_ms: evidenceCeilingMs(word.text, providerDuration),
           arbitration_provider_duration_ms: providerDuration,
           arbitration_aligned_duration_ms: Math.round(Number(word.end_ms) - Number(word.start_ms)),
