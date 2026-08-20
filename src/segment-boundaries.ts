@@ -72,7 +72,18 @@ export const NEIGHBOUR_GAP_SHARE = 0.5;
  */
 export const BOUNDARY_STABILITY_EPSILON_MS = 150;
 
-export type BoundaryWord = { start_ms: number; end_ms: number };
+export type BoundaryWord = {
+  start_ms: number;
+  end_ms: number;
+  /**
+   * TRUE when the pipeline judged this word unplaceable (see the alignment
+   * engine's verdict plus the policy-v6 reconciliation). Such a word is NOT
+   * validated timing and is therefore excluded from the authoritative core —
+   * see coreOf(). Carried here because the core cannot honour its own contract
+   * without knowing which words were actually validated.
+   */
+  unresolved?: boolean;
+};
 
 export type BoundaryRow = {
   start_ms: number;
@@ -120,6 +131,22 @@ export type BoundaryReport = {
    */
   rows_authored_preserved: number;
   /**
+   * Rows that DO carry measured words but not one validated one, so no core
+   * could be formed and the window was taken from preserved evidence instead of
+   * derived from the unplaceable positions. Counted separately from music and
+   * authored rows because the cause is different in kind: this is a dialogue row
+   * whose alignment failed outright, and it is always quarantined
+   * UNRESOLVED_TIMING. A rising value is a measurement of alignment quality
+   * upstream, not of this stage.
+   */
+  rows_unresolved_preserved: number;
+  /**
+   * Rows in that state whose window was recovered from the PROVIDER's own
+   * segment boundary (real preserved measurement) rather than merely left at the
+   * unplaceable positions the grouping stage had put on the row.
+   */
+  rows_unresolved_provider_recovered: number;
+  /**
    * Rows whose provider boundary cut INSIDE their own validated words — the
    * defect class this module removes. Line 18 is one of these. A non-zero value
    * is a measurement of upstream segmentation quality, not of this stage.
@@ -135,12 +162,39 @@ const finite = (value: unknown): number | null => {
   return Number.isFinite(n) ? n : null;
 };
 
-/** first-to-last validated word span — the authoritative core of the segment. */
+/** Does this row carry any measured word evidence at all (resolved or not)? */
+function hasWords(row: BoundaryRow): boolean {
+  return (row._boundary_words || []).length > 0;
+}
+
+/**
+ * first-to-last VALIDATED word span — the authoritative core of the segment.
+ *
+ * UNRESOLVED WORDS ARE EXCLUDED. This is the contract stated at the top of this
+ * module ("FIRST-TO-LAST VALIDATED WORD"), and until 2026-08-20 the
+ * implementation did not honour it: every word was folded in regardless of its
+ * verdict, so a word the pipeline had *just declared unplaceable* became the
+ * authority for the segment's window.
+ *
+ * GROUND TRUTH (project 6a85757eb3fb1626eb1fea43, run 6a8621e09fe756d206e5fd25):
+ * on row 5 the aligner stacked all three words of "Things at Hogwarts?" onto
+ * 30139->30140 and flagged all three unresolved. That 1ms stack became the core,
+ * padding was added around it, and the row shipped a 211ms window at 30129-30340
+ * for a line the transcriber had measured at 29497-29846 — a 632ms placement
+ * error and a physically impossible 90 cps. Row 43 failed identically. The
+ * structural invariant below could not catch it, because a 1ms core is trivially
+ * contained by any window, and the provider-stability escape hatch could not
+ * rescue it either, because the 632ms disagreement exceeds the epsilon.
+ *
+ * A row with no validated words therefore has NO core, and the caller must fall
+ * back to preserved evidence rather than derive a window from a collapse stack.
+ */
 function coreOf(row: BoundaryRow): { start: number; end: number } | null {
   const words = row._boundary_words || [];
   let start = Infinity;
   let end = -Infinity;
   for (const word of words) {
+    if (word?.unresolved === true) continue;
     const s = finite(word?.start_ms);
     const e = finite(word?.end_ms);
     if (s === null || e === null) continue;
@@ -172,6 +226,8 @@ export function deriveSegmentBoundaries(
     rows_stable: 0,
     rows_music_preserved: 0,
     rows_authored_preserved: 0,
+    rows_unresolved_preserved: 0,
+    rows_unresolved_provider_recovered: 0,
     provider_contradictions_prevented: 0,
     worst_extension_ms: 0,
     worst_reduction_ms: 0,
@@ -199,6 +255,47 @@ export function deriveSegmentBoundaries(
     const row = list[index];
     const core = cores[index];
     row.boundary_policy_version = BOUNDARY_POLICY_VERSION;
+
+    if (!core && hasWords(row)) {
+      // MEASURED WORDS EXIST, BUT NOT ONE OF THEM IS VALIDATED. This is the
+      // alignment-collapse case, and it is emphatically NOT the music/authored
+      // case below: this row is dialogue, words were measured for it, and the
+      // aligner simply could not place any of them. Deriving a window from those
+      // positions is what produced the 632ms placement error described on
+      // coreOf(), so nothing here is derived from them.
+      //
+      // THE PROVIDER'S SEGMENT BOUNDARY IS PREFERRED, and it is evidence rather
+      // than a guess: it is the transcriber's own measurement, preserved
+      // untouched on the row precisely so it can answer this question. It is
+      // supplied only when the row corresponds 1:1 to one provider segment, so
+      // it can never be borrowed from a sibling of a split.
+      //
+      // Only when no comparable provider boundary exists is the incoming window
+      // left exactly as it arrived — that is the least-bad visible timing, and
+      // the row is quarantined either way, so it is never mistaken for proven.
+      const providerStart = finite(row.provider_boundary_start_ms);
+      const providerEnd = finite(row.provider_boundary_end_ms);
+      const recoverable = providerStart !== null && providerEnd !== null
+        && providerEnd > providerStart && providerStart >= 0;
+
+      const priorStart = finite(row.start_ms);
+      const priorEnd = finite(row.end_ms);
+      if (recoverable) {
+        row.start_ms = Math.round(providerStart);
+        row.end_ms = Math.round(providerEnd);
+        report.rows_unresolved_provider_recovered += 1;
+      }
+      row.boundary_source = 'unresolved_words_preserved';
+      // No padding is granted. Padding is earned from measured silence around a
+      // validated core, and there is no validated core here.
+      row.boundary_lead_in_ms = 0;
+      row.boundary_lead_out_ms = 0;
+      row.boundary_delta_start_ms = priorStart === null ? 0 : Math.round(Number(row.start_ms) - priorStart);
+      row.boundary_delta_end_ms = priorEnd === null ? 0 : Math.round(Number(row.end_ms) - priorEnd);
+      report.rows_unresolved_preserved += 1;
+      previousFinalEnd = finite(row.end_ms);
+      continue;
+    }
 
     if (!core) {
       // No validated words. Its window is not derived from speech, so there is
