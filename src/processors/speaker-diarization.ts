@@ -151,7 +151,11 @@ arbitration_reason:String(w.arbitration_reason||''),capture_restored:w.capture_r
 // provider's own segment boundary as evidence beside it. The provider boundary is
 // supplied ONLY when this row is the sole group of its source segment \u2014 a split
 // row has no comparable provider boundary, so it is always fully derived.
-_boundary_words:g.words.map(w=>({start_ms:Number(w.start_ms),end_ms:Number(w.end_ms)})),
+// Each word's VERDICT travels with its timing. deriveSegmentBoundaries forms the
+// authoritative core from VALIDATED words only, and it cannot honour that
+// contract if it cannot tell which words were validated — omitting this flag is
+// what let a collapse stack define a segment window (see segment-boundaries.ts).
+_boundary_words:g.words.map(w=>({start_ms:Number(w.start_ms),end_ms:Number(w.end_ms),unresolved:w.unresolved===true})),
 // Diarization cluster this row was attributed to. Derivation input for the
 // speaker-island rule's overlap evidence (turns are per cluster, rows per
 // speaker) — stripped before staging like every other transient field.
