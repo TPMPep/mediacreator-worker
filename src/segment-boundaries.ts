@@ -78,6 +78,14 @@ export type BoundaryRow = {
   start_ms: number;
   end_ms: number;
   is_music?: boolean;
+  /**
+   * [Text authority] This row's text is operator-authored and it has no measured
+   * words, so refinement carried it through unchanged. Set EXPLICITLY by the
+   * caller — never inferred from the absence of words — so 'authored_preserved'
+   * can only ever describe that deliberate decision and can never become a
+   * generic label for a row whose alignment simply produced nothing.
+   */
+  _authored_preserved?: boolean;
   /** Validated (arbitrated + clamped) word timings this row was grouped from. */
   _boundary_words?: BoundaryWord[];
   /**
@@ -103,6 +111,14 @@ export type BoundaryReport = {
   rows_derived: number;
   rows_stable: number;
   rows_music_preserved: number;
+  /**
+   * [Text authority] Rows whose operator-authored boundary was deliberately
+   * preserved because refinement had no measured word evidence to re-derive it
+   * from. Counted separately from music so the audit never conflates "a
+   * non-dialogue line has no words" with "a human wrote this line and we
+   * measured nothing".
+   */
+  rows_authored_preserved: number;
   /**
    * Rows whose provider boundary cut INSIDE their own validated words — the
    * defect class this module removes. Line 18 is one of these. A non-zero value
@@ -155,6 +171,7 @@ export function deriveSegmentBoundaries(
     rows_derived: 0,
     rows_stable: 0,
     rows_music_preserved: 0,
+    rows_authored_preserved: 0,
     provider_contradictions_prevented: 0,
     worst_extension_ms: 0,
     worst_reduction_ms: 0,
@@ -184,15 +201,25 @@ export function deriveSegmentBoundaries(
     row.boundary_policy_version = BOUNDARY_POLICY_VERSION;
 
     if (!core) {
-      // No validated words (music / non-dialogue). Its window is not derived
-      // from speech, so there is nothing here to re-derive — and inventing a
-      // boundary for it would be a claim the evidence does not support.
-      row.boundary_source = 'music_preserved';
+      // No validated words. Its window is not derived from speech, so there is
+      // nothing here to re-derive — and inventing a boundary for it would be a
+      // claim the evidence does not support.
+      //
+      // TWO DISTINCT CAUSES, LABELLED DISTINCTLY. A music/non-dialogue row has no
+      // words because it carries no speech. An AUTHORED row has no words because a
+      // human wrote its text and nothing was ever measured for it. Recording both
+      // as 'music_preserved' would put a false statement on a dialogue line's audit
+      // record, so the authored case gets its own value — and only ever when the
+      // caller set the flag explicitly, so it can never degrade into a fallback for
+      // missing or failed alignment on a machine-owned row.
+      const authored = row._authored_preserved === true && row.is_music !== true;
+      row.boundary_source = authored ? 'authored_preserved' : 'music_preserved';
       row.boundary_lead_in_ms = 0;
       row.boundary_lead_out_ms = 0;
       row.boundary_delta_start_ms = 0;
       row.boundary_delta_end_ms = 0;
-      report.rows_music_preserved += 1;
+      if (authored) report.rows_authored_preserved += 1;
+      else report.rows_music_preserved += 1;
       previousFinalEnd = finite(row.end_ms);
       continue;
     }
