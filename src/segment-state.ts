@@ -54,7 +54,20 @@
 // disclosed system override. A row whose earlier quarantine was withdrawn on
 // evidence is deliverable, but it is NOT untouched: the system replaced or
 // corroborated a timing and must say so in the state an operator reads.
-export const SEGMENT_STATE_POLICY_VERSION = 4;
+// v5 adds the two TEXT-AUTHORITY causes (see text-authority.ts). Both exist
+// because refinement must never silently replace human-authored text with
+// machine words, and honouring that leaves two facts a row must be able to state:
+//   • no_measured_words — an operator-authored line with NO provider word
+//     timings was carried through unchanged (nothing was measured, so nothing
+//     could be re-derived). Without this input such a row fell through every
+//     check and landed on VALIDATED — "words, timings, boundary and speaker all
+//     passed on evidence" — which is false for a row nothing was measured on.
+//     Fabricating an unplaced-word count to force a quarantine would be worse:
+//     it would claim the aligner failed on words that never existed.
+//   • speaker_span_unresolved — refinement heard more than one speaker inside an
+//     authoritative line and the line was kept whole rather than divided, so its
+//     attribution is a choice and not a measurement.
+export const SEGMENT_STATE_POLICY_VERSION = 5;
 
 export type SegmentState =
   | 'VALIDATED'
@@ -98,6 +111,24 @@ export type SegmentStateInput = {
   /** Plain-English reason supplied by the island rule, naming the favoured speaker. */
   speaker_island_reason?: string;
   /**
+   * [Text authority, policy v5] This row's text is operator-authored and it has
+   * NO provider word timings, so refinement carried its text, window, structure
+   * and boundary through unchanged. Nothing about its timing was verified against
+   * the audio, which is a different fact from "the aligner tried and failed" —
+   * hence its own input rather than a fabricated unplaced-word count. Never set
+   * on a music row (music makes no timing claim and is validated as such).
+   */
+  no_measured_words?: boolean;
+  /**
+   * [Text authority, policy v5] Refinement grouped this authoritative row's words
+   * into more than one speaker span, and the row was kept whole rather than
+   * divided (dividing operator-authored text means guessing which words belong to
+   * which speaker). The carried speaker is therefore not proven.
+   */
+  speaker_span_unresolved?: boolean;
+  /** Plain-English reason supplied with speaker_span_unresolved. */
+  speaker_span_reason?: string;
+  /**
    * [Reconciliation, policy v4] Words on this row whose engine-set unresolved
    * verdict a later stage provably resolved (an implausible aligned window replaced
    * by the provider's credible capture, or a brief window the provider
@@ -140,10 +171,16 @@ export function deriveSegmentState(row: SegmentStateInput): SegmentStateVerdict 
   const overlap = row.timing_defect === 'same_speaker_overlap';
   const divergence = row.timing_defect === 'provider_capture_divergence';
 
-  const unresolved_timing = unresolvedWords > 0 || exhaustedWords > 0 || nearZeroWords > 0
+  // An authoritative row carried through with nothing measured. Music is excluded
+  // defensively: a non-dialogue row makes no timing claim and is validated as
+  // such, so it must never be pulled into a timing quarantine by this input.
+  const noMeasuredWords = row.no_measured_words === true && row.is_music !== true;
+
+  const unresolved_timing = noMeasuredWords || unresolvedWords > 0 || exhaustedWords > 0 || nearZeroWords > 0
     || collapsed || overlap || divergence;
   const speakerIsland = row.speaker_island_in_overlap === true;
-  const unresolved_speaker = speakerUnresolved > 0 || speakerIsland;
+  const speakerSpan = row.speaker_span_unresolved === true;
+  const unresolved_speaker = speakerUnresolved > 0 || speakerIsland || speakerSpan;
 
   const verdict = (timing_state: SegmentState, timing_state_reason: string): SegmentStateVerdict => ({
     timing_state,
@@ -158,6 +195,9 @@ export function deriveSegmentState(row: SegmentStateInput): SegmentStateVerdict 
   }
 
   if (unresolved_timing) {
+    if (noMeasuredWords) {
+      return verdict('UNRESOLVED_TIMING', "This line's text was authored by an operator and has no measured word timings, so refinement carried its text, window and structure through unchanged. Its timing was not verified against the audio.");
+    }
     if (unresolvedWords > 0) {
       return verdict('UNRESOLVED_TIMING', `${unresolvedWords} word(s) could not be placed in the audio after bounded search expansion. The transcriber's timing is kept visible as fallback evidence only — it is not validated timing.`);
     }
@@ -179,6 +219,10 @@ export function deriveSegmentState(row: SegmentStateInput): SegmentStateVerdict 
   if (unresolved_speaker) {
     if (speakerUnresolved > 0) {
       return verdict('UNRESOLVED_SPEAKER', `No speaker turn covered ${speakerUnresolved} word(s) on this line, so its attribution was inherited from a neighbour rather than measured.`);
+    }
+    if (speakerSpan && !speakerIsland) {
+      return verdict('UNRESOLVED_SPEAKER', row.speaker_span_reason
+        || 'Refinement heard more than one speaker inside this operator-authored line. It was kept whole rather than divided, so its speaker attribution is not proven.');
     }
     return verdict('UNRESOLVED_SPEAKER', row.speaker_island_reason
       || 'Short speaker island inside overlapping speech; the surrounding evidence favors another speaker, so this attribution is not proven.');
