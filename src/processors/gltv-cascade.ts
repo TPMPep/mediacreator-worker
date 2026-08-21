@@ -51,7 +51,7 @@
 
 import type { Job, Queue } from 'bullmq';
 import type { GltvCascadeJobData } from '../../shared/queue-contracts.js';
-import { QUEUE_NAMES, GLTV_CASCADE_JOB_OPTIONS } from '../../shared/queue-contracts.js';
+import { QUEUE_NAMES, GLTV_CASCADE_JOB_OPTIONS, GLTV_CASCADE_JOB_ID } from '../../shared/queue-contracts.js';
 import { invokeBase44Function, logEvent, runWithLockHeartbeat, WorkerLockLostError } from '../base44-client.js';
 import { env } from '../env.js';
 
@@ -294,13 +294,18 @@ export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
         const renewed = !!step.next_auth_token;
         const nextAuthToken = step.next_auth_token || auth_token;
         const q = getQueue(QUEUE_NAMES.GLTV_CASCADE);
+        // D-3 single-flight: the deterministic per-job id means BullMQ collapses a
+        // duplicate add, so this self-re-enqueue can never race the producer or the
+        // watchdog into two concurrent deciders for one DubbingApiJob. Adding an
+        // existing id is a no-op that returns the incumbent job — which is exactly
+        // the desired outcome, so it is deliberately NOT treated as an error.
         await q.add(QUEUE_NAMES.GLTV_CASCADE, {
           schema_version: job.data.schema_version,
           dubbing_api_job_id,
           project_id,
           request_id,
           auth_token: nextAuthToken,
-        }, { ...GLTV_CASCADE_JOB_OPTIONS, delay: TICK_DELAY_MS });
+        }, { ...GLTV_CASCADE_JOB_OPTIONS, jobId: GLTV_CASCADE_JOB_ID(dubbing_api_job_id), delay: TICK_DELAY_MS });
 
         await _log('info', renewed ? 'gltv_cascade_auth_renewed' : 'gltv_cascade_next_tick_enqueued', {
           ...baseCtx, action: step.action, delay_ms: TICK_DELAY_MS, auth_token_renewed: renewed,
