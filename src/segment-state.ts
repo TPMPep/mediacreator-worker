@@ -177,6 +177,12 @@ export type SegmentStateVerdict = {
   segment_state_policy_version: number;
 };
 
+/**
+ * The reason used when a cross-row chronology conflict is the row's ONLY cause.
+ * Named so the note appended to every other cause cannot duplicate it.
+ */
+const CHRONOLOGY_REASON = 'This line and the line next to it are out of order — one of them begins before the line that precedes it. The two were timed from sources that disagree about their order, so nothing was moved: correcting it automatically would mean guessing which of the two is in the right place.';
+
 const count = (value: unknown): number => {
   const n = Number(value);
   return Number.isFinite(n) && n > 0 ? n : 0;
@@ -203,9 +209,21 @@ export function deriveSegmentState(row: SegmentStateInput): SegmentStateVerdict 
   const speakerSpan = row.speaker_span_unresolved === true;
   const unresolved_speaker = speakerUnresolved > 0 || speakerIsland || speakerSpan;
 
+  // A chronology conflict frequently coexists with a word-level cause (on project
+  // 6a85757eb3fb1626eb1fea43 rows 42 and 43 each ALSO carried unplaceable words).
+  // Precedence is unchanged — the word-level cause still wins and still decides the
+  // state — but the operator is told about the ordering problem as well, because a
+  // reason that mentions only the words would send them to re-transcribe a line
+  // whose real problem is that it sits in the wrong place.
+  const chronologyNote = chronologyConflict
+    ? ` This line is also out of order relative to the line next to it (by ${Math.round(Number(row.chronology_conflict_ms || 0))}ms); nothing was moved, because correcting that automatically would mean guessing which of the two is in the right place.`
+    : '';
+
   const verdict = (timing_state: SegmentState, timing_state_reason: string): SegmentStateVerdict => ({
     timing_state,
-    timing_state_reason,
+    timing_state_reason: (chronologyNote && timing_state === 'UNRESOLVED_TIMING' && timing_state_reason !== CHRONOLOGY_REASON)
+      ? `${timing_state_reason}${chronologyNote}`
+      : timing_state_reason,
     unresolved_timing,
     unresolved_speaker,
     segment_state_policy_version: SEGMENT_STATE_POLICY_VERSION,
@@ -235,7 +253,7 @@ export function deriveSegmentState(row: SegmentStateInput): SegmentStateVerdict 
       return verdict('UNRESOLVED_TIMING', 'This line and another line by the same speaker cover the same moment, so one of the two windows is wrong.');
     }
     if (chronologyConflict) {
-      return verdict('UNRESOLVED_TIMING', 'This line and the line next to it are out of order — one of them begins before the line that precedes it. The two were timed from sources that disagree about their order, so nothing was moved: correcting it automatically would mean guessing which of the two is in the right place.');
+      return verdict('UNRESOLVED_TIMING', CHRONOLOGY_REASON);
     }
     return verdict('UNRESOLVED_TIMING', "The transcriber's measurement and the audio check disagree beyond the trust threshold and neither could be accepted on evidence.");
   }
