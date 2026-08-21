@@ -1,8 +1,39 @@
+import { createHash } from 'node:crypto';
 import type { Job } from 'bullmq';
 import type { GltvMEExtractionJobData } from '../../shared/queue-contracts.js';
 import { invokeBase44Function, logEvent, runWithLockHeartbeat } from '../base44-client.js';
 
 const LONG_TIMEOUT_MS = 30 * 60 * 1000;
+
+/**
+ * A DETERMINISTIC RFC-4122 UUID derived from a seed string (SHA-256, with the
+ * version/variant bits set as UUIDv5 does).
+ *
+ * WHY NOT crypto.randomUUID(). LALAL.AI's idempotency_key exists so that a
+ * retried submit cannot start a SECOND billable split for the same source. A
+ * random key satisfies the format and destroys that guarantee: this job runs with
+ * BullMQ retries and a heartbeat-abort path, so a re-submit after a lock loss or a
+ * transient network failure is a routine event, and each one would buy another
+ * separation of the same audio.
+ *
+ * WHY NOT THE PLAIN STRING KEY EITHER. This is the defect being fixed. The submit
+ * sent `gltv-me-<dubbing_api_job_id>`, and LALAL.AI rejects it with HTTP 422
+ * (`uuid_parsing … invalid character: found 'g' at 1`), so the GLTV M&E path could
+ * never succeed at all: every recipe requesting 'standard' or 'high' fidelity
+ * reached the fail-closed M&E gate before the mixer and terminalised the job. It
+ * presented as an M&E failure, so nothing pointed at a malformed request field.
+ *
+ * A hash-derived UUID keeps both properties at once — a valid UUID for the
+ * provider, and the same value for the same split input forever.
+ */
+function deterministicUuid(seed: string): string {
+  const h = createHash('sha256').update(seed).digest();
+  const b = Buffer.from(h.subarray(0, 16));
+  b[6] = (b[6] & 0x0f) | 0x50; // version 5
+  b[8] = (b[8] & 0x3f) | 0x80; // RFC-4122 variant
+  const hex = b.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 
 type Inspect = { state: 'queued' | 'uploaded' | 'submitted' | 'ready' | 'failed'; source_id?: string | null };
 
@@ -17,7 +48,12 @@ async function uploadSource(job: GltvMEExtractionJobData, signal: AbortSignal) {
   return String(data.source_id);
 }
 async function startSplit(job: GltvMEExtractionJobData, sourceId: string, signal: AbortSignal) {
-  const response = await fetch('https://www.lalal.ai/api/v1/split/stem_separator/', { method: 'POST', headers: { 'X-License-Key': job.lalal_license_key, 'Content-Type': 'application/json' }, signal, body: JSON.stringify({ source_id: sourceId, idempotency_key: `gltv-me-${job.dubbing_api_job_id}`, presets: { stem: 'vocals', splitter: 'perseus', enhanced_processing_enabled: true } }) });
+  // Seeded on the SPLIT INPUT, not merely the job: a retry of the same uploaded
+  // source dedupes against the first submit, while a genuinely re-uploaded source
+  // (new source_id) gets its own key rather than being answered with the earlier
+  // source's task.
+  const idempotencyKey = deterministicUuid(`gltv-me:${job.dubbing_api_job_id}:${job.fidelity}:${sourceId}`);
+  const response = await fetch('https://www.lalal.ai/api/v1/split/stem_separator/', { method: 'POST', headers: { 'X-License-Key': job.lalal_license_key, 'Content-Type': 'application/json' }, signal, body: JSON.stringify({ source_id: sourceId, idempotency_key: idempotencyKey, presets: { stem: 'vocals', splitter: 'perseus', enhanced_processing_enabled: true } }) });
   const data = await response.json().catch(() => ({})) as { task_id?: unknown };
   if (!response.ok || !data.task_id) throw new Error(`M&E split submit failed (${response.status}): ${JSON.stringify(data).slice(0, 300)}`);
   return String(data.task_id);
