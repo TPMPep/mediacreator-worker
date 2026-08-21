@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-08-21c-r3-boundary-policy-v3';
+export const BUILD_TAG = '2026-08-21d-gltv-cascade-single-flight';
