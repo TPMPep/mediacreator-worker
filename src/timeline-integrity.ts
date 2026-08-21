@@ -166,7 +166,39 @@
 // the aligned window was too long when it was too short. The reason is now
 // direction-aware; an audit field that states the opposite of what happened is
 // worse than no field.
-export const TIMELINE_INTEGRITY_POLICY_VERSION = 8;
+// v9 closes a SILENT-ACCEPTANCE leak in Stage 0, and adds nothing else.
+// Arbitration already detects a positional dispute (divergenceAt >
+// PROVIDER_CAPTURE_DIVERGENCE_MS), and it already resolves the two cases it can:
+// restore the provider window, or reject it and keep the acoustic one. The third
+// case — neither window usable AND the words are not stacked — fell through a
+// final `else` that changed nothing and CLAIMED nothing, leaving the words on the
+// aligned timeline WITHOUT an unresolved verdict. A word with no credible
+// placement was therefore still "validated", and segment-boundaries.ts forms its
+// authoritative core from validated words, so such a word could define a segment
+// window. Ground truth, project 6a85757eb3fb1626eb1fea43 row 42 ("Harry Potter
+// and the"): the transcriber measured "Harry" at 120,871→121,257 and the aligner
+// placed it at 125,163→125,383 — a 4,292ms positional shift. It was disputed
+// correctly, but the provider restore was refused because the seam shortfall
+// against the already-accepted (itself displaced) preceding word was 4,172ms,
+// 16x the AUTO_REPAIR_CEILING_MS rounding tolerance. Both words then passed as
+// validated purely because a 220ms duration is plausible for "Harry", became the
+// row's core, and the row shipped a window 4.3 SECONDS from the dialogue it
+// belongs to — while its neighbour row 43, recovered to its provider window,
+// ended up chronologically BEFORE it.
+// The fix is to say what happened: an unresolved dispute leaves the words
+// unresolved. NO THRESHOLD MOVES, no new constant, no new classifier — the same
+// `disputed()` relation and the same plausibility bounds decide everything; only
+// the unlabelled fall-through branch now records its own outcome. The words keep
+// their aligned timing as the least-bad VISIBLE value (exactly as every other
+// quarantine does) and are excluded from the boundary core, so the row falls back
+// to preserved provider evidence instead of deriving a window from a placement
+// nothing could confirm. Deliberately NOT a clearance route in reverse: policy v6
+// reconciliation can never withdraw this verdict, because a genuine two-timeline
+// disagreement is the canonical case v6 documents as never cleared.
+// v9 also records cross-row chronology conflicts detected by boundary policy v2
+// (see segment-boundaries.ts) so an inverted timeline is countable at run level
+// rather than only visible row by row.
+export const TIMELINE_INTEGRITY_POLICY_VERSION = 9;
 
 // Below this, an overlap is boundary rounding between two adjacent same-speaker
 // groups and is safe to repair deterministically.
@@ -321,9 +353,20 @@ export type CaptureRestoreReport = {
   unrestorable_words: number;
   worst_restored_divergence_ms: number;
   worst_rejected_provider_divergence_ms: number;
+  /**
+   * [Policy v9] Words whose positional/plausibility dispute NEITHER timeline could
+   * settle, and which are not a collapse stack. Before v9 these were accepted
+   * silently onto the aligned timeline with no verdict, so a word displaced by
+   * seconds could still define a segment boundary. They are now quarantined like
+   * every other unplaceable word. A rising value is an upstream signal that the
+   * aligner and the transcriber disagree irreconcilably more often — it is not a
+   * new defect class, it is the honest name for one that was already happening.
+   */
+  unresolved_dispute_words: number;
   restored_keys: string[];
   rejected_keys: string[];
   collapsed_keys: string[];
+  unresolved_dispute_keys: string[];
 };
 
 export type FinalAcceptanceReport = {
@@ -469,6 +512,10 @@ export function reconcileResolvedUnresolvedWords(
     if (priorReason === 'zero_width_final_window') return word;
     if (priorReason.startsWith('final_window_below_evidence_floor')) return word;
     if (priorReason === 'alignment_collapse_no_usable_window') return word;
+    // [Policy v9] A dispute NEITHER timeline could settle. This is the canonical
+    // "genuine two-timeline disagreement" this module already documents as never
+    // cleared: no stage resolved it, so there is nothing to withdraw.
+    if (priorReason === 'arbitration_unresolved_two_timeline_conflict') return word;
 
     const start = Number(word.start_ms);
     const end = Number(word.end_ms);
@@ -547,6 +594,7 @@ export function restoreDivergedCaptures(
   const restoredKeys: string[] = [];
   const rejectedKeys: string[] = [];
   const collapsedKeys: string[] = [];
+  const unresolvedDisputeKeys: string[] = [];
   let worstRestored = 0;
   let worstRejected = 0;
 
@@ -809,10 +857,34 @@ export function restoreDivergedCaptures(
       });
     } else {
       // An unresolved dispute that is NOT a collapse: neither window is usable,
-      // but the words are not stacked. Nothing is changed and nothing is claimed —
-      // the row falls through to the divergence check in STAGE 2, which is the
-      // honest description of what happened.
-      run.forEach((word) => accept(word));
+      // but the words are not stacked.
+      //
+      // [POLICY v9] NOTHING IS CHANGED — and now the outcome is CLAIMED. Until v9
+      // this branch accepted the words untouched and silent, which meant a word
+      // whose placement no evidence could confirm was still counted as validated
+      // and could therefore become a segment's authoritative core (row 42's 4,292ms
+      // displacement did exactly that). Leaving the timing alone is right: it is
+      // the least-bad visible value and the provider capture stays beside it as
+      // evidence. Leaving the VERDICT unsaid was the defect.
+      //
+      // The aligned timing is preserved verbatim so the row still renders, and the
+      // word is excluded from the boundary core — so the row falls back to its
+      // preserved provider boundary rather than deriving a window from a position
+      // nothing could confirm. An existing engine reason is never overwritten: the
+      // first, most specific verdict wins, exactly as elsewhere in this module.
+      run.forEach((word, offset) => {
+        unresolvedDisputeKeys.push(String(word.key));
+        const providerDuration = providerDurationAt(index + offset);
+        accept({
+          ...word,
+          unresolved: true,
+          unresolved_reason: word.unresolved_reason || 'arbitration_unresolved_two_timeline_conflict',
+          arbitration_reason: word.arbitration_reason || 'neither_timeline_usable_dispute_unresolved',
+          arbitration_ceiling_ms: evidenceCeilingMs(word.text, providerDuration),
+          arbitration_provider_duration_ms: providerDuration,
+          arbitration_aligned_duration_ms: Math.round(Number(word.end_ms) - Number(word.start_ms)),
+        });
+      });
     }
 
     index = end + 1;
@@ -827,9 +899,11 @@ export function restoreDivergedCaptures(
       unrestorable_words: collapsedKeys.length,
       worst_restored_divergence_ms: worstRestored,
       worst_rejected_provider_divergence_ms: worstRejected,
+      unresolved_dispute_words: unresolvedDisputeKeys.length,
       restored_keys: restoredKeys.slice(0, 200),
       rejected_keys: rejectedKeys.slice(0, 200),
       collapsed_keys: collapsedKeys.slice(0, 200),
+      unresolved_dispute_keys: unresolvedDisputeKeys.slice(0, 200),
     },
   };
 }
@@ -928,6 +1002,15 @@ export type IntegrityRow = {
   // counts are independent of every repair disclosure above.
   unresolved_alignment_word_count?: number;
   search_window_exhausted_word_count?: number;
+  /**
+   * [Boundary policy v2] This row's final window is chronologically INVERTED
+   * against its adjacent neighbour — it starts before the row that precedes it in
+   * sequence order. Set by deriveSegmentBoundaries, which detects the conflict but
+   * deliberately does not resolve it: reordering or nudging a window would be a
+   * guess about which of two disagreeing measurements is correct.
+   */
+  chronology_conflict?: boolean;
+  chronology_conflict_ms?: number;
 };
 
 export type IntegrityReport = {
@@ -980,6 +1063,25 @@ export type IntegrityReport = {
   unresolved_cleared_words: number;
   /** [Policy v6] Distinct rows carrying at least one such cleared word. */
   unresolved_cleared_rows: number;
+  /**
+   * [Policy v9] Words whose dispute neither timeline could settle (see
+   * CaptureRestoreReport.unresolved_dispute_words). Counted at run level because
+   * before v9 these words were accepted silently, so there was no number an
+   * auditor could look at to know it had happened.
+   */
+  unresolved_dispute_words: number;
+  /**
+   * [Boundary policy v2 / integrity v9] Rows quarantined because the derived
+   * timeline is chronologically inverted across adjacent rows. Both sides of each
+   * inversion are counted, because a reviewer needs the pair, not one half of it.
+   * Zero on a healthy programme, and zero is the expected steady state: a non-zero
+   * value means two adjacent rows were resolved on timelines that disagree about
+   * their order, which no downstream stage can repair.
+   */
+  chronology_conflict_rows: number;
+  worst_chronology_inversion_ms: number;
+  /** sequence_index of every row involved in an inversion, ascending. Bounded. */
+  chronology_conflict_sequences: number[];
   defect_sequences: number[];
 };
 
@@ -1096,8 +1198,32 @@ export function auditTimelineIntegrity(
     // disagreeing more often, which is an upstream signal, not a delivery risk.
     unresolved_cleared_words: reconciliation?.unresolved_cleared_words || 0,
     unresolved_cleared_rows: reconciliation?.unresolved_cleared_rows || 0,
+    unresolved_dispute_words: captureRestore?.unresolved_dispute_words || 0,
+    chronology_conflict_rows: 0,
+    worst_chronology_inversion_ms: 0,
+    chronology_conflict_sequences: [],
     defect_sequences: [],
   };
+
+  // ── Pass 0: cross-row chronology conflicts [boundary policy v2] ───────────
+  // deriveSegmentBoundaries has already detected these and changed nothing. This
+  // pass only makes them countable at run level and gives the row the highest-
+  // severity defect label, so the state model quarantines it.
+  //
+  // MUSIC IS NOT SKIPPED HERE, unlike every other check below. Elsewhere a music
+  // row is exempt because it makes no timing claim; an inverted window is not a
+  // claim about speech, it is a claim about ORDER, and an out-of-order row breaks
+  // the timeline whatever it contains.
+  for (const row of rows) {
+    if (row.chronology_conflict !== true) continue;
+    const magnitude = Math.round(Number(row.chronology_conflict_ms || 0));
+    report.chronology_conflict_rows += 1;
+    if (magnitude > report.worst_chronology_inversion_ms) report.worst_chronology_inversion_ms = magnitude;
+    if (report.chronology_conflict_sequences.length < 500) {
+      report.chronology_conflict_sequences.push(Number(row.sequence_index));
+    }
+    flag(row, 'unresolved_timing', magnitude);
+  }
 
   // ── Pass 1: provider capture vs acoustic truth ────────────────────────────
   for (const row of rows) {
