@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-08-21b-r1-arbitration-verdict-and-chronology-invariant';
+export const BUILD_TAG = '2026-08-21c-r2-boundary-policy-v3';
