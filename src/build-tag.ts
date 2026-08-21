@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-08-20b-r1-validated-core-boundary';
+export const BUILD_TAG = '2026-08-21a-r1-provider-result-hash-binding';
