@@ -1644,20 +1644,55 @@ export const BACKUP_JOB_OPTIONS = {
   removeOnFail: { age: 86400 * 14 },
 };
 
-// GLTV cascade (Phase 2, 2026-06-12). Conservative — like the orchestrators,
-// a wedged cascade needs human eyes, not infinite re-ticks. attempts=2 means
-// one retry then DLQ. The cascade re-enqueues ITSELF for each tick (the step
-// returns action='continue'/'advance'), so a single job's attempt budget only
-// covers a hard failure of ONE tick, not the whole pipeline. Idempotent by
-// design (start-or-poll keyed by *_run_id) so a retried tick is a safe no-op.
-// SOC 2 CC7.4 — bounded retry; every DLQ entry is auditable via BullMQ
-// failedReason + the DubbingApiJob.phase_history row.
+// GLTV cascade (Phase 2, 2026-06-12; single-flight 2026-08-21).
+//
+// ─── DETERMINISTIC SINGLE-FLIGHT (D-3) ──────────────────────────────────────
+// THREE independent producers can put a tick on this lane — gltvEnqueueCascade,
+// this worker's own self-re-enqueue, and watchdogGltvCascade — and NONE of them
+// passed a jobId, so two concurrent ticks for one DubbingApiJob were permitted by
+// construction. Measured on the W0 baseline job: BullMQ jobs 5687 and 5688 were
+// both `active` on the same project at N=1 concurrency, phase_history carried
+// duplicated un-closed entries, and the consequences were expensive in both
+// directions — 34 `voice_gen_success` events for 17 delivered lines (every line
+// rendered TWICE, doubling ElevenLabs spend) and 3 lines permanently locked out
+// by an orphaned claim left by the losing racer.
+//
+// The fix is the pattern this codebase already proves in enqueueGltvMEExtraction
+// (`jobId: gltv-me-${dubbing_api_job_id}`): a deterministic per-job id, so BullMQ
+// itself collapses a duplicate add. Use GLTV_CASCADE_JOB_ID for every enqueue.
+//
+// removeOnComplete MUST be `true` (immediate) rather than an age window. BullMQ
+// dedupes against a job id for as long as the job EXISTS in the queue, including
+// a retained completed one — so the previous 1h retention would have blocked the
+// legitimate next tick and stalled every cascade. Immediate removal frees the id
+// the instant a tick finishes. TRADE-OFF, accepted deliberately: completed ticks
+// are no longer inspectable in the queue. Failed ticks are still retained 7d for
+// the DLQ panel, and DubbingApiJob.phase_history remains the durable per-phase
+// audit record, so nothing auditor-facing is lost.
+//
+// attempts=1 (was 2). A cascade tick must never be BullMQ-retried into a SECOND
+// decider: the brain is the sole writer of job status and each tick is idempotent,
+// but a retry of a tick that already issued a producer directive can re-issue paid
+// work. The other two producers already used attempts:1; this aligns the third.
+// A genuinely dead chain is resumed by watchdogGltvCascade, which is bounded to 5
+// recoveries per job. SOC 2 CC7.4.
 export const GLTV_CASCADE_JOB_OPTIONS = {
-  attempts: 2,
-  backoff: { type: 'exponential' as const, delay: 10000 },
-  removeOnComplete: { age: 3600, count: 500 },
+  attempts: 1,
+  removeOnComplete: true,
   removeOnFail: { age: 86400 * 7 },
 };
+
+/**
+ * The ONE deterministic BullMQ job id for a GLTV cascade tick.
+ *
+ * Every enqueue path — producer, worker self-re-enqueue, watchdog — MUST use it.
+ * Exported from the shared contract precisely so the three cannot drift: a
+ * producer that mints its own string would silently re-open the duplicate-tick
+ * window this constant exists to close.
+ */
+export function GLTV_CASCADE_JOB_ID(dubbingApiJobId: string): string {
+  return `gltv-cascade-${dubbingApiJobId}`;
+}
 
 // M&E poll heartbeat (2026-06-25). attempts:1 — the heartbeat re-enqueues its
 // OWN next tick (deterministic jobId 'me-poll-singleton'); a failed tick must
