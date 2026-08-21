@@ -118,6 +118,16 @@ export type SegmentStateInput = {
    * ORDER and is wrong whatever the row contains.
    */
   chronology_conflict?: boolean;
+  /**
+   * [Boundary policy v2] Magnitude of the WORST inversion this row participates
+   * in, in milliseconds, written onto the row by enforceChronology alongside
+   * chronology_conflict. Read ONLY to name the distance in the operator-facing
+   * reason — it is never compared against a threshold and never influences the
+   * verdict, so an absent value degrades the sentence, never the state. Held
+   * separately from timing_defect_ms because that field's meaning is defined by
+   * whichever timing_defect label won precedence.
+   */
+  chronology_conflict_ms?: number;
   /** Words no pyannote turn covered. */
   speaker_unresolved_word_count?: number;
   /**
