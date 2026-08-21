@@ -51,7 +51,26 @@
 // padding policy granted, and by how much it moved.
 // =============================================================================
 
-export const BOUNDARY_POLICY_VERSION = 1;
+// v2 adds the CROSS-ROW CHRONOLOGY INVARIANT (see enforceChronology at the foot
+// of this module) and changes no threshold, no padding rule and no boundary
+// source. Rules 1-3 above are per-row: each row's window is judged against its own
+// words and its own provider evidence. Nothing checked that the SET of windows was
+// still ordered afterwards — and it can stop being ordered, because adjacent rows
+// are resolved on DIFFERENT timelines. A row with a validated core is derived from
+// its aligned words; a row with no validated core is recovered from its preserved
+// provider boundary. Where the aligner has displaced one row and the other falls
+// back to the transcriber, the two can cross.
+// Ground truth, project 6a85757eb3fb1626eb1fea43: row 42 ("Harry Potter and the")
+// was derived to 125,043-125,724 from aligned words the aligner had placed 4.3s
+// late, while row 43 ("Order of the Phoenix.") was correctly recovered to its
+// provider window 123,444-125,406 — so row 43 began 1.6 SECONDS BEFORE row 42
+// despite following it. Both rows were already quarantined for their own reasons,
+// which is the only thing that kept the inverted geometry off a deliverable.
+// The invariant NEVER reorders and NEVER nudges a window: choosing a corrected
+// placement would mean deciding which of two disagreeing measurements is right,
+// which is precisely the judgement this module refuses to make on a guess. It
+// quarantines both sides and records the conflict.
+export const BOUNDARY_POLICY_VERSION = 2;
 
 /** Editorial lead-in before the first validated word, when silence allows it. */
 export const LEAD_IN_MS = 120;
@@ -112,6 +131,15 @@ export type BoundaryRow = {
   boundary_delta_start_ms?: number;
   boundary_delta_end_ms?: number;
   boundary_policy_version?: number;
+  /** Position in the delivered order. Used only to report a conflict's location. */
+  sequence_index?: number;
+  /**
+   * [v2] This row's final window is chronologically inverted against its adjacent
+   * neighbour. Consumed by the segment-state model (quarantine) and the integrity
+   * audit (run-level counters). Never set on a healthy timeline.
+   */
+  chronology_conflict?: boolean;
+  chronology_conflict_ms?: number;
 };
 
 export type BoundaryReport = {
@@ -155,6 +183,18 @@ export type BoundaryReport = {
   worst_extension_ms: number;
   worst_reduction_ms: number;
   worst_lead_out_granted_ms: number;
+  /**
+   * [v2] Rows quarantined because the derived timeline is chronologically
+   * inverted across adjacent rows. BOTH sides of each inversion are counted — a
+   * reviewer needs the pair, not one half of it. Zero is the expected steady
+   * state; a non-zero value means two adjacent rows were resolved on timelines
+   * that disagree about their ORDER, which no downstream stage can repair and
+   * which must therefore never be emitted silently.
+   */
+  chronology_conflict_rows: number;
+  worst_chronology_inversion_ms: number;
+  /** sequence_index of every row involved in an inversion, ascending. Bounded. */
+  chronology_conflict_sequences: number[];
 };
 
 const finite = (value: unknown): number | null => {
@@ -232,6 +272,9 @@ export function deriveSegmentBoundaries(
     worst_extension_ms: 0,
     worst_reduction_ms: 0,
     worst_lead_out_granted_ms: 0,
+    chronology_conflict_rows: 0,
+    worst_chronology_inversion_ms: 0,
+    chronology_conflict_sequences: [],
   };
 
   const list = rows || [];
@@ -419,5 +462,60 @@ export function deriveSegmentBoundaries(
     previousFinalEnd = row.end_ms;
   }
 
+  enforceChronology(list, report);
   return report;
+}
+
+/**
+ * [v2] CROSS-ROW CHRONOLOGY INVARIANT — the delivered timeline must not go
+ * backwards.
+ *
+ * Runs after every row's window is final, because that is the only point at which
+ * the question can be asked: the per-row rules are individually correct and the
+ * conflict is a property of the PAIR.
+ *
+ * WHAT IS CHECKED, AND WHAT DELIBERATELY IS NOT. Only the START ORDER of ADJACENT
+ * rows. Overlap is NOT a violation: two rows overlap legitimately whenever two
+ * people speak at once, cross-speaker overlap is preserved by design (see the
+ * header), and the final mixer sums those clips deliberately. Same-speaker
+ * overlap — the case that IS an attribution error — is already detected and
+ * bounded-repaired by the timeline-integrity audit, and duplicating it here would
+ * quarantine rows that stage repairs correctly. So this invariant catches exactly
+ * the class nothing else can see: row N+1 beginning before row N.
+ *
+ * NOTHING IS RESOLVED. No reorder, no clamp, no nudge. Both sides are marked and
+ * the magnitude recorded; the state model quarantines them UNRESOLVED_TIMING and
+ * an operator rules. Picking a "corrected" placement would mean choosing between
+ * two measurements that disagree, on no evidence — the exact guess this module
+ * exists to refuse.
+ */
+function enforceChronology(list: BoundaryRow[], report: BoundaryReport): void {
+  const conflicted = new Set<number>();
+
+  for (let index = 1; index < list.length; index++) {
+    const previousStart = finite(list[index - 1]?.start_ms);
+    const currentStart = finite(list[index]?.start_ms);
+    if (previousStart === null || currentStart === null) continue;
+    if (currentStart >= previousStart) continue;
+
+    const inversion = Math.round(previousStart - currentStart);
+    if (inversion > report.worst_chronology_inversion_ms) {
+      report.worst_chronology_inversion_ms = inversion;
+    }
+    // Both sides. Each row keeps the WORST inversion it participates in, so a row
+    // caught between two conflicts reports the more serious one.
+    for (const side of [index - 1, index]) {
+      const row = list[side];
+      if (!row) continue;
+      conflicted.add(side);
+      row.chronology_conflict = true;
+      row.chronology_conflict_ms = Math.max(Number(row.chronology_conflict_ms || 0), inversion);
+    }
+  }
+
+  report.chronology_conflict_rows = conflicted.size;
+  report.chronology_conflict_sequences = [...conflicted]
+    .map((index) => Number(list[index]?.sequence_index ?? index))
+    .sort((a, b) => a - b)
+    .slice(0, 500);
 }
