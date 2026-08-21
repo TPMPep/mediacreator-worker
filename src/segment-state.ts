@@ -67,7 +67,16 @@
 //   • speaker_span_unresolved — refinement heard more than one speaker inside an
 //     authoritative line and the line was kept whole rather than divided, so its
 //     attribution is a choice and not a measurement.
-export const SEGMENT_STATE_POLICY_VERSION = 5;
+// v6 adds ONE input, chronology_conflict, and changes nothing else. Boundary
+// policy v2 detects a delivered timeline that goes backwards — row N+1 starting
+// before row N, which happens when adjacent rows are resolved on different
+// timelines (one derived from aligned words, its neighbour recovered from the
+// preserved provider boundary). That is a timing fact no existing input could
+// express: every other cause here describes something about a row's OWN words,
+// while this one is a property of the row's position relative to its neighbour.
+// Without it such a row could satisfy every per-row check and land on VALIDATED
+// while sitting out of order in the programme.
+export const SEGMENT_STATE_POLICY_VERSION = 6;
 
 export type SegmentState =
   | 'VALIDATED'
@@ -98,6 +107,17 @@ export type SegmentStateInput = {
   alignment_collapsed?: boolean;
   /** Outstanding defect label from the timeline-integrity audit. */
   timing_defect?: string;
+  /**
+   * [Boundary policy v2] This row's final window is chronologically inverted
+   * against its adjacent neighbour — it begins before the row that precedes it in
+   * delivered order. Held as its own input rather than folded into timing_defect
+   * because it is a fact about the row's POSITION, not about its words, and
+   * because the boundary stage that detects it runs before the integrity audit.
+   * Deliberately NOT excluded for music: elsewhere a music row is exempt because
+   * it makes no claim about speech, but an out-of-order window is a claim about
+   * ORDER and is wrong whatever the row contains.
+   */
+  chronology_conflict?: boolean;
   /** Words no pyannote turn covered. */
   speaker_unresolved_word_count?: number;
   /**
@@ -170,6 +190,7 @@ export function deriveSegmentState(row: SegmentStateInput): SegmentStateVerdict 
   const collapsed = row.alignment_collapsed === true || row.timing_defect === 'alignment_collapse';
   const overlap = row.timing_defect === 'same_speaker_overlap';
   const divergence = row.timing_defect === 'provider_capture_divergence';
+  const chronologyConflict = row.chronology_conflict === true;
 
   // An authoritative row carried through with nothing measured. Music is excluded
   // defensively: a non-dialogue row makes no timing claim and is validated as
@@ -177,7 +198,7 @@ export function deriveSegmentState(row: SegmentStateInput): SegmentStateVerdict 
   const noMeasuredWords = row.no_measured_words === true && row.is_music !== true;
 
   const unresolved_timing = noMeasuredWords || unresolvedWords > 0 || exhaustedWords > 0 || nearZeroWords > 0
-    || collapsed || overlap || divergence;
+    || collapsed || overlap || divergence || chronologyConflict;
   const speakerIsland = row.speaker_island_in_overlap === true;
   const speakerSpan = row.speaker_span_unresolved === true;
   const unresolved_speaker = speakerUnresolved > 0 || speakerIsland || speakerSpan;
@@ -212,6 +233,9 @@ export function deriveSegmentState(row: SegmentStateInput): SegmentStateVerdict 
     }
     if (overlap) {
       return verdict('UNRESOLVED_TIMING', 'This line and another line by the same speaker cover the same moment, so one of the two windows is wrong.');
+    }
+    if (chronologyConflict) {
+      return verdict('UNRESOLVED_TIMING', 'This line and the line next to it are out of order — one of them begins before the line that precedes it. The two were timed from sources that disagree about their order, so nothing was moved: correcting it automatically would mean guessing which of the two is in the right place.');
     }
     return verdict('UNRESOLVED_TIMING', "The transcriber's measurement and the audio check disagree beyond the trust threshold and neither could be accepted on evidence.");
   }
