@@ -70,7 +70,16 @@
 // placement would mean deciding which of two disagreeing measurements is right,
 // which is precisely the judgement this module refuses to make on a guess. It
 // quarantines both sides and records the conflict.
-export const BOUNDARY_POLICY_VERSION = 2;
+//
+// v3 adds PROVIDER-BOUNDARY IMMUTABILITY across re-refinement. v2 established a
+// provider boundary from the source row's start_ms/end_ms on every run. That is
+// correct on the first refinement, where the source row is the transcriber's, but
+// wrong on a re-refinement, where the source row is the previous refinement's
+// derived output. v3 carries an already-established provider boundary forward
+// verbatim, establishes one from the source window only for a never-refined row,
+// and leaves split rows without a fabricated provider span. No threshold, padding,
+// chronology, or source-selection rule otherwise changes.
+export const BOUNDARY_POLICY_VERSION = 3;
 
 /** Editorial lead-in before the first validated word, when silence allows it. */
 export const LEAD_IN_MS = 120;
@@ -201,6 +210,80 @@ const finite = (value: unknown): number | null => {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 };
+
+export type ProviderBoundarySource = {
+  start_ms?: number | null;
+  end_ms?: number | null;
+  provider_boundary_start_ms?: number | null;
+  provider_boundary_end_ms?: number | null;
+  boundary_source?: string | null;
+};
+
+/**
+ * PROVIDER-BOUNDARY IMMUTABILITY — resolve the provider reference for one output
+ * row from the SOURCE row refinement is reading.
+ *
+ * THE DEFECT THIS CLOSES. The provider boundary used to be taken unconditionally
+ * from the source row's own start_ms/end_ms. That is correct exactly once — on the
+ * FIRST refinement, where the source rows are the transcriber's own rows and their
+ * window IS the provider's measurement. On every re-refinement the source rows are
+ * the PREVIOUS refinement's output, so the "provider" reference silently became
+ * our own derived window: a later refinement became its own provider.
+ *
+ * Observed on project 6a85757eb3fb1626eb1fea43 row 42. The transcriber measured
+ * 120,871-122,736. The first refinement derived 125,043-125,724 (from aligned words
+ * placed 4.3s late) and correctly preserved 120,871-122,736 as provider evidence. A
+ * re-refine then overwrote that evidence with 125,043-125,724 — so the original
+ * measurement was gone, the row had nothing left to recover to, and the stability
+ * check compared the derived window against ITSELF and pronounced it "stable". That
+ * last part is the worst of it: 24 rows moved from VALIDATED_WITH_OVERRIDE to
+ * VALIDATED because the boundary now "agreed with the provider", when what it
+ * agreed with was the previous run's output. A re-refine could launder its own
+ * derivation into apparent provider corroboration.
+ *
+ * THE RULE. Derived boundaries may change on every run; provider boundaries may not.
+ *   1. A SPLIT output row has no 1:1 provider segment, so it gets null — unchanged
+ *      from the previous contract, and the honest answer. This is checked FIRST, so
+ *      two halves can never both claim one provider span as corroboration.
+ *   2. If the source row ALREADY carries a provider boundary, carry it forward
+ *      verbatim. This is the original transcription measurement, established on the
+ *      first refinement and never re-derived since.
+ *   3. Otherwise, if the source row has never been refined (no boundary_source), its
+ *      window IS the provider's measurement — establish from it.
+ *   4. Otherwise the source row is a previously-refined row with no provider
+ *      boundary of its own (a prior split). Return null rather than fabricating one
+ *      from a derived window, which is precisely the defect above.
+ *
+ * No new field, no duplicate source of truth: the existing
+ * provider_boundary_start_ms / provider_boundary_end_ms columns already hold the
+ * original measurement, and this makes them immutable in practice as the schema
+ * already claims they are. SOC 2 CC8.1 — provider evidence is never destructively
+ * overwritten, on any run.
+ */
+export function resolveProviderBoundary(
+  source: ProviderBoundarySource | null | undefined,
+  opts: { isSplit?: boolean } = {},
+): { provider_boundary_start_ms: number | null; provider_boundary_end_ms: number | null } {
+  const none = { provider_boundary_start_ms: null, provider_boundary_end_ms: null };
+  if (!source) return none;
+  if (opts.isSplit === true) return none;
+
+  const carriedStart = finite(source.provider_boundary_start_ms);
+  const carriedEnd = finite(source.provider_boundary_end_ms);
+  if (carriedStart !== null && carriedEnd !== null && carriedEnd > carriedStart) {
+    return { provider_boundary_start_ms: carriedStart, provider_boundary_end_ms: carriedEnd };
+  }
+
+  // A row that has been through refinement already (boundary_source set) but holds
+  // no provider boundary had none to inherit. Its window is DERIVED, so it must
+  // never be presented as a provider measurement.
+  if (String(source.boundary_source || '') !== '') return none;
+
+  const start = finite(source.start_ms);
+  const end = finite(source.end_ms);
+  if (start === null || end === null || end <= start) return none;
+  return { provider_boundary_start_ms: start, provider_boundary_end_ms: end };
+}
 
 /** Does this row carry any measured word evidence at all (resolved or not)? */
 function hasWords(row: BoundaryRow): boolean {
