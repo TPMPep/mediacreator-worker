@@ -49,9 +49,11 @@
 // verified server-side (in the brain) BEFORE any status mutation.
 // =============================================================================
 
+import { DelayedError } from 'bullmq';
 import type { Job, Queue } from 'bullmq';
 import type { GltvCascadeJobData } from '../../shared/queue-contracts.js';
-import { QUEUE_NAMES, GLTV_CASCADE_JOB_OPTIONS, GLTV_CASCADE_JOB_ID } from '../../shared/queue-contracts.js';
+// QUEUE_NAMES is no longer needed here: the tick continues itself via
+// job.moveToDelayed (ONE persistent job) instead of adding a new job.
 import { invokeBase44Function, logEvent, runWithLockHeartbeat, WorkerLockLostError } from '../base44-client.js';
 import { env } from '../env.js';
 
@@ -162,12 +164,46 @@ async function executeProducerDirective(directive: CascadeStepResponse, lockSign
 }
 
 /**
- * Process one GLTV cascade tick. The processor needs a handle to its own queue
- * so it can re-enqueue the next tick (continue/advance). index.ts injects this
- * via a closure so the processor stays decoupled from the queue registry.
+ * Process one GLTV cascade tick.
+ *
+ * ─── SELF-CONTINUATION: ONE PERSISTENT JOB, MANY TICKS (2026-08-21e) ────────
+ * The tick does NOT add a successor job. It reschedules ITSELF via
+ * job.moveToDelayed, so a cascade is represented by exactly ONE BullMQ job whose
+ * deterministic id (gltv-cascade-<dubbing_api_job_id>) exists continuously from
+ * the first tick until the cascade terminalises.
+ *
+ * WHY THIS REPLACED THE SELF-RE-ENQUEUE. The previous tick re-enqueued a new job
+ * carrying the same deterministic id — while its OWN job was still `active` and
+ * therefore still holding that id. BullMQ deduped the add against the incumbent
+ * (itself), added nothing, and the tick then completed and was removed: the chain
+ * died silently after exactly one tick. Measured on the W0 rerun (job
+ * 6a886ec0bfeef21361f9928a): one tick advanced queued → scanning → transcribing
+ * via the directive chain, returned `continue`, and the queue went to 0 active /
+ * 0 waiting / 0 delayed with the job frozen at 10% and updated_date never
+ * advancing again. Single-flight was correct; liveness was not.
+ *
+ * moveToDelayed makes the two properties inseparable rather than traded off:
+ *   • LIVENESS — the job is rescheduled, never re-created, so nothing can dedupe
+ *     the continuation against itself.
+ *   • SINGLE-FLIGHT — the id is occupied for the WHOLE cascade, including while
+ *     the tick is waiting in `delayed`, so an add from gltvEnqueueCascade or
+ *     watchdogGltvCascade is collapsed by BullMQ at every instant. The previous
+ *     design left the id free between ticks, which is exactly the window the
+ *     watchdog resumed into on the original W0 baseline (it cannot see `delayed`),
+ *     producing the two concurrent deciders that double-rendered 17 lines.
+ *   • The renewed per-tick auth token (Fix A′) is carried by job.updateData, so a
+ *     long cascade still never runs on an expiring JWT.
+ *
+ * A DelayedError is BullMQ's contract for "this job has been rescheduled, do not
+ * treat the handler's exit as success or failure" — it consumes no attempt and
+ * writes no failure. SOC 2 CC7.2 (bounded, resumable, no silent stall) / CC7.4
+ * (one decider ⇒ paid producer work is never issued twice).
+ *
+ * The queue-handle factory argument is retained so index.ts's registration stays
+ * unchanged; the processor no longer needs it.
  */
-export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
-  return async function processGltvCascade(job: Job<GltvCascadeJobData>) {
+export function makeGltvCascadeProcessor(_getQueue: (name: string) => Queue) {
+  return async function processGltvCascade(job: Job<GltvCascadeJobData>, token?: string) {
     const t0 = Date.now();
     const { dubbing_api_job_id, project_id, request_id, auth_token } = job.data;
     const baseCtx = {
@@ -293,25 +329,41 @@ export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
         // so a slow cascade can never expire its own auth mid-run.
         const renewed = !!step.next_auth_token;
         const nextAuthToken = step.next_auth_token || auth_token;
-        const q = getQueue(QUEUE_NAMES.GLTV_CASCADE);
-        // D-3 single-flight: the deterministic per-job id means BullMQ collapses a
-        // duplicate add, so this self-re-enqueue can never race the producer or the
-        // watchdog into two concurrent deciders for one DubbingApiJob. Adding an
-        // existing id is a no-op that returns the incumbent job — which is exactly
-        // the desired outcome, so it is deliberately NOT treated as an error.
-        await q.add(QUEUE_NAMES.GLTV_CASCADE, {
+
+        // The lock token is what proves THIS worker still owns the job, and
+        // moveToDelayed cannot be performed without it. Its absence is not a
+        // condition to paper over with a fallback `add` — an add would carry the
+        // job's own still-occupied id and be deduped into a dead chain, which is
+        // the exact defect this design replaced. Throw instead: the failure is
+        // loud, and watchdogGltvCascade resumes the cascade under its bounded
+        // 5-recovery budget.
+        if (!token) {
+          await _log('error', 'gltv_cascade_missing_lock_token', {
+            ...baseCtx, action: step.action,
+          }, 'Tick cannot self-reschedule without a BullMQ lock token — failing loudly so the watchdog resumes.');
+          throw new Error(`gltv-cascade: missing BullMQ lock token for job ${dubbing_api_job_id} — cannot reschedule tick`);
+        }
+
+        // Carry the renewed auth token onto THIS job before rescheduling it, so
+        // the next tick of the same job runs on a fresh 30-min clock.
+        await job.updateData({
           schema_version: job.data.schema_version,
           dubbing_api_job_id,
           project_id,
           request_id,
           auth_token: nextAuthToken,
-        }, { ...GLTV_CASCADE_JOB_OPTIONS, jobId: GLTV_CASCADE_JOB_ID(dubbing_api_job_id), delay: TICK_DELAY_MS });
+        });
 
-        await _log('info', renewed ? 'gltv_cascade_auth_renewed' : 'gltv_cascade_next_tick_enqueued', {
+        await _log('info', renewed ? 'gltv_cascade_auth_renewed' : 'gltv_cascade_next_tick_scheduled', {
           ...baseCtx, action: step.action, delay_ms: TICK_DELAY_MS, auth_token_renewed: renewed,
-        }, `Re-enqueued next cascade tick (delay ${TICK_DELAY_MS}ms${renewed ? ', with renewed auth token' : ''}).`);
+          continuation: 'move_to_delayed',
+        }, `Rescheduled THIS cascade job for the next tick (delay ${TICK_DELAY_MS}ms${renewed ? ', with renewed auth token' : ''}).`);
 
-        return { ok: true, action: step.action, status: step.status, auth_token_renewed: renewed, duration_ms: Date.now() - t0 };
+        // Reschedule self, then signal BullMQ that the job was delayed rather
+        // than finished. Done LAST so the lock-heartbeat loop never extends a
+        // lock we have already released.
+        await job.moveToDelayed(Date.now() + TICK_DELAY_MS, token);
+        throw new DelayedError();
       }
 
       // await_review (checkpoint mode) — EXIT cleanly. gltvApproveDubbingJob
@@ -334,6 +386,10 @@ export function makeGltvCascadeProcessor(getQueue: (name: string) => Queue) {
       return step.result ?? { ok: true, action: 'done', status: step.status, duration_ms: Date.now() - t0 };
       }); // end runWithLockHeartbeat body
     } catch (err) {
+      // A DelayedError is the successful self-reschedule path, not a failure:
+      // rethrow it untouched so BullMQ parks the job in `delayed` without
+      // consuming an attempt or writing a failure record.
+      if (err instanceof DelayedError) throw err;
       const e = err as Error;
       const lockLost = e instanceof WorkerLockLostError;
       // Read .name/.stack/.message off the un-narrowed Error. (Narrowing `e` via
