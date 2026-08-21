@@ -5,7 +5,7 @@ import { env } from '../env.js';
 import { alignTranscript, assertAlignmentQuality } from '../alignment-client.js';
 import { TIMELINE_INTEGRITY_POLICY_VERSION, assertFinalWordAcceptance, auditTimelineIntegrity, clampAcousticOnsets, reconcileResolvedUnresolvedWords, restoreDivergedCaptures } from '../timeline-integrity.js';
 import { BUILD_TAG } from '../build-tag.js';
-import { deriveSegmentBoundaries } from '../segment-boundaries.js';
+import { deriveSegmentBoundaries, resolveProviderBoundary } from '../segment-boundaries.js';
 import { deriveSegmentState, summariseSegmentStates } from '../segment-state.js';
 import { detectSpeakerIslands } from '../speaker-islands.js';
 import { resolveOutputGroups, resolveOutputText, textIsAuthoritative } from '../text-authority.js';
@@ -14,7 +14,12 @@ const API = 'https://api.pyannote.ai/v1';
 const COLORS = ['blue','purple','green','amber','red','pink','cyan','orange'];
 type Turn = { speaker:string; start:number; end:number; confidence?:Record<string,number> };
 type Word = { text?:string; start_ms:number; end_ms:number; confidence?:number; cluster?:string|null };
-type Segment = { id:string; sequence_index:number; start_ms:number; end_ms:number; source_text:string; speaker_label?:string; source_text_status?:string; confidence?:number; avg_word_confidence?:number; aai_word_timings?:Word[]; provider_name?:string; version_number?:number; consensus_run_id?:string; consensus_word_sources?:Array<{start_ms?:number;end_ms?:number;[key:string]:unknown}>; is_music?:boolean; music_source?:string; music_context?:string };
+type Segment = { id:string; sequence_index:number; start_ms:number; end_ms:number; source_text:string; speaker_label?:string; source_text_status?:string; confidence?:number; avg_word_confidence?:number; aai_word_timings?:Word[]; provider_name?:string; version_number?:number;
+// PROVIDER-BOUNDARY IMMUTABILITY. Read from the source row so the ORIGINAL
+// transcription measurement can be carried forward instead of being re-derived from
+// the previous refinement's own window (see resolveProviderBoundary). boundary_source
+// distinguishes a never-refined transcription row from an already-refined one.
+provider_boundary_start_ms?:number|null; provider_boundary_end_ms?:number|null; boundary_source?:string; consensus_run_id?:string; consensus_word_sources?:Array<{start_ms?:number;end_ms?:number;[key:string]:unknown}>; is_music?:boolean; music_source?:string; music_context?:string };
 
 const label = (cluster:string,index:number) => { const m=cluster.match(/(\d+)$/); return `Speaker ${m?Number(m[1])+1:index+1}`; };
 const tc = (ms:number,fps=25) => { const s=Math.floor(ms/1000), f=Math.floor((ms%1000)/(1000/fps)); return `${String(Math.floor(s/3600)).padStart(2,'0')}:${String(Math.floor((s%3600)/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')};${String(f).padStart(2,'0')}`; };
@@ -107,7 +112,12 @@ export async function processSpeakerDiarization(job:Job<SpeakerDiarizationJobDat
 // structure, but human-authored text is never overwritten by machine words and an
 // authoritative row is never structurally divided by machine evidence.
 const authoritative=textIsAuthoritative(segment);
-if(!providerWords.length&&(segment.is_music||authoritative)){const t=best(turns,Number(segment.start_ms),Number(segment.end_ms),cursor),cluster=t?.speaker||clusters[0],sp=speakers[cluster];counts[cluster]=(counts[cluster]||0)+1;output.push({sequence_index:output.length,start_ms:segment.start_ms,end_ms:segment.end_ms,tc_in:tc(segment.start_ms,prep.project.frame_rate||25),tc_out:tc(segment.end_ms,prep.project.frame_rate||25),speaker_id:sp.id,speaker_label:sp.label,speaker_color:sp.color,source_text:segment.source_text,source_text_status:segment.source_text_status||'machine',confidence:segment.confidence,avg_word_confidence:segment.avg_word_confidence,aai_word_timings:[],provider_name:segment.provider_name,version_number:segment.version_number||1,_alignment:{status:'not_applicable',model:alignment.model,model_revision:alignment.model_revision,language_code:alignment.language_code,words:[],mean_confidence:0,max_provider_shift_ms:0,raw_result_key:prep.alignment_result_key},_cluster:cluster,
+if(!providerWords.length&&(segment.is_music||authoritative)){const t=best(turns,Number(segment.start_ms),Number(segment.end_ms),cursor),cluster=t?.speaker||clusters[0],sp=speakers[cluster];counts[cluster]=(counts[cluster]||0)+1;output.push({sequence_index:output.length,start_ms:segment.start_ms,end_ms:segment.end_ms,tc_in:tc(segment.start_ms,prep.project.frame_rate||25),tc_out:tc(segment.end_ms,prep.project.frame_rate||25),speaker_id:sp.id,speaker_label:sp.label,speaker_color:sp.color,source_text:segment.source_text,source_text_status:segment.source_text_status||'machine',confidence:segment.confidence,avg_word_confidence:segment.avg_word_confidence,aai_word_timings:[],provider_name:segment.provider_name,version_number:segment.version_number||1,
+// Music and authored rows carry their provider boundary forward too. Their window is
+// never re-derived from it, but wiping the evidence on a re-refine would destroy the
+// original measurement just as surely as overwriting it.
+...resolveProviderBoundary(segment,{isSplit:false}),
+_alignment:{status:'not_applicable',model:alignment.model,model_revision:alignment.model_revision,language_code:alignment.language_code,words:[],mean_confidence:0,max_provider_shift_ms:0,raw_result_key:prep.alignment_result_key},_cluster:cluster,
 // Music and AUTHORED rows both arrive here with no words, and they are disclosed
 // DIFFERENTLY because they are different facts: music is a validated non-dialogue
 // line, while an authored row is a human-written line whose timing was never
@@ -160,8 +170,10 @@ _boundary_words:g.words.map(w=>({start_ms:Number(w.start_ms),end_ms:Number(w.end
 // speaker-island rule's overlap evidence (turns are per cluster, rows per
 // speaker) — stripped before staging like every other transient field.
 _cluster:g.cluster,
-provider_boundary_start_ms:outputGroups.length===1?Number(segment.start_ms):null,
-provider_boundary_end_ms:outputGroups.length===1?Number(segment.end_ms):null,
+// The ORIGINAL provider measurement, carried forward across every re-refinement.
+// Never re-derived from the source row's window, because on a re-refine that window
+// is the PREVIOUS refinement's output — which would let a run corroborate itself.
+...resolveProviderBoundary(segment,{isSplit:outputGroups.length!==1}),
 // Quarantine evidence. Counted per row so the state model and the export gate can
 // name the exact lines whose timing or speaker was never proven.
 unresolved_alignment_word_count:g.words.filter(w=>w.unresolved===true).length,
