@@ -1647,9 +1647,9 @@ export const BACKUP_JOB_OPTIONS = {
 // GLTV cascade (Phase 2, 2026-06-12; single-flight 2026-08-21).
 //
 // ─── DETERMINISTIC SINGLE-FLIGHT (D-3) ──────────────────────────────────────
-// THREE independent producers can put a tick on this lane — gltvEnqueueCascade,
-// this worker's own self-re-enqueue, and watchdogGltvCascade — and NONE of them
-// passed a jobId, so two concurrent ticks for one DubbingApiJob were permitted by
+// TWO independent producers can put a tick on this lane — gltvEnqueueCascade and
+// watchdogGltvCascade — and neither of them passed a jobId, so two concurrent
+// ticks for one DubbingApiJob were permitted by
 // construction. Measured on the W0 baseline job: BullMQ jobs 5687 and 5688 were
 // both `active` on the same project at N=1 concurrency, phase_history carried
 // duplicated un-closed entries, and the consequences were expensive in both
@@ -1661,14 +1661,24 @@ export const BACKUP_JOB_OPTIONS = {
 // (`jobId: gltv-me-${dubbing_api_job_id}`): a deterministic per-job id, so BullMQ
 // itself collapses a duplicate add. Use GLTV_CASCADE_JOB_ID for every enqueue.
 //
+// THE WORKER DOES NOT RE-ENQUEUE ITSELF. A cascade is ONE persistent job that
+// reschedules itself via job.moveToDelayed until it terminalises (see the
+// gltv-cascade processor header). That is what makes single-flight and liveness
+// inseparable: the id is occupied for the whole cascade — including while the
+// tick sits in `delayed` — so an add from either producer is always collapsed,
+// and the continuation can never be deduped against the job's own still-live id.
+// An earlier revision did re-enqueue with this same deterministic id from inside
+// the running tick, and BullMQ correctly deduped it against the incumbent
+// (itself): the chain died after exactly one tick with the job frozen mid-phase.
+//
 // removeOnComplete MUST be `true` (immediate) rather than an age window. BullMQ
 // dedupes against a job id for as long as the job EXISTS in the queue, including
-// a retained completed one — so the previous 1h retention would have blocked the
-// legitimate next tick and stalled every cascade. Immediate removal frees the id
-// the instant a tick finishes. TRADE-OFF, accepted deliberately: completed ticks
-// are no longer inspectable in the queue. Failed ticks are still retained 7d for
-// the DLQ panel, and DubbingApiJob.phase_history remains the durable per-phase
-// audit record, so nothing auditor-facing is lost.
+// a retained completed one — so a retention window would block the next
+// legitimate cascade for that job. Immediate removal frees the id the instant a
+// cascade terminalises. TRADE-OFF, accepted deliberately: a completed cascade is
+// no longer inspectable in the queue. Failed jobs are still retained 7d for the
+// DLQ panel, and DubbingApiJob.phase_history remains the durable per-phase audit
+// record, so nothing auditor-facing is lost.
 //
 // attempts=1 (was 2). A cascade tick must never be BullMQ-retried into a SECOND
 // decider: the brain is the sole writer of job status and each tick is idempotent,
@@ -1685,8 +1695,10 @@ export const GLTV_CASCADE_JOB_OPTIONS = {
 /**
  * The ONE deterministic BullMQ job id for a GLTV cascade tick.
  *
- * Every enqueue path — producer, worker self-re-enqueue, watchdog — MUST use it.
- * Exported from the shared contract precisely so the three cannot drift: a
+ * Every enqueue path — gltvEnqueueCascade and watchdogGltvCascade — MUST use it.
+ * The worker is deliberately NOT an enqueue path: it reschedules its own job via
+ * moveToDelayed, so it keeps this id occupied rather than re-minting it.
+ * Exported from the shared contract precisely so the two cannot drift: a
  * producer that mints its own string would silently re-open the duplicate-tick
  * window this constant exists to close.
  */
