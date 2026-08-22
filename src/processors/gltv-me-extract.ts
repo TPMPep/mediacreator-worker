@@ -6,8 +6,9 @@ import { invokeBase44Function, logEvent, runWithLockHeartbeat } from '../base44-
 const LONG_TIMEOUT_MS = 30 * 60 * 1000;
 
 /**
- * A DETERMINISTIC RFC-4122 UUID derived from a seed string (SHA-256, with the
- * version/variant bits set as UUIDv5 does).
+ * A DETERMINISTIC RFC-4122 UUID derived from a seed string (SHA-256), stamped
+ * with the VERSION-4 marker because LALAL.AI validates the version nibble and
+ * rejects anything else.
  *
  * WHY NOT crypto.randomUUID(). LALAL.AI's idempotency_key exists so that a
  * retried submit cannot start a SECOND billable split for the same source. A
@@ -23,13 +24,23 @@ const LONG_TIMEOUT_MS = 30 * 60 * 1000;
  * reached the fail-closed M&E gate before the mixer and terminalised the job. It
  * presented as an M&E failure, so nothing pointed at a malformed request field.
  *
- * A hash-derived UUID keeps both properties at once — a valid UUID for the
- * provider, and the same value for the same split input forever.
+ * WHY VERSION 4 AND NOT 5. The first fix stamped the v5 marker, which is the
+ * honest description of how the value is built (a hash of a name), and LALAL.AI
+ * rejected it too: `uuid_version … UUID version 4 expected`. So the provider
+ * constrains the FORMAT to v4 while we require DETERMINISM, and those two are
+ * only reconcilable one way — derive the bytes from the hash, then stamp the v4
+ * marker. Be precise about what that means: this is NOT a random v4 UUID and
+ * must never be read as evidence of randomness. It is a deterministic value
+ * wearing the version marker the provider demands, and determinism is the
+ * property the idempotency guarantee actually rests on, so nothing about the
+ * cost-safety claim is weakened by the marker. Collision risk is irrelevant
+ * here: the seed already names the exact split input, so two different inputs
+ * colliding would require a SHA-256 collision.
  */
 function deterministicUuid(seed: string): string {
   const h = createHash('sha256').update(seed).digest();
   const b = Buffer.from(h.subarray(0, 16));
-  b[6] = (b[6] & 0x0f) | 0x50; // version 5
+  b[6] = (b[6] & 0x0f) | 0x40; // version 4 marker — required by LALAL.AI
   b[8] = (b[8] & 0x3f) | 0x80; // RFC-4122 variant
   const hex = b.toString('hex');
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
