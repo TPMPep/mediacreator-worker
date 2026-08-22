@@ -608,10 +608,23 @@ const server = http.createServer(async (req, res) => {
     try {
       const q = getQueue(queue);
       const counts = await q.getJobCounts('waiting', 'active', 'delayed', 'completed', 'failed', 'paused');
-      // Pull the most recent jobs across the three most diagnostic states.
-      const [waiting, active, failed, completed] = await Promise.all([
+      // Pull the most recent jobs across the diagnostic states.
+      //
+      // DELAYED IS ENUMERATED (D-8, 2026-08-22) — this used to report `delayed`
+      // as a bare COUNT only, and that blind spot was a correctness bug rather
+      // than a missing nicety. Since the cascade became ONE self-rescheduling
+      // persistent job (D-5), `delayed` is the state a HEALTHY cascade occupies
+      // between ticks, and BullMQ also parks a retrying job there during backoff.
+      // watchdogGltvCascade correlates liveness from this response, so a lane it
+      // could not see meant a live cascade read as dead: it consumed one of the
+      // job's five recoveries and enqueued against a deterministic id the delayed
+      // job still held, so BullMQ collapsed the add and the recorded "recovery"
+      // never happened. Enumerating delayed jobs is what makes that correlation
+      // exact. SOC 2 CC7.2 / CC7.4.
+      const [waiting, active, delayed, failed, completed] = await Promise.all([
         q.getJobs(['waiting'], 0, limit - 1, false),
         q.getJobs(['active'], 0, limit - 1, false),
+        q.getJobs(['delayed'], 0, limit - 1, false),
         q.getJobs(['failed'], 0, limit - 1, false),
         q.getJobs(['completed'], 0, limit - 1, false),
       ]);
@@ -629,6 +642,24 @@ const server = http.createServer(async (req, res) => {
         project_id: (j.data as { project_id?: string } | undefined)?.project_id || null,
         request_id: (j.data as { request_id?: string } | undefined)?.request_id || null,
       });
+      // Delayed jobs carry the extra facts a caller needs to PROVE liveness
+      // rather than infer it: how many attempts have run (so a backoff park is
+      // distinguishable from a normal between-tick park), the configured delay,
+      // and a best-effort next-run estimate. `next_run_estimate_ms` is named as
+      // an estimate deliberately — BullMQ keeps the authoritative run-at time as
+      // the delayed-set score, and `timestamp + delay` is the closest honest
+      // reconstruction from the job object. `failed_reason` is included because a
+      // job in retry-backoff still carries the reason its previous attempt threw.
+      const shapeDelayed = (j: Parameters<typeof shape>[0] & { delay?: number }) => {
+        const base = shape(j);
+        const delayMs = typeof j.delay === 'number' ? j.delay : null;
+        return {
+          ...base,
+          state: 'delayed',
+          delay_ms: delayMs,
+          next_run_estimate_ms: delayMs !== null && typeof j.timestamp === 'number' ? j.timestamp + delayMs : null,
+        };
+      };
       const workerRow = workers.find(w => w.name === queue);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
@@ -638,9 +669,15 @@ const server = http.createServer(async (req, res) => {
         worker_running: workerRow ? !workerRow.closing : false,
         worker_concurrency: workerRow?.opts.concurrency ?? null,
         counts,
+        // Signals to the caller that delayed jobs are enumerated individually,
+        // so a pre-D-8 worker (which omits this) can still be told apart from a
+        // lane that genuinely has no delayed jobs. watchdogGltvCascade keys its
+        // precise-vs-conservative behaviour off exactly this flag.
+        delayed_enumerated: true,
         recent: {
           waiting: waiting.map(shape),
           active: active.map(shape),
+          delayed: delayed.map(shapeDelayed),
           failed: failed.map(shape),
           completed: completed.map(shape),
         },
@@ -953,9 +990,36 @@ const server = http.createServer(async (req, res) => {
 
     try {
       const q = getQueue(queue);
+      // DEDUPE DISCLOSURE (D-8, 2026-08-22). When the caller supplies a
+      // deterministic jobId, BullMQ silently returns the INCUMBENT job if that id
+      // is already present and adds nothing. That collapse is the single-flight
+      // guarantee working, but the response was indistinguishable from a real
+      // add — the caller got back the same id either way. watchdogGltvCascade
+      // spends a bounded recovery on a resume, so it must be able to tell "a tick
+      // was queued" from "an identical tick already existed"; otherwise it records
+      // recoveries that never happened. One cheap getJob before the add makes the
+      // outcome truthful. Purely additive: every existing caller ignores the two
+      // new fields. SOC 2 CC7.4 / CC8.1.
+      const requestedId = typeof (opts as { jobId?: unknown } | undefined)?.jobId === 'string'
+        ? String((opts as { jobId?: string }).jobId)
+        : null;
+      let preExistingState: string | null = null;
+      if (requestedId) {
+        const incumbent = await q.getJob(requestedId).catch(() => null);
+        if (incumbent) preExistingState = await incumbent.getState().catch(() => 'unknown');
+      }
       const job = await q.add(queue, payload, { ...DEFAULT_JOB_OPTIONS, ...(opts || {}) });
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, job_id: job.id, queue }));
+      res.end(JSON.stringify({
+        ok: true,
+        job_id: job.id,
+        queue,
+        pre_existing_state: preExistingState,
+        // A terminal incumbent (completed/failed) does not block a fresh add —
+        // BullMQ replaces it — so only a non-terminal incumbent means the add
+        // was collapsed and nothing new was queued.
+        accepted: !preExistingState || preExistingState === 'completed' || preExistingState === 'failed',
+      }));
     } catch (err) {
       const e = err as Error;
       captureError(e, { route: '/enqueue', queue });
