@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-08-22b-me-uuid-v4-delayed-liveness';
+export const BUILD_TAG = '2026-08-22c-me-poll-persistent-singleton';
