@@ -1415,6 +1415,17 @@ export interface MEPollJobData {
   /** Scoped JWT bound to (fn='pollMEStatus'). Long TTL — this is a perpetual
    *  heartbeat; the producer reseeds with a fresh token periodically. */
   auth_token: string;
+  /**
+   * CONSECUTIVE failed sweeps carried on the job across self-reschedules
+   * (2026-08-22). Nothing else drives this lane, so a single transient sweep
+   * error must not end the heartbeat — but an endlessly failing sweep must not
+   * spin silently either. The tick reschedules while this stays under
+   * ME_POLL_MAX_CONSECUTIVE_TICK_FAILURES and stops loudly once it is spent; a
+   * successful sweep resets it to 0. Carried on the job (not in memory) so the
+   * bound survives a pod recycle and is readable from the payload. Absent on a
+   * freshly seeded job and on any job predating the field — both mean zero.
+   */
+  consecutive_failures?: number;
 }
 
 // ─── Consensus transcription payload (Phase 1, 2026-07-13) ───────────────────
