@@ -10,7 +10,7 @@ import { env, assertS3CredsOrWarn } from './env.js';
 import { getRedis, closeRedis } from './redis.js';
 import { initSentry, captureError, flushSentry } from './sentry.js';
 import { logEvent } from './base44-client.js';
-import { QUEUE_NAMES } from '../shared/queue-contracts.js';
+import { QUEUE_NAMES, JOB_SCHEMA_VERSION, ME_POLL_JOB_OPTIONS } from '../shared/queue-contracts.js';
 // Single source of truth for the build fingerprint. Lives in its own module so
 // processors can stamp it onto the evidence they persist without importing this
 // entry point (which would be circular).
@@ -104,6 +104,10 @@ import { processSrtTranslate } from './processors/srt-translate.js';
 import { makeMEPollProcessor } from './processors/me-poll.js';
 // Boot-seeds the perpetual M&E poll heartbeat (self-starting, no Base44 cron).
 import { seedMEPollHeartbeat } from './me-poll-seed.js';
+// State-aware reseed of the M&E singleton — shared verbatim by the boot seed and
+// the /me-poll/reseed admin endpoint so the two can never diverge on what is
+// safe to replace. Only a provably terminal poller is ever removed.
+import { reseedMEPollSingleton } from './me-poll-singleton.js';
 // Dual-Model Consensus transcription (Phase 1, 2026-07-13). ISOLATED lane. One
 // tick-resumable job per ConsensusTranscriptionRun; the step advances a phase
 // machine (Phase 1 parks at awaiting_merge). Producer is enqueueConsensusTranscription
@@ -565,6 +569,72 @@ const server = http.createServer(async (req, res) => {
       s3_creds_missing: s3Creds.missing,
       queues: workers.map(w => ({ name: w.name, concurrency: w.opts.concurrency, running: !w.closing })),
     }));
+    return;
+  }
+
+  if (req.url === '/me-poll/reseed' && req.method === 'POST') {
+    // ───────────────────────────────────────────────────────────────────────────
+    // /me-poll/reseed — the ONE supported path for restoring the perpetual M&E
+    // harvester (called by the Base44 fn `enqueueMEPoll`).
+    //
+    // WHY THIS ENDPOINT EXISTS RATHER THAN A PLAIN /enqueue (2026-08-22). The
+    // admin reseed used to POST /enqueue with the deterministic jobId and trust
+    // BullMQ to make a duplicate a no-op. A jobId held by a STALE COMPLETED
+    // record is not reusable either, and `removeOnComplete` eviction is lazy —
+    // it runs when a LATER job in the same queue completes, which never happens
+    // on a single-job queue. So the reseed silently collapsed against a dead
+    // singleton and reported success; measured in production, the harvester was
+    // dead from 2026-08-01 while three independent restore paths all "worked".
+    //
+    // Reseeding therefore has to be STATE-AWARE, and that decision cannot live
+    // in a Base44 function (it has no Redis access). It runs here, through the
+    // exact same routine as the boot seed, so the two cannot diverge: a live
+    // poller (active/waiting/delayed/prioritized/paused, or any state we cannot
+    // classify) is left completely untouched, and only a provably terminal
+    // singleton is removed and replaced.
+    //
+    // Body: { auth_token: string, request_id?: string, schema_version?: number }
+    // Returns: { ok, action: 'seed'|'replace'|'no_op', reason, observed_state,
+    //            seeded, job_id }
+    // Auth: same shared secret as /enqueue and /queue-status.
+    // SOC 2 CC7.2 (the heartbeat is restorable through an audited path) /
+    // CC8.1 (the response states what was observed and what was done).
+    // ───────────────────────────────────────────────────────────────────────────
+    if (!env.ENQUEUE_SECRET || req.headers['x-enqueue-secret'] !== env.ENQUEUE_SECRET) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unauthorized' }));
+      return;
+    }
+    let rawBody = '';
+    for await (const chunk of req) rawBody += chunk;
+    let parsedReseed: { auth_token?: string; request_id?: string; schema_version?: number };
+    try { parsedReseed = JSON.parse(rawBody); } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid JSON' }));
+      return;
+    }
+    if (!parsedReseed.auth_token) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'auth_token required (scoped JWT bound to fn=pollMEStatus)' }));
+      return;
+    }
+    try {
+      const result = await reseedMEPollSingleton({
+        queue: getQueue(QUEUE_NAMES.ME_POLL),
+        data: {
+          schema_version: parsedReseed.schema_version ?? JOB_SCHEMA_VERSION,
+          request_id: parsedReseed.request_id || `reseed-${Date.now()}`,
+          auth_token: parsedReseed.auth_token,
+          consecutive_failures: 0,
+        },
+        opts: ME_POLL_JOB_OPTIONS,
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, ...result }));
+    } catch (error) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String((error as Error)?.message || error).slice(0, 300) }));
+    }
     return;
   }
 
