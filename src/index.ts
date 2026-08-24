@@ -1107,10 +1107,26 @@ const server = http.createServer(async (req, res) => {
         job_id: job.id,
         queue,
         pre_existing_state: preExistingState,
-        // A terminal incumbent (completed/failed) does not block a fresh add —
-        // BullMQ replaces it — so only a non-terminal incumbent means the add
-        // was collapsed and nothing new was queued.
-        accepted: !preExistingState || preExistingState === 'completed' || preExistingState === 'failed',
+        // ANY incumbent under the requested id blocks the add. The earlier claim
+        // here — that BullMQ "replaces" a terminal (completed/failed) incumbent —
+        // is FALSE: `Queue.add` keys on the job id, and while that key exists the
+        // add returns the incumbent and queues nothing, whatever state it is in.
+        //
+        // MEASURED CONSEQUENCE (job 6a8bd53762fb222094d48c0b, 2026-08-24): a
+        // cascade tick failed on a platform rate limit and was retained in
+        // `failed` under the deterministic id. The watchdog then re-added twice,
+        // this endpoint reported accepted:true both times, and the watchdog
+        // recorded two recoveries and spent two of its five-recovery budget while
+        // the lane stayed at 0 waiting / 0 active / 0 delayed. Nothing ran. At the
+        // cap the job would have been failed out for a reason unrelated to itself
+        // — an unfalsifiable recovery, the exact class D-1 and D-8 closed for the
+        // counter and for non-terminal incumbents respectively.
+        //
+        // Reporting a terminal incumbent as BLOCKING is what makes the watchdog's
+        // existing refund path fire. Removing the corpse so a resume can actually
+        // resume is the caller's job (see watchdogGltvCascade), deliberately: this
+        // endpoint reports truthfully and never destroys queue state on its own.
+        accepted: !preExistingState,
       }));
     } catch (err) {
       const e = err as Error;
