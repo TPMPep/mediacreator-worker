@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-08-24b-cascade-recovery-integrity';
+export const BUILD_TAG = '2026-08-24c-apitest-poll-transient-retry';
