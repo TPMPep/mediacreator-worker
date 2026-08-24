@@ -80,6 +80,14 @@ export async function processVoiceGen(job: Job<VoiceGenJobData>) {
         // when the producer didn't set it (the common case — manual segment
         // regen with the toggle OFF, and ALL bulk runs).
         consistency_strategy: consistency_strategy ?? undefined,
+        // THE BOUND on generateOneSegment's platform-back-pressure deferral. It
+        // deliberately does NOT own a budget of its own: this lane's real BullMQ
+        // ladder is the budget, so a Base44 SDK 429 before any provider request
+        // defers to the next attempt and, on the LAST attempt, is written as a
+        // loud failure with the original evidence. Passing the true numbers is
+        // what makes that bound provable rather than assumed. SOC 2 CC7.4.
+        attempt: job.attemptsMade + 1,
+        max_attempts: typeof job.opts?.attempts === 'number' ? job.opts.attempts : null,
       },
       timeoutMs: 5 * 60 * 1000,
     });
