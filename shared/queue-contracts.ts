@@ -1364,6 +1364,17 @@ export interface GltvCascadeJobData {
   project_id: string;
   request_id: string;
   auth_token: string;
+  /**
+   * How many TRANSIENT reschedules this cascade has spent (see
+   * src/gltv-tick-retry.ts). Absent on every job enqueued by a producer — only
+   * the worker writes it, when a worker→brain call is refused by platform
+   * back-pressure and the tick is rescheduled instead of failing the chain. It is
+   * cleared by the normal continue/advance path, so a cascade that recovers gets
+   * its full allowance back for a genuinely separate later incident. Bounded by
+   * MAX_TRANSIENT_TICK_RETRIES; past the bound the tick fails loudly and
+   * watchdogGltvCascade owns recovery under its own five-recovery budget.
+   */
+  transient_retry_count?: number;
 }
 
 export interface GltvMEExtractionJobData {
@@ -1743,10 +1754,21 @@ export const BACKUP_JOB_OPTIONS = {
 // work. The other two producers already used attempts:1; this aligns the third.
 // A genuinely dead chain is resumed by watchdogGltvCascade, which is bounded to 5
 // recoveries per job. SOC 2 CC7.4.
+// removeOnFail is BOUNDED TIGHTLY (1h, and at most 200 rows) rather than the
+// lane-default 7 days. BullMQ dedupes against a job id for as long as the job
+// EXISTS in ANY state, so a retained FAILED tick occupies the deterministic id
+// exactly as a retained completed one would — the reason removeOnComplete is
+// immediate. Measured (job 6a8bd53762fb222094d48c0b, 2026-08-24): a tick failed
+// on a platform rate limit, sat in `failed` under the deterministic id, and every
+// subsequent watchdog resume collapsed against it while reporting success.
+// One hour keeps a fresh failure inspectable in the DLQ panel for triage without
+// letting it wedge its own cascade for a week. DubbingApiJob.phase_history remains
+// the durable per-phase audit record, so nothing auditor-facing depends on this
+// retention window. SOC 2 CC7.2.
 export const GLTV_CASCADE_JOB_OPTIONS = {
   attempts: 1,
   removeOnComplete: true,
-  removeOnFail: { age: 86400 * 7 },
+  removeOnFail: { age: 3600, count: 200 },
 };
 
 /**
