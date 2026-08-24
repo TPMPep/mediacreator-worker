@@ -48,6 +48,7 @@ import type { Job } from 'bullmq';
 import { createHash } from 'node:crypto';
 import type { GltvApiTestJobData } from '../../shared/queue-contracts.js';
 import { invokeBase44Function, logEvent, runWithLockHeartbeat, WorkerLockLostError } from '../base44-client.js';
+import { decideTransientRetry, isTransientTickError, MAX_TRANSIENT_TICK_RETRIES } from '../gltv-tick-retry.js';
 import { env } from '../env.js';
 
 const BRAIN_FN = 'gltvApiTestWorkerStep';
@@ -340,6 +341,10 @@ export async function processGltvApiTest(job: Job<GltvApiTestJobData>, token?: s
           schema_version: job.data.schema_version,
           test_run_id, user_email, request_id,
           auth_token: step.next_auth_token || auth_token,
+          // A healthy tick returns the full transient budget: a run that recovered
+          // gets its whole allowance back for a genuinely separate later incident,
+          // rather than carrying a spent counter for the rest of its window.
+          transient_retry_count: 0,
         });
         await _log('info', 'gltv_api_test_next_tick_scheduled', { ...baseCtx, delay_ms: delay, continuation: 'move_to_delayed' });
         await job.moveToDelayed(Date.now() + delay, token);
@@ -353,9 +358,55 @@ export async function processGltvApiTest(job: Job<GltvApiTestJobData>, token?: s
     if (err instanceof DelayedError) throw err;
     const e = err as Error;
     const lockLost = e instanceof WorkerLockLostError;
+    // Read off the un-narrowed Error: narrowing via `instanceof WorkerLockLostError`
+    // makes the false branch `never`, because it is structurally identical to Error.
+    const errName: string = e.name;
+    const errMessage: string = e.message;
+
+    // ─── TRANSIENT PLATFORM BACK-PRESSURE → RESCHEDULE, DO NOT DIE ───────────
+    // Identical reasoning to the cascade lane, and the same shared rule
+    // (gltv-tick-retry), because it is the same failure: a worker→brain call
+    // refused by the platform's own rate limiter says nothing about the run.
+    //
+    // A POLL IS EVEN SAFER TO REPLAY THAN A CASCADE TICK: it only READS job
+    // status through the public endpoint and hands the readings to the brain,
+    // which is the sole writer. It creates no job, uploads nothing and spends no
+    // provider money, so re-running it is idempotent by construction.
+    //
+    // WHAT IT PROTECTS: the observation window, not the pipeline. The underlying
+    // GLTV job keeps running regardless — the harm was that the harness stopped
+    // WATCHING it, leaving the run row permanently disagreeing with the delivered
+    // artifact. Bounded by the same small budget so a sustained outage terminalises
+    // the run honestly (its own `timeout_at`, then stale-claim reclamation) instead
+    // of rescheduling forever. A lock-loss is excluded: without the lock we cannot
+    // legitimately reschedule, and BullMQ's reclaim already owns that case.
+    //
+    // DELIBERATELY NOT A SUBMIT-PHASE RETRY: isTransientTickError only matches
+    // brain/transport back-pressure, and a submit that already reached
+    // gltvCreateDubbingJob is recorded by the brain before this branch is reached.
+    if (!lockLost && token && isTransientTickError(errMessage)) {
+      const retry = decideTransientRetry(job.data.transient_retry_count);
+      if (retry.retry) {
+        await job.updateData({ ...job.data, transient_retry_count: retry.next_count });
+        await _log('warn', 'gltv_api_test_tick_transient_retry', {
+          ...baseCtx,
+          error_kind: errName,
+          transient_retry_count: retry.next_count,
+          max_transient_retries: MAX_TRANSIENT_TICK_RETRIES,
+          delay_ms: retry.delay_ms,
+          reason: retry.reason,
+        }, `Harness tick hit transient platform back-pressure — rescheduling in ${Math.round(retry.delay_ms / 1000)}s (${retry.reason}). No attempt consumed; the underlying GLTV job is untouched: ${errMessage}`);
+        await job.moveToDelayed(Date.now() + retry.delay_ms, token);
+        throw new DelayedError();
+      }
+      // Budget exhausted — fall through and fail loudly so the exhaustion is
+      // visible rather than being absorbed as another quiet reschedule.
+    }
+
     await _log(lockLost ? 'warn' : 'error', lockLost ? 'gltv_api_test_lock_lost' : 'gltv_api_test_failed', {
-      ...baseCtx, total_duration_ms: Date.now() - t0, error_kind: e.name,
-    }, String(e.message || '').slice(0, 400));
+      ...baseCtx, total_duration_ms: Date.now() - t0, error_kind: errName,
+      transient_retry_count: job.data.transient_retry_count ?? 0,
+    }, String(errMessage || '').slice(0, 400));
     throw err;
   }
 }
