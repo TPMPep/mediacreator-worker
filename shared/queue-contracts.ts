@@ -1573,6 +1573,20 @@ export interface GltvApiTestJobData {
   request_id: string;
   /** Scoped JWT bound to (admin, test_run_id, 'gltvApiTestWorkerStep'). */
   auth_token: string;
+  /**
+   * How many TRANSIENT platform back-pressure reschedules this run's poll chain
+   * has already spent (see src/gltv-tick-retry.ts). Absent/0 on a healthy run.
+   *
+   * WHY THE HARNESS NEEDS IT TOO: the poll chain is a self-rescheduling
+   * `moveToDelayed` loop exactly like the cascade's, and it ran with no defence
+   * against a platform 500 on the worker→brain call. Run 6a8bd53499876251c2754b21
+   * stopped polling at 05:28 after 16 ticks while its underlying job went on to
+   * deliver a 154MB WAV — so the audit row said `running` / 0 bytes for a job
+   * that had completed. A harness that dies silently mid-observation produces
+   * incomplete evidence for a test that spent real provider money, which is the
+   * one outcome the run row exists to prevent. Reset to 0 by every healthy tick.
+   */
+  transient_retry_count?: number;
 }
 
 // Discriminated union for processors that need to handle multiple shapes.
