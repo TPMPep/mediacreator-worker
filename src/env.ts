@@ -256,6 +256,36 @@ export const env = {
   // pressure; each run processes a bounded number of items per tick.
   CONCURRENCY_TAIL_NORMALIZATION: intEnv('WORKER_CONCURRENCY_TAIL_NORMALIZATION', 2),
 
+  // Internal GLTV public-API test harness (2026-08-24). Held at 2 — a test run
+  // is ONE job that submits a bounded burst of create calls then parks in
+  // `delayed` between polls, so the slot is idle almost the whole time. 2 covers
+  // a second admin test queued behind the first without letting the harness
+  // itself become a source of load.
+  CONCURRENCY_GLTV_API_TEST: intEnv('WORKER_CONCURRENCY_GLTV_API_TEST', 2),
+  // ── Internal GLTV API test credentials (2026-08-24) ─────────────────────
+  // THE ONLY PLACE THE TEST BEARER SECRETS EXIST. Never sent to Base44, never
+  // written to an entity, never logged, never returned in a response, and never
+  // present in the job payload. Two classes, deliberately separate:
+  //   • _TEST — the dedicated gltv_test_ credential for routine/release smoke
+  //     tests; the everyday path.
+  //   • _LIVE — the dedicated LIVE test credential for the numbered W-run
+  //     campaigns, rotated and revoked after each campaign. It is the weaker
+  //     link of the two by nature, which is exactly why it is kept separate and
+  //     is not the credential used for routine testing.
+  // A customer's credential is never one of these: the producer refuses any key
+  // not explicitly marked as an internal test credential.
+  //
+  // Optional at boot ON PURPOSE. A missing value fails ONLY this isolated test
+  // lane (loudly, before any request, via the key-hash check) rather than
+  // crashing a worker that serves 20+ production queues.
+  GLTV_TEST_API_KEY_TEST: process.env.GLTV_TEST_API_KEY_TEST || '',
+  GLTV_TEST_API_KEY_LIVE: process.env.GLTV_TEST_API_KEY_LIVE || '',
+  // Public origin the test harness is allowed to call. Mirrors
+  // base44/shared/public-api-base.ts; parity asserted in CI. The worker
+  // validates every brain-supplied endpoint against THIS value, so a directive
+  // can never point the harness at an arbitrary host.
+  PUBLIC_API_BASE_URL: process.env.PUBLIC_API_BASE_URL || 'https://mediacreator.blutools.io',
+
   ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
 
