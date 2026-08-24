@@ -124,6 +124,14 @@ import { processSpeakerDiarization } from './processors/speaker-diarization.js';
 // before the job is minted).
 import { processPerformanceCapture } from './processors/performance-capture.js';
 import { processTailNormalization } from './processors/tail-normalization.js';
+// Internal GLTV public-API test harness (2026-08-24). ADDITIVE test
+// infrastructure: it exercises the REAL public endpoint as a real external
+// caller. It exists here because a Base44 function physically cannot call our
+// own public host (508 Loop Detected on a self-host fetch; functions.invoke
+// drops custom headers so it cannot carry a bearer key) — and because a call
+// from this worker is genuinely external, which is the more faithful test.
+// This worker holds the ONLY copy of the test bearer credential.
+import { processGltvApiTest } from './processors/gltv-api-test.js';
 
 initSentry();
 
@@ -479,6 +487,20 @@ const workers: Worker[] = [
     concurrency: env.CONCURRENCY_TAIL_NORMALIZATION,
     stalledInterval: 30_000,
     maxStalledCount: 2,
+  }),
+  // Internal GLTV public-API test harness (2026-08-24). ISOLATED lane, default
+  // concurrency 2 — a run submits a bounded burst then parks in `delayed`
+  // between polls, so it holds no slot while waiting for delivery.
+  // STALLED-JOB RECLAIM is deliberately NOT enabled here. Every other lane can
+  // safely be reclaimed because its step is idempotent; this lane's submit phase
+  // is not free to repeat — a reclaimed tick that already POSTed create calls to
+  // the real public API would spend again. The brain's phase machine makes a
+  // resumed run skip an already-submitted phase, and a run whose worker dies is
+  // recovered by the stale-claim window at the next launch rather than by a
+  // reclaim. SOC 2 CC7.4 — bounded spend beats faster self-heal.
+  new Worker(QUEUE_NAMES.GLTV_API_TEST, processGltvApiTest, {
+    ...baseOpts,
+    concurrency: env.CONCURRENCY_GLTV_API_TEST,
   }),
 ];
 
