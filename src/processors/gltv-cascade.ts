@@ -55,6 +55,7 @@ import type { GltvCascadeJobData } from '../../shared/queue-contracts.js';
 // QUEUE_NAMES is no longer needed here: the tick continues itself via
 // job.moveToDelayed (ONE persistent job) instead of adding a new job.
 import { invokeBase44Function, logEvent, runWithLockHeartbeat, WorkerLockLostError } from '../base44-client.js';
+import { decideTransientRetry, isTransientTickError, MAX_TRANSIENT_TICK_RETRIES } from '../gltv-tick-retry.js';
 import { env } from '../env.js';
 
 const FUNCTION_CALL_TIMEOUT_MS = 90_000;   // One brain step (decide or record).
@@ -346,6 +347,11 @@ export function makeGltvCascadeProcessor(_getQueue: (name: string) => Queue) {
 
         // Carry the renewed auth token onto THIS job before rescheduling it, so
         // the next tick of the same job runs on a fresh 30-min clock.
+        // NOTE: transient_retry_count is deliberately NOT carried forward here.
+        // A tick that reached a real decision proves the platform is answering
+        // again, so the transient allowance resets and a genuinely separate later
+        // incident gets its own full budget. The bound exists to stop a SUSTAINED
+        // outage from rescheduling forever, not to ration a long healthy cascade.
         await job.updateData({
           schema_version: job.data.schema_version,
           dubbing_api_job_id,
@@ -398,6 +404,47 @@ export function makeGltvCascadeProcessor(_getQueue: (name: string) => Queue) {
       const errName: string = e.name;
       const errStack: string | undefined = e.stack;
       const errMessage: string = e.message;
+
+      // ─── TRANSIENT PLATFORM BACK-PRESSURE → RESCHEDULE, DO NOT DIE ──────────
+      // A worker→brain call refused by the platform's own rate limiter says
+      // nothing about this job: the brain decided nothing and called no producer,
+      // so re-running the tick is idempotent by construction. Before this branch
+      // existed, such a failure ended the chain outright (attempts:1) — job
+      // 6a8bd53762fb222094d48c0b had all 42 lines rendered and its voice run
+      // completed, and still never produced a WAV, because its tick hit
+      // `HTTP 500: {"error":"Rate limit exceeded"}` and nothing came back.
+      //
+      // We reschedule through the SAME mechanism a healthy tick uses between
+      // ticks, so no attempt is consumed and no failure row is written, and we
+      // never widen `attempts` — a tick that already issued a producer directive
+      // is still never replayed (isTransientTickError refuses producer failures).
+      // A lock-loss is excluded: without the lock we cannot legitimately
+      // reschedule, and BullMQ's reclaim already owns that case.
+      if (!lockLost && token && isTransientTickError(errMessage)) {
+        const retry = decideTransientRetry(job.data.transient_retry_count);
+        if (retry.retry) {
+          await job.updateData({ ...job.data, transient_retry_count: retry.next_count });
+          await _log('warn', 'gltv_cascade_tick_transient_retry', {
+            ...baseCtx,
+            error_kind: errName,
+            transient_retry_count: retry.next_count,
+            max_transient_retries: MAX_TRANSIENT_TICK_RETRIES,
+            delay_ms: retry.delay_ms,
+            reason: retry.reason,
+          }, `Cascade tick hit transient platform back-pressure — rescheduling in ${Math.round(retry.delay_ms / 1000)}s (${retry.reason}). No attempt consumed, no producer work re-issued: ${errMessage}`);
+          await job.moveToDelayed(Date.now() + retry.delay_ms, token);
+          throw new DelayedError();
+        }
+        // Budget exhausted — fall through to the loud failure below so the
+        // watchdog (bounded to 5 recoveries) owns it from here.
+        await _log('error', 'gltv_cascade_tick_transient_exhausted', {
+          ...baseCtx,
+          error_kind: errName,
+          transient_retry_count: retry.next_count,
+          max_transient_retries: MAX_TRANSIENT_TICK_RETRIES,
+          reason: retry.reason,
+        }, `Transient reschedule budget exhausted after ${retry.next_count} attempts — failing the tick loudly for watchdog recovery: ${errMessage}`);
+      }
       console.error(`[bullmq:gltv-cascade] ${lockLost ? 'gltv_cascade_lock_lost' : 'gltv_cascade_failure'} job=${job.id} dubbing_api_job=${dubbing_api_job_id} attempt=${job.attemptsMade + 1} duration_ms=${Date.now() - t0} error_kind=${errName} message=${String(errMessage || '').slice(0, 500)}`);
       if (errStack && !lockLost) {
         console.error(`[bullmq:gltv-cascade] stack: ${errStack.split('\n').slice(0, 5).join(' | ')}`);
