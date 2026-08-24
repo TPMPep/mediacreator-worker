@@ -319,6 +319,29 @@ export const QUEUE_NAMES = {
   // with user confirmation between them. Isolated concurrency lane prevents
   // bulk FFmpeg analysis from starving voice generation or exports.
   TAIL_NORMALIZATION: 'tail-normalization',
+  // Internal GLTV public-API test harness (2026-08-24). ADDITIVE TEST
+  // INFRASTRUCTURE — it changes nothing about the production API; it CALLS it.
+  //
+  // WHY IT LIVES IN THE WORKER RATHER THAN IN A BASE44 FUNCTION: a Base44
+  // function cannot call our own public host at all. A raw fetch from a function
+  // to our own deployment returns 508 Loop Detected, and functions.invoke
+  // silently drops custom headers so it cannot carry a bearer key. The worker is
+  // genuinely off-platform, so a request from here is a real external HTTPS call
+  // over real DNS/TLS from a foreign origin — which is not a workaround but the
+  // more faithful test: it is exactly what an integrating customer does.
+  //
+  // ONE persistent tick-resumable job per GltvApiTestRun. The worker calls
+  // gltvApiTestWorkerStep (the brain) which decides and persists; the worker is
+  // pure transport and holds the ONLY copy of the test bearer credential (from
+  // its own env, verified against the referenced ApiKey's key_hash before any
+  // request is sent). While waiting for dubbing jobs to reach a terminal state
+  // the job reschedules ITSELF via moveToDelayed — it never occupies an active
+  // worker slot for the duration of a cascade, and it never re-adds itself
+  // against its own still-occupied deterministic id.
+  //
+  // SOC 2 CC6.1 (every test attributable) / CC7.4 (bounded concurrency + bounded
+  // window on real provider spend) / CC8.1 (GltvApiTestRun is the audit row).
+  GLTV_API_TEST: 'gltv-api-test',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -1519,6 +1542,28 @@ export interface TailNormalizationJobData {
   auth_token: string;
 }
 
+// ─── Internal GLTV public-API test payload (2026-08-24) ─────────────────────
+//
+// Deliberately MINIMAL. The payload carries a run id and a scoped callback JWT —
+// nothing else. No URL, no host, no function name, no header, no method, and
+// above all NO CREDENTIAL. The brain returns endpoint URLs it derived from the
+// one canonical public-api-base module, the worker validates them against its
+// own copy of the same origin + a three-entry function allow-list, and the
+// bearer secret is read from the worker's own environment (selected by the
+// run's credential_class through a map the worker owns). That is what keeps this
+// a fixed-target harness rather than a general-purpose proxy.
+export interface GltvApiTestJobData {
+  schema_version: number;
+  /** GltvApiTestRun.id — the run this job advances. */
+  test_run_id: string;
+  /** Admin that launched the test (attribution; preserved across ticks). */
+  user_email: string;
+  /** Correlation id threaded into every log row for this run. */
+  request_id: string;
+  /** Scoped JWT bound to (admin, test_run_id, 'gltvApiTestWorkerStep'). */
+  auth_token: string;
+}
+
 // Discriminated union for processors that need to handle multiple shapes.
 export type AnyJobData =
    | VoiceGenJobData
@@ -1552,7 +1597,8 @@ export type AnyJobData =
    | TranscriptionJobData
    | SpeakerDiarizationJobData
    | PerformanceCaptureJobData
-   | TailNormalizationJobData;
+   | TailNormalizationJobData
+   | GltvApiTestJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
 
@@ -1728,6 +1774,29 @@ export const ME_POLL_JOB_OPTIONS = {
   removeOnComplete: { age: 600, count: 5 },
   removeOnFail: { age: 86400 },
 };
+
+// Internal GLTV API test harness (2026-08-24). Same posture as the cascade, for
+// the same reasons: attempts=1 because a BullMQ retry of a tick that already
+// submitted create calls would re-spend on the real API, and the run is ONE
+// persistent self-rescheduling job so removeOnComplete must be immediate —
+// BullMQ dedupes against a retained completed job, which would block the next
+// legitimate test for that run id. Failed jobs are retained 7d for the DLQ; the
+// GltvApiTestRun row is the durable audit record either way.
+export const GLTV_API_TEST_JOB_OPTIONS = {
+  attempts: 1,
+  removeOnComplete: true,
+  removeOnFail: { age: 86400 * 7 },
+};
+
+/**
+ * The ONE deterministic BullMQ job id for an internal API test run. The producer
+ * is the only enqueue path; the worker keeps this id occupied for the whole run
+ * (including while parked in `delayed`) by rescheduling itself, so a duplicate
+ * launch is collapsed by BullMQ at every instant.
+ */
+export function GLTV_API_TEST_JOB_ID(testRunId: string): string {
+  return `gltv-api-test-${testRunId}`;
+}
 
 // ─── Project cascade payload (2026-05-15) ────────────────────────────
 //
