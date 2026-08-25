@@ -3,6 +3,7 @@ import type { SpeakerDiarizationJobData } from '../../shared/queue-contracts.js'
 import { WorkerStandDownError, invokeBase44Function, logEvent, runWithLockHeartbeat } from '../base44-client.js';
 import { env } from '../env.js';
 import { alignTranscript, assertAlignmentQuality } from '../alignment-client.js';
+import { resolveAlignmentLanguage } from '../canonical-language.js';
 import { TIMELINE_INTEGRITY_POLICY_VERSION, assertFinalWordAcceptance, auditTimelineIntegrity, clampAcousticOnsets, reconcileResolvedUnresolvedWords, restoreDivergedCaptures } from '../timeline-integrity.js';
 import { BUILD_TAG } from '../build-tag.js';
 import { deriveSegmentBoundaries, resolveProviderBoundary } from '../segment-boundaries.js';
@@ -73,7 +74,22 @@ export async function processSpeakerDiarization(job:Job<SpeakerDiarizationJobDat
     // UNRESOLVED_TIMING; nothing is aligned, measured or invented for it.
     const alignmentInput=source.flatMap(segment=>{const words=segment.aai_word_timings||[];if(!words.length&& !segment.is_music&& !textIsAuthoritative(segment))throw new Error(`Missing provider word timings for segment ${segment.id}`);return words.map((word,index)=>({key:`${segment.id}:${index}`,text:String(word.text||'').trim(),provider_start_ms:Number(word.start_ms),provider_end_ms:Number(word.end_ms)})).filter(word=>word.text);});
     if(!alignmentInput.length)throw new Error('No provider words available for forced alignment');
-    const alignment=await alignTranscript({requestId:`${request_id}:${run_id}`,audioUrl:prep.source_url,languageCode:String(prep.project.source_language||'en'),words:alignmentInput,signal});
+    // FAIL-CLOSED LANGUAGE BOUNDARY. The project's source_language is a CANONICAL
+    // field, but this processor cannot verify who wrote it — and on project
+    // 6a8d904d15662678be3befd7 a Scribe ISO-639-3 code ('eng') had been persisted
+    // there and was forwarded verbatim, so the engine answered
+    // `422 ... not commercially supported for language: eng` FOR ENGLISH and three
+    // runs died before a single paid alignment call. A raw code is therefore never
+    // forwarded again: it is resolved to a canonical, engine-supported base here,
+    // or the run fails with one of two NAMED, actionable reasons (unresolvable vs
+    // genuinely unsupported) that tell the operator what to do instead of blaming
+    // a language the engine fully supports.
+    const languageResolution=resolveAlignmentLanguage(prep.project.source_language);
+    if(!languageResolution.ok){
+      await logEvent({function_name:'bullmq:speaker-diarization',level:'error',event:languageResolution.code,message:languageResolution.message,context:{project_id,run_id,job_run_id,request_id,stored_source_language:prep.project.source_language??null,resolved_language_base:languageResolution.language_base}});
+      throw new Error(`${languageResolution.code}: ${languageResolution.message}`);
+    }
+    const alignment=await alignTranscript({requestId:`${request_id}:${run_id}`,audioUrl:prep.source_url,languageCode:languageResolution.code,words:alignmentInput,signal});
     assertAlignmentQuality('Speaker refinement',alignment);
     const alignmentArchive=await timedFetch(prep.alignment_result_upload_url,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(alignment)},signal,120000);if(!alignmentArchive.ok)throw new Error(`alignment result archive failed: HTTP ${alignmentArchive.status}`);
     // Both RAW responses are archived above, untouched. Only the CONSUMED timeline
@@ -281,5 +297,5 @@ speaker_unresolved_word_count:g.words.filter(w=>w.speaker_unresolved===true).len
       await logEvent({function_name:'bullmq:speaker-diarization',level:'info',event:'speaker_diarization_stood_down',message:`Stood down: another refinement run owns this project's single-flight claim. No transcript row was touched and no retry was consumed.`,duration_ms:Date.now()-started,context:{project_id,run_id,job_run_id,request_id,user_email,incumbent_run_id:error.incumbentRunId,refused_operation:error.refusedOperation,detail:error.detail.slice(0,300),attempt:job.attemptsMade+1,max_attempts:Number(job.opts.attempts||1)}});
       return {ok:true,stood_down:true,incumbent_run_id:error.incumbentRunId};
     }
-    const message=String((error as Error)?.message||error).slice(0,500),max=Number(job.opts.attempts||1),terminal=job.attemptsMade+1>=max||/not configured|No source|no usable turns|No active transcript|staging|Translation started|Forced alignment HTTP 4|word-count mismatch|token mismatch|invalid alignment|Missing provider word|timeline_integrity_evidence_unverified/i.test(message);if(terminal)await call('terminal_failure',{terminal_failure:message}).catch(()=>{});await logEvent({function_name:'bullmq:speaker-diarization',level:terminal?'error':'warn',event:terminal?'speaker_diarization_failed':'speaker_diarization_retrying',message,context:{project_id,run_id,job_run_id,request_id,user_email,attempt:job.attemptsMade+1,max_attempts:max}});throw error;}
+    const message=String((error as Error)?.message||error).slice(0,500),max=Number(job.opts.attempts||1),terminal=job.attemptsMade+1>=max||/not configured|No source|no usable turns|No active transcript|staging|Translation started|Forced alignment HTTP 4|word-count mismatch|token mismatch|invalid alignment|Missing provider word|timeline_integrity_evidence_unverified|alignment_language_unresolvable|alignment_language_unsupported/i.test(message);if(terminal)await call('terminal_failure',{terminal_failure:message}).catch(()=>{});await logEvent({function_name:'bullmq:speaker-diarization',level:terminal?'error':'warn',event:terminal?'speaker_diarization_failed':'speaker_diarization_retrying',message,context:{project_id,run_id,job_run_id,request_id,user_email,attempt:job.attemptsMade+1,max_attempts:max}});throw error;}
 }
