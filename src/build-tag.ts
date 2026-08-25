@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-08-24d-voicegen-backpressure-deferral';
+export const BUILD_TAG = '2026-08-25a-canonical-language-alignment-boundary';
