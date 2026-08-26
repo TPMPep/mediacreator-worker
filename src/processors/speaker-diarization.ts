@@ -57,6 +57,33 @@ export async function processSpeakerDiarization(job:Job<SpeakerDiarizationJobDat
   };
   const call=<T=any>(operation:string,payload:Record<string,unknown>={},signal?:AbortSignal):Promise<T>=>
     post<T>('speakerDiarizationWorkerStep',{project_id,run_id,job_run_id,operation,...payload},signal,operation);
+  // ── HONEST STAGE PROGRESS (2026-08-26) ──────────────────────────────────────
+  // Forced alignment is ONE blocking call that legitimately runs for many minutes
+  // on a feature-length asset, and it used to report NOTHING: the run sat at a flat
+  // percentage with no phase, no elapsed time and no liveness signal, so a healthy
+  // 10-minute pass was indistinguishable from a wedged job. Measured on run
+  // 6a8f668a8e3c1e309bebcb66: 80% for 10 minutes, then a terminal failure.
+  //
+  // THE CONTRACT, AND WHY IT IS SHAPED THIS WAY: percentage moves ONLY at real
+  // stage boundaries — it is never interpolated from elapsed time, because a bar
+  // that advances while nothing happens is a more expensive lie than a bar that
+  // does not move. Liveness is answered separately and truthfully by a periodic
+  // tick carrying the phase name, the phase's own elapsed time and the heartbeat
+  // timestamp. "Is it alive?" is answered by freshness; "how far?" by the stage.
+  // Neither number is invented.
+  //
+  // The tick is best-effort by design: a progress report must never be able to fail
+  // a paid provider pass, so every tick swallows its own error. It also refreshes
+  // the project's single-flight refinement claim (the heartbeat operation does that
+  // already), which is what stops a long alignment from being reclaimed as stale.
+  const PHASE_TICK_MS=30_000;
+  const withPhase=async <T,>(phase:string,pct:number,detail:string,signal:AbortSignal,fn:()=>Promise<T>):Promise<T>=>{
+    const phaseStarted=Date.now();
+    const tick=(first:boolean)=>call('heartbeat',{phase,progress_pct:pct,phase_detail:detail,phase_elapsed_ms:Date.now()-phaseStarted,phase_start:first},signal).catch(()=>{});
+    await tick(true);
+    const timer=setInterval(()=>{void tick(false);},PHASE_TICK_MS);
+    try{return await fn();}finally{clearInterval(timer);}
+  };
   try{return await runWithLockHeartbeat(job,async signal=>{
     if(!env.PYANNOTE_API_KEY)throw new Error('PYANNOTE_API_KEY is not configured in Railway');
     const prep=await call<any>('prepare',{},signal); if(prep.action==='done')return {ok:true,already_terminal:true};
@@ -65,6 +92,7 @@ export async function processSpeakerDiarization(job:Job<SpeakerDiarizationJobDat
     let result:any=null,polls=0; while(Date.now()-started<40*60*1000){result=await provider(`${API}/jobs/${providerId}`,{headers:auth},signal);if(result.status==='succeeded')break;if(!['pending','created','running'].includes(result.status))throw new Error(`pyannote job ${result.status||'failed'}: ${result.output?.error||'provider failure'}`);polls++;await call('heartbeat',{progress_pct:Math.min(75,15+polls*3)},signal);await sleep(5000,signal);} if(result?.status!=='succeeded')throw new Error('speaker diarization exceeded 40 minutes');
     const turns:Turn[]=(result.output?.diarization||[]).filter((t:Turn)=>t?.speaker&&Number.isFinite(t.start)&&Number.isFinite(t.end)).sort((a:Turn,b:Turn)=>a.start-b.start);if(!turns.length)throw new Error('pyannote returned no usable turns');await call('mark_reconciling',{},signal);
     const upload=await timedFetch(prep.raw_result_upload_url,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(result)},signal,120000);if(!upload.ok)throw new Error(`raw result archive failed: HTTP ${upload.status}`);
+    await call('heartbeat',{phase:'reading_transcript',progress_pct:58,phase_detail:'Reading the committed transcript to build the alignment input.',phase_start:true},signal).catch(()=>{});
     const source:Segment[]=[];let pageCursor:number|null=-1;while(pageCursor!==null){const page:{rows:Segment[];next_cursor:number|null}=await call<{rows:Segment[];next_cursor:number|null}>('read_segments',{cursor:pageCursor,limit:500},signal);source.push(...page.rows);pageCursor=page.next_cursor;}if(!source.length)throw new Error('No active transcript segments found');
     // An AUTHORITATIVE row with no provider words is exempt from this refusal
     // alongside music. It arises legitimately — an operator split creates a half
@@ -89,7 +117,13 @@ export async function processSpeakerDiarization(job:Job<SpeakerDiarizationJobDat
       await logEvent({function_name:'bullmq:speaker-diarization',level:'error',event:languageResolution.code,message:languageResolution.message,context:{project_id,run_id,job_run_id,request_id,stored_source_language:prep.project.source_language??null,resolved_language_base:languageResolution.language_base}});
       throw new Error(`${languageResolution.code}: ${languageResolution.message}`);
     }
-    const alignment=await alignTranscript({requestId:`${request_id}:${run_id}`,audioUrl:prep.source_url,languageCode:languageResolution.code,words:alignmentInput,signal});
+    // The single longest stage in the pass. Wrapped so it reports its phase, its
+    // own elapsed time and a 30s liveness tick for as long as it runs.
+    const alignment=await withPhase('aligning_words',62,`Aligning ${alignmentInput.length} words against the source audio (${source.length} lines). This is the longest stage and scales with programme length.`,signal,
+      ()=>alignTranscript({requestId:`${request_id}:${run_id}`,audioUrl:prep.source_url,languageCode:languageResolution.code,words:alignmentInput,signal}));
+    // The confidence floor is UNCHANGED and remains a hard refusal. What changed is
+    // only the blast radius of that refusal: see base44/shared/refinement-decoupling.
+    await call('heartbeat',{phase:'verifying_alignment',progress_pct:82,phase_detail:'Checking forced-alignment confidence against the quality floor.',phase_start:true},signal).catch(()=>{});
     assertAlignmentQuality('Speaker refinement',alignment);
     const alignmentArchive=await timedFetch(prep.alignment_result_upload_url,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(alignment)},signal,120000);if(!alignmentArchive.ok)throw new Error(`alignment result archive failed: HTTP ${alignmentArchive.status}`);
     // Both RAW responses are archived above, untouched. Only the CONSUMED timeline
@@ -274,7 +308,7 @@ speaker_unresolved_word_count:g.words.filter(w=>w.speaker_unresolved===true).len
     const evidence=await post<{verified?:boolean;report_id?:string}>('persistTimelineIntegrityReport',{project_id,run_id,job_run_id,request_id,report:integrity,source_segment_count:source.length,output_segment_count:output.length,segment_states:{...segmentStates.counts,blocking_count:segmentStates.blocking_count,policy_version:segmentStates.policy_version},worker_build_tag:BUILD_TAG,alignment_expansion_policy_version:Number(alignment.expansion_policy_version||0)},signal,'persist_timeline_integrity');
     if(!evidence?.verified)throw new Error('timeline_integrity_evidence_unverified: refusing transcript cutover without verified audit evidence');
     await logEvent({function_name:'bullmq:speaker-diarization',event:'timeline_integrity_evidence_verified',context:{project_id,run_id,job_run_id,request_id,report_id:evidence.report_id||null}});
-    for(let i=0;i<output.length;i+=50){await call('stage_segments',{segments:output.slice(i,i+50)},signal);await call('heartbeat',{progress_pct:Math.min(96,82+Math.floor(i/output.length*14))},signal);}
+    for(let i=0;i<output.length;i+=50){await call('stage_segments',{segments:output.slice(i,i+50)},signal);await call('heartbeat',{phase:'staging_transcript',progress_pct:Math.min(96,86+Math.floor(i/output.length*10)),phase_detail:`Staging refined lines ${i+1}–${Math.min(output.length,i+50)} of ${output.length}. The existing transcript stays live until cutover.`},signal);}
     const cs=plans.map(p=>p.confidence).filter((n):n is number=>n!==null),avg=cs.length?cs.reduce((a,b)=>a+b,0)/cs.length:null;await call('finalize',{worker_build_tag:BUILD_TAG,timeline_integrity:integrity,segment_states:{...segmentStates.counts,blocking_count:segmentStates.blocking_count,policy_version:segmentStates.policy_version},boundary_policy:boundaries,final_acceptance:acceptance.report,raw_result_key:prep.raw_result_key,provider_job_id:providerId,source_segment_count:source.length,output_segment_count:output.length,detected_speaker_count:clusters.length,split_count:splits,reassigned_word_count:reassigned,unresolved_word_count:unresolved,average_confidence:avg,speaker_counts:counts,alignment:{status:'verified',provider:alignment.provider,model:alignment.model,model_revision:alignment.model_revision,language_code:alignment.language_code,word_count:alignment.word_count,mean_confidence:alignment.mean_confidence,max_provider_shift_ms:alignment.max_provider_shift_ms,duration_ms:alignment.duration_ms,expansion_policy_version:Number(alignment.expansion_policy_version||0),alignment_pass_count:Number(alignment.alignment_pass_count||0),expanded_chunk_count:Number(alignment.expanded_chunk_count||0),max_expansion_ms:Number(alignment.max_expansion_ms||0),unresolved_word_count:Number(alignment.unresolved_word_count||0),raw_result_key:prep.alignment_result_key}},signal);
     await logEvent({function_name:'bullmq:speaker-diarization',event:'speaker_diarization_completed',duration_ms:Date.now()-started,context:{project_id,run_id,job_run_id,request_id,provider_job_id:providerId,output_segments:output.length,speakers:clusters.length}});return {ok:true,action:'done'};
   });}catch(error){
