@@ -2,7 +2,7 @@ import type { Job } from 'bullmq';
 import type { SpeakerDiarizationJobData } from '../../shared/queue-contracts.js';
 import { WorkerStandDownError, invokeBase44Function, logEvent, runWithLockHeartbeat } from '../base44-client.js';
 import { env } from '../env.js';
-import { alignTranscript, assertAlignmentQuality } from '../alignment-client.js';
+import { ALIGNMENT_QUALITY_POLICY_VERSION, alignTranscript, assertAlignmentQuality } from '../alignment-client.js';
 import { resolveAlignmentLanguage } from '../canonical-language.js';
 import { TIMELINE_INTEGRITY_POLICY_VERSION, assertFinalWordAcceptance, auditTimelineIntegrity, clampAcousticOnsets, reconcileResolvedUnresolvedWords, restoreDivergedCaptures } from '../timeline-integrity.js';
 import { BUILD_TAG } from '../build-tag.js';
@@ -121,10 +121,26 @@ export async function processSpeakerDiarization(job:Job<SpeakerDiarizationJobDat
     // own elapsed time and a 30s liveness tick for as long as it runs.
     const alignment=await withPhase('aligning_words',62,`Aligning ${alignmentInput.length} words against the source audio (${source.length} lines). This is the longest stage and scales with programme length.`,signal,
       ()=>alignTranscript({requestId:`${request_id}:${run_id}`,audioUrl:prep.source_url,languageCode:languageResolution.code,words:alignmentInput,signal}));
-    // The confidence floor is UNCHANGED and remains a hard refusal. What changed is
-    // only the blast radius of that refusal: see base44/shared/refinement-decoupling.
-    await call('heartbeat',{phase:'verifying_alignment',progress_pct:82,phase_detail:'Checking forced-alignment confidence against the quality floor.',phase_start:true},signal).catch(()=>{});
-    assertAlignmentQuality('Speaker refinement',alignment);
+    // ── QUALITY VERDICT — MEASURED, AND RECORDED BEFORE IT IS ACTED ON ────────
+    // The gate judges the MEASURED distribution (p99 word shift + outlier ratio in
+    // ms against the transcriber's own timeline), not the provider's uncalibrated
+    // confidence scalar — see alignment-client.ts for the evidence behind that.
+    //
+    // ORDER IS DELIBERATE: the measurement is persisted as typed evidence on the run
+    // BEFORE the refusal is allowed to throw. Every other alignment figure on the run
+    // is written by `finalize`, which a refused run never reaches — so a rejected run
+    // used to carry no measured evidence at all beyond a sentence in error_message,
+    // and surfaces resorted to regex-scanning that sentence for numbers. Recording
+    // first means the outcome that most needs evidence is the one that has it, and it
+    // makes "confidence is retained as evidence even though it no longer vetoes"
+    // checkable rather than merely stated. The write is NOT swallowed: if the evidence
+    // cannot be recorded the run fails, which is fail-closed in the same direction as
+    // the pre-cutover integrity report.
+    await call('heartbeat',{phase:'verifying_alignment',progress_pct:82,phase_detail:'Measuring how far the aligned words moved against the transcriber\u2019s own timing.',phase_start:true},signal).catch(()=>{});
+    let gateRefusal='';
+    try{assertAlignmentQuality('Speaker refinement',alignment);}catch(error){gateRefusal=String((error as Error)?.message||error).slice(0,500);}
+    await call('record_alignment_quality',{alignment_quality:{policy_version:ALIGNMENT_QUALITY_POLICY_VERSION,passed:!gateRefusal,refusal_reason:gateRefusal,mean_confidence:Number(alignment.mean_confidence||0),word_count:Number(alignment.word_count||0),max_provider_shift_ms:Number(alignment.max_provider_shift_ms||0),p99_provider_shift_ms:alignment.p99_provider_shift_ms??null,median_provider_shift_ms:alignment.median_provider_shift_ms??null,outlier_tolerance_ms:alignment.outlier_tolerance_ms??null,outlier_word_count:alignment.outlier_word_count??null,outlier_ratio:alignment.outlier_ratio??null,unresolved_word_count:Number(alignment.unresolved_word_count||0),timing_repair_count:Number(alignment.timing_repair_count||0),expansion_policy_version:Number(alignment.expansion_policy_version||0),language_code:String(alignment.language_code||''),worker_build_tag:BUILD_TAG}},signal);
+    if(gateRefusal)throw new Error(gateRefusal);
     const alignmentArchive=await timedFetch(prep.alignment_result_upload_url,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(alignment)},signal,120000);if(!alignmentArchive.ok)throw new Error(`alignment result archive failed: HTTP ${alignmentArchive.status}`);
     // Both RAW responses are archived above, untouched. Only the CONSUMED timeline
     // is repaired, in two ordered stages.
@@ -331,5 +347,5 @@ speaker_unresolved_word_count:g.words.filter(w=>w.speaker_unresolved===true).len
       await logEvent({function_name:'bullmq:speaker-diarization',level:'info',event:'speaker_diarization_stood_down',message:`Stood down: another refinement run owns this project's single-flight claim. No transcript row was touched and no retry was consumed.`,duration_ms:Date.now()-started,context:{project_id,run_id,job_run_id,request_id,user_email,incumbent_run_id:error.incumbentRunId,refused_operation:error.refusedOperation,detail:error.detail.slice(0,300),attempt:job.attemptsMade+1,max_attempts:Number(job.opts.attempts||1)}});
       return {ok:true,stood_down:true,incumbent_run_id:error.incumbentRunId};
     }
-    const message=String((error as Error)?.message||error).slice(0,500),max=Number(job.opts.attempts||1),terminal=job.attemptsMade+1>=max||/not configured|No source|no usable turns|No active transcript|staging|Translation started|Forced alignment HTTP 4|word-count mismatch|token mismatch|invalid alignment|Missing provider word|timeline_integrity_evidence_unverified|alignment_language_unresolvable|alignment_language_unsupported/i.test(message);if(terminal)await call('terminal_failure',{terminal_failure:message}).catch(()=>{});await logEvent({function_name:'bullmq:speaker-diarization',level:terminal?'error':'warn',event:terminal?'speaker_diarization_failed':'speaker_diarization_retrying',message,context:{project_id,run_id,job_run_id,request_id,user_email,attempt:job.attemptsMade+1,max_attempts:max}});throw error;}
+    const message=String((error as Error)?.message||error).slice(0,500),max=Number(job.opts.attempts||1),terminal=job.attemptsMade+1>=max||/not configured|No source|no usable turns|No active transcript|staging|Translation started|Forced alignment HTTP 4|word-count mismatch|token mismatch|invalid alignment|Missing provider word|timeline_integrity_evidence_unverified|alignment_language_unresolvable|alignment_language_unsupported|forced alignment is systemically misaligned|forced alignment disagreement is widespread|forced alignment shift/i.test(message);if(terminal)await call('terminal_failure',{terminal_failure:message}).catch(()=>{});await logEvent({function_name:'bullmq:speaker-diarization',level:terminal?'error':'warn',event:terminal?'speaker_diarization_failed':'speaker_diarization_retrying',message,context:{project_id,run_id,job_run_id,request_id,user_email,attempt:job.attemptsMade+1,max_attempts:max}});throw error;}
 }
