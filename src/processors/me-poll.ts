@@ -59,7 +59,9 @@
 import { DelayedError, type Job, type Queue } from 'bullmq';
 import type { MEPollJobData } from '../../shared/queue-contracts.js';
 import { invokeBase44Function, logEvent, runWithLockHeartbeat, WorkerLockLostError } from '../base44-client.js';
+import { env } from '../env.js';
 import { decidePollTick, ME_POLL_JOB_ID } from '../me-poll-singleton.js';
+import { decideTickAuthSource, mintMEPollJWT } from '../me-poll-auth.js';
 
 // One sweep can chain several pollMEStatus harvests internally (the function
 // loops over all active projects). Give it a generous budget; a stuck LALAL
@@ -93,15 +95,37 @@ export function makeMEPollProcessor(_getQueue: (name: string) => Queue) {
       consecutive_failures: job.data.consecutive_failures ?? 0,
     };
 
-    if (!auth_token) {
+    // ── CREDENTIAL: minted FRESH for this tick whenever we can. ──────────────
+    // A perpetual loop must not depend on a token someone else minted hours ago.
+    // Carrying a 6h JWT on job data is what killed this heartbeat every six
+    // hours (see ../me-poll-auth.ts for the measured incident): the job outlives
+    // its credential, every sweep then 401s, and the bounded failure budget
+    // terminalises the singleton. Minting per tick removes that class entirely.
+    const authDecision = decideTickAuthSource({
+      has_secret: !!env.ENQUEUE_SECRET,
+      has_carried_token: !!auth_token,
+    });
+    if (authDecision.source === 'none') {
       await logEvent({
         function_name: 'bullmq:me-poll',
         level: 'error',
         event: 'me_poll_missing_auth_token',
-        message: 'ME-poll tick arrived without auth_token — reseed required via enqueueMEPoll.',
-        context: baseCtx,
+        message: 'ME-poll tick has neither WORKER_ENQUEUE_SECRET (to mint) nor a carried auth_token — cannot authenticate the sweep.',
+        context: { ...baseCtx, ...authDecision },
       });
-      throw new Error('me-poll: missing auth_token (reseed via enqueueMEPoll)');
+      throw new Error('me-poll: no signing secret and no carried auth_token (set WORKER_ENQUEUE_SECRET or reseed via enqueueMEPoll)');
+    }
+    const tickToken = authDecision.source === 'minted'
+      ? mintMEPollJWT(env.ENQUEUE_SECRET as string)
+      : (auth_token as string);
+    if (authDecision.source === 'carried') {
+      await logEvent({
+        function_name: 'bullmq:me-poll',
+        level: 'warn',
+        event: 'me_poll_tick_using_carried_token',
+        message: 'ME-poll tick could not mint its own credential and is reusing the seeded token, which WILL expire and end the heartbeat. Set WORKER_ENQUEUE_SECRET on the worker.',
+        context: { ...baseCtx, ...authDecision },
+      });
     }
 
     try {
@@ -113,7 +137,7 @@ export function makeMEPollProcessor(_getQueue: (name: string) => Queue) {
         try {
           const sweep = await invokeBase44Function<SweepResponse>({
             fn: 'pollMEStatus',
-            authToken: auth_token,
+            authToken: tickToken,
             payload: { mode: 'sweep', request_id },
             timeoutMs: SWEEP_CALL_TIMEOUT_MS,
             signal,
@@ -174,8 +198,16 @@ export function makeMEPollProcessor(_getQueue: (name: string) => Queue) {
 
         // Carry the failure budget forward on the job itself, so the bound
         // survives a pod recycle and is readable from the job payload.
+        //
+        // The seeded token is DROPPED once we can mint our own: keeping it would
+        // leave a bearer credential sitting in Redis for its whole TTL with
+        // nothing reading it, and would preserve the very fallback path whose
+        // expiry killed this loop twice. auth_source is persisted so an operator
+        // can see from the job payload which credential path a live tick used.
         await job.updateData({
           ...job.data,
+          auth_token: authDecision.source === 'minted' ? undefined : job.data.auth_token,
+          auth_source: authDecision.source,
           consecutive_failures: decision.next_consecutive_failures,
         });
 
