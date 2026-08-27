@@ -29,35 +29,17 @@
 // Long TTL because this is a perpetual heartbeat; a deploy reseeds it.
 // =============================================================================
 
-import { createHmac, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import type { Queue } from 'bullmq';
 import { QUEUE_NAMES, ME_POLL_JOB_OPTIONS, JOB_SCHEMA_VERSION } from '../shared/queue-contracts.js';
 import { env } from './env.js';
 import { logEvent } from './base44-client.js';
 import { reseedMEPollSingleton } from './me-poll-singleton.js';
-
-const ME_POLL_JWT_TTL_SECONDS = 6 * 60 * 60; // 6h — reseeded each deploy.
-
-function b64url(input: string): string {
-  return Buffer.from(input).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-// Mint a JWT bound to fn='pollMEStatus' — identical shape to the Base44
-// enqueueMEPoll producer, signed with the same shared secret.
-function mintMEPollJWT(secret: string): string {
-  const now = Math.floor(Date.now() / 1000);
-  const head = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-  const pay = b64url(JSON.stringify({
-    sub: 'me-poll-worker-boot',
-    fn: 'pollMEStatus',
-    iat: now,
-    exp: now + ME_POLL_JWT_TTL_SECONDS,
-    jti: randomUUID(),
-  }));
-  const sig = createHmac('sha256', secret).update(`${head}.${pay}`).digest('base64')
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  return `${head}.${pay}.${sig}`;
-}
+// ONE signer for this side of the seam, shared with the tick (2026-08-27). The
+// seed's token is now a FALLBACK with a SHORT TTL: the tick mints its own
+// credential per sweep, so nothing needs a long-lived bearer token. The previous
+// 6h seed token is exactly what ended the heartbeat six hours after every seed.
+import { mintMEPollJWT, ME_POLL_SEED_JWT_TTL_SECONDS } from './me-poll-auth.js';
 
 /**
  * Seed the perpetual M&E poll heartbeat at boot. Best-effort: a failure here
@@ -78,7 +60,7 @@ export async function seedMEPollHeartbeat(getQueue: (name: string) => Queue): Pr
       return;
     }
     const q = getQueue(QUEUE_NAMES.ME_POLL);
-    const authToken = mintMEPollJWT(secret);
+    const authToken = mintMEPollJWT(secret, 'me-poll-worker-boot', ME_POLL_SEED_JWT_TTL_SECONDS);
     const result = await reseedMEPollSingleton({
       queue: q,
       data: {
