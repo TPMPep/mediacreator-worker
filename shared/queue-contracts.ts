@@ -1446,9 +1446,25 @@ export interface MEPollJobData {
   schema_version: number;
   /** Correlation id threaded into StructuredLog rows for this heartbeat. */
   request_id: string;
-  /** Scoped JWT bound to (fn='pollMEStatus'). Long TTL — this is a perpetual
-   *  heartbeat; the producer reseeds with a fresh token periodically. */
-  auth_token: string;
+  /**
+   * Scoped JWT bound to (fn='pollMEStatus'), supplied by whichever path SEEDED
+   * the heartbeat — and now a FALLBACK ONLY, with a short TTL.
+   *
+   * OPTIONAL as of 2026-08-27, and dropped from the payload by the first tick
+   * that can mint its own. Carrying a long-lived token here is what killed this
+   * heartbeat every six hours: the job is perpetual, the credential was not, so
+   * every sweep 401'd once the TTL lapsed and the failure budget terminalised
+   * the singleton (measured: 18h 14m of dead harvester, and a second life that
+   * ended exactly 360 minutes after its reseed). The tick now mints a
+   * short-lived token per sweep from ENQUEUE_SECRET — see src/me-poll-auth.ts.
+   */
+  auth_token?: string;
+  /**
+   * Which credential path the last tick used ('minted' | 'carried'). Persisted
+   * so an operator can tell a self-minted heartbeat from a legacy carried-token
+   * one from the job payload alone, without reading Railway stdout.
+   */
+  auth_source?: 'minted' | 'carried';
   /**
    * CONSECUTIVE failed sweeps carried on the job across self-reschedules
    * (2026-08-22). Nothing else drives this lane, so a single transient sweep
