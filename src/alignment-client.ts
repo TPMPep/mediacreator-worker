@@ -79,29 +79,55 @@ export type AlignmentResult = {
 // Consumed by BOTH the Duo consensus acoustic-evidence gate and the mandatory
 // pyannote speaker-refinement gate, so the two can never drift apart.
 //
-// POSTURE — fail closed on SYSTEMIC failure, never on one word:
-//   • mean_confidence below MIN_MEAN_CONFIDENCE  → the aligner itself is unsure.
-//   • p99 shift above MAX_SYSTEMIC_SHIFT_MS      → the provider timeline is
-//     broadly wrong, so the acoustic anchor cannot be trusted wholesale.
-//   • outlier ratio above MAX_OUTLIER_RATIO      → disagreement is widespread
+// POSTURE — fail closed on SYSTEMIC, MEASURED failure, never on one word and
+// never on an uncalibrated proxy:
+//   • p99 shift above MAX_SYSTEMIC_SHIFT_MS → the acoustic result and the
+//     transcriber's timeline broadly disagree, so the acoustic anchor cannot be
+//     trusted wholesale.
+//   • outlier ratio above MAX_OUTLIER_RATIO → that disagreement is widespread
 //     rather than incidental.
-// The absolute max shift is retained verbatim as immutable evidence (archived
-// to S3 with the alignment result and reported on the run) but is NOT a veto:
-// a single provider timestamp outlier in ~8,000 words previously aborted an
-// entire paid dual-model run and blocked a fully usable transcript.
+// Both are measured in MILLISECONDS against an independent timeline, which is
+// exactly the quantity this pipeline's downstream decisions (where a line
+// breaks, who is speaking) actually depend on.
+//
+// WHY mean_confidence IS NO LONGER A VETO (policy v3).
+// mean_confidence is derived as (1 − provider alignment loss). That loss is an
+// internal model quantity with no documented scale and no probability
+// semantics, so a fixed 0.50 floor on it was never a calibrated control — it
+// was a threshold that happened to sit below where ENGLISH content lands.
+// Measured across 123 refinement runs: English completed 72 times at 0.87–0.95,
+// while every gate refusal outside English clustered at 0.013–0.459 (Swedish
+// 0.013 twice, Portuguese 0.017–0.171, Dutch 0.266, German 0.353/0.459, French
+// 0.390). Those runs were not defective. The Swedish run
+// (6a8f8ecedcdc9fe8fe0a7332, 340 lines) placed EVERY word, reported ZERO
+// unresolved words and ZERO timing repairs, and was discarded solely on this
+// number — 9 minutes of provider spend, nothing applied, and a paid enhancement
+// that was structurally incapable of ever helping a non-English programme.
+// A control that fails an entire language family while the measured evidence is
+// clean is not a safety control; it is a defect that presents as rigour.
+//
+// It is retained VERBATIM as recorded evidence (reported on the run, archived to
+// S3 with the alignment result, surfaced in the refinement report) so an auditor
+// can still see what the provider reported and can recompute this verdict — it
+// simply no longer decides whether usable work ships.
+//
+// NOTHING ELSE WAS RELAXED. Every structural guarantee that makes an alignment
+// trustworthy is unchanged and still fails closed: word-count parity, per-word
+// token lineage, valid non-degenerate windows, the monotonicity/regression
+// bounds and repair-ratio ceiling in the engine, and per-word UNRESOLVED
+// verdicts that quarantine their own lines (UNRESOLVED_TIMING) and block a
+// production export until a named human rules on them. A pathological alignment
+// therefore still cannot ship silently — it is caught per line, on evidence,
+// rather than by discarding a whole programme on one opaque scalar.
+//
 // Engines that predate the distribution metrics fall back to the strict
 // max-based rule, so this can never silently weaken an older deployment.
-export const ALIGNMENT_QUALITY_POLICY_VERSION = 2;
-const MIN_MEAN_CONFIDENCE = 0.5;
+export const ALIGNMENT_QUALITY_POLICY_VERSION = 3;
 const MAX_SYSTEMIC_SHIFT_MS = 30_000;
 const MAX_OUTLIER_RATIO = 0.005;
 
 export function assertAlignmentQuality(label: string, result: AlignmentResult) {
   if (!result.verified) throw new Error(`${label} forced alignment was not verified`);
-  const meanConfidence = Number(result.mean_confidence || 0);
-  if (meanConfidence < MIN_MEAN_CONFIDENCE) {
-    throw new Error(`${label} forced alignment confidence ${meanConfidence.toFixed(3)} is below ${MIN_MEAN_CONFIDENCE}`);
-  }
   const hasDistribution = Number.isFinite(Number(result.p99_provider_shift_ms)) && Number.isFinite(Number(result.outlier_ratio));
   if (!hasDistribution) {
     const maxShift = Number(result.max_provider_shift_ms || 0);
