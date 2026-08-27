@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-08-27c-alignment-quality-v3-plus-typed-quality-evidence';
+export const BUILD_TAG = '2026-08-27e-me-poll-per-tick-jwt-minting';
