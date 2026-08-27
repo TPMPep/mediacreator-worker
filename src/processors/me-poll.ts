@@ -207,7 +207,11 @@ export function makeMEPollProcessor(_getQueue: (name: string) => Queue) {
         await job.updateData({
           ...job.data,
           auth_token: authDecision.source === 'minted' ? undefined : job.data.auth_token,
-          auth_source: authDecision.source,
+          // Narrowed deliberately rather than widening the job contract: the
+          // 'none' case has already thrown above, so it is unreachable here, and
+          // letting the contract accept it would allow an unauthenticated tick
+          // to persist a credential source as though it were valid.
+          auth_source: authDecision.source === 'minted' ? 'minted' : 'carried',
           consecutive_failures: decision.next_consecutive_failures,
         });
 
