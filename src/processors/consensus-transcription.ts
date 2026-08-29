@@ -21,9 +21,18 @@
 // AAI-only transcript (degraded_to_primary_only=true) — never wastes the paid AAI
 // leg. An AAI (primary) failure hard-fails (no diarization timeline to merge into).
 //
-// AUTH: scoped JWT (30-min TTL) bound to (user, project, consensus_run_id,
-// 'consensusTranscriptionWorkerStep'), minted by enqueueConsensusTranscription.
-// Forwarded verbatim as X-Worker-JWT on every call.
+// AUTH: scoped JWT bound to (user, project, consensus_run_id,
+// 'consensusTranscriptionWorkerStep'), minted by enqueueConsensusTranscription
+// with a 12-HOUR TTL, and re-minted at the same TTL by watchdogConsensusRuns on
+// every recovery. Forwarded verbatim as X-Worker-JWT on every call.
+//
+// THE TTL IS LOAD-BEARING, WHICH IS WHY IT IS STATED ACCURATELY HERE. This header
+// previously said 30 minutes. A feature-length AAI leg alone can run 15-20
+// minutes, so a reader trusting that number would conclude that long programmes
+// must be hitting the JWT-expiry path — which terminalises the run AFTER both
+// paid provider legs have been spent, and is not watchdog-recoverable because the
+// run is already terminal. That is precisely the failure an auditor would chase,
+// and the comment would have sent them at a bound that does not exist.
 //
 // ZOMBIE-KILL: every worker-step call runs inside runWithLockHeartbeat, so a
 // lost BullMQ lock aborts the in-flight invocation instead of stranding a zombie
