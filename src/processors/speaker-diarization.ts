@@ -94,6 +94,18 @@ export async function processSpeakerDiarization(job:Job<SpeakerDiarizationJobDat
     const upload=await timedFetch(prep.raw_result_upload_url,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(result)},signal,120000);if(!upload.ok)throw new Error(`raw result archive failed: HTTP ${upload.status}`);
     await call('heartbeat',{phase:'reading_transcript',progress_pct:58,phase_detail:'Reading the committed transcript to build the alignment input.',phase_start:true},signal).catch(()=>{});
     const source:Segment[]=[];let pageCursor:number|null=-1;while(pageCursor!==null){const page:{rows:Segment[];next_cursor:number|null}=await call<{rows:Segment[];next_cursor:number|null}>('read_segments',{cursor:pageCursor,limit:500},signal);source.push(...page.rows);pageCursor=page.next_cursor;}if(!source.length)throw new Error('No active transcript segments found');
+    // ── FAIL-CLOSED INPUT INVARIANT — one live generation, or refuse ──────────
+    // A duplicated sequence_index in the live read means MORE THAN ONE live
+    // transcript generation is being served — the polluted-input state that fed
+    // forced alignment 2×/4× the words on POK_TV_S0601_NL (3,392 words against a
+    // 1,698-word transcript → p99 shift 702,622ms) and burned a week of forensics.
+    // The read path now excludes this run's own rows and the finalize cutover
+    // enforces a single live generation, so this should be unreachable — which is
+    // exactly why it must be checked: it is the tripwire for the pollution source
+    // nobody has imagined yet. Named terminal error → the run fails cleanly,
+    // cleanup restores the proper generation, no alignment spend on garbage.
+    {const seenSeq=new Set<number>();const dupSeq:number[]=[];for(const seg of source){const k=Number(seg.sequence_index);if(seenSeq.has(k))dupSeq.push(k);else seenSeq.add(k);}
+    if(dupSeq.length)throw new Error(`refinement_input_duplicate_rows: the live transcript served ${source.length} rows with ${dupSeq.length} duplicated line number(s) (e.g. ${[...new Set(dupSeq)].slice(0,5).join(', ')}) — more than one live transcript generation is present. Refusing to align a polluted input.`);}
     // An AUTHORITATIVE row with no provider words is exempt from this refusal
     // alongside music. It arises legitimately — an operator split creates a half
     // with no word timings — and failing the whole project because one
@@ -347,5 +359,5 @@ speaker_unresolved_word_count:g.words.filter(w=>w.speaker_unresolved===true).len
       await logEvent({function_name:'bullmq:speaker-diarization',level:'info',event:'speaker_diarization_stood_down',message:`Stood down: another refinement run owns this project's single-flight claim. No transcript row was touched and no retry was consumed.`,duration_ms:Date.now()-started,context:{project_id,run_id,job_run_id,request_id,user_email,incumbent_run_id:error.incumbentRunId,refused_operation:error.refusedOperation,detail:error.detail.slice(0,300),attempt:job.attemptsMade+1,max_attempts:Number(job.opts.attempts||1)}});
       return {ok:true,stood_down:true,incumbent_run_id:error.incumbentRunId};
     }
-    const message=String((error as Error)?.message||error).slice(0,500),max=Number(job.opts.attempts||1),terminal=job.attemptsMade+1>=max||/not configured|No source|no usable turns|No active transcript|staging|Translation started|Forced alignment HTTP 4|word-count mismatch|token mismatch|invalid alignment|Missing provider word|timeline_integrity_evidence_unverified|alignment_language_unresolvable|alignment_language_unsupported|forced alignment is systemically misaligned|forced alignment disagreement is widespread|forced alignment shift/i.test(message);if(terminal)await call('terminal_failure',{terminal_failure:message}).catch(()=>{});await logEvent({function_name:'bullmq:speaker-diarization',level:terminal?'error':'warn',event:terminal?'speaker_diarization_failed':'speaker_diarization_retrying',message,context:{project_id,run_id,job_run_id,request_id,user_email,attempt:job.attemptsMade+1,max_attempts:max}});throw error;}
+    const message=String((error as Error)?.message||error).slice(0,500),max=Number(job.opts.attempts||1),terminal=job.attemptsMade+1>=max||/not configured|No source|no usable turns|No active transcript|refinement_input_duplicate_rows|staging|Translation started|Forced alignment HTTP 4|word-count mismatch|token mismatch|invalid alignment|Missing provider word|timeline_integrity_evidence_unverified|alignment_language_unresolvable|alignment_language_unsupported|forced alignment is systemically misaligned|forced alignment disagreement is widespread|forced alignment shift/i.test(message);if(terminal)await call('terminal_failure',{terminal_failure:message}).catch(()=>{});await logEvent({function_name:'bullmq:speaker-diarization',level:terminal?'error':'warn',event:terminal?'speaker_diarization_failed':'speaker_diarization_retrying',message,context:{project_id,run_id,job_run_id,request_id,user_email,attempt:job.attemptsMade+1,max_attempts:max}});throw error;}
 }
