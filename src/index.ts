@@ -41,6 +41,7 @@ import { processSrtImport } from './processors/srt-import.js';
 import { processHlsIngest } from './processors/hls-ingest.js';
 import { processCCFormatRun } from './processors/cc-format-run.js';
 import { processProxyGen } from './processors/proxy-gen.js';
+import { processMediaProbe } from './processors/media-probe.js';
 import { processProjectCascade } from './processors/project-cascade.js';
 // User-triggered export pipeline (2026-05-15) — unified processor handles
 // all four module kinds (dub / superscript / adaptation / cc) via a kind
@@ -310,6 +311,14 @@ const workers: Worker[] = [
   // would each take ~2× wall-clock and risk OOM.
   new Worker(QUEUE_NAMES.PROXY_GEN, processProxyGen, {
     ...baseOpts, concurrency: env.CONCURRENCY_PROXY_GEN,
+  }),
+  // Metadata probing is network-light and bypasses the heavy FFmpeg lane. Eight
+  // isolated slots let a 100-user upload burst become queued work, not UI errors.
+  new Worker(QUEUE_NAMES.MEDIA_PROBE, processMediaProbe, {
+    ...baseOpts,
+    concurrency: env.CONCURRENCY_MEDIA_PROBE,
+    stalledInterval: 30_000,
+    maxStalledCount: 2,
   }),
   // Project cascade-delete pipeline (2026-05-15). Runs outside the 3-min
   // function ceiling so large projects can be deleted reliably. Concurrency=2
@@ -699,7 +708,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const queue = parsed.queue;
-    const limit = Math.min(Math.max(parsed.limit || 10, 1), 50);
+    const limit = Math.min(Math.max(parsed.limit || 10, 1), 500);
     if (!queue || !Object.values(QUEUE_NAMES).includes(queue as never)) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: `valid queue required` }));
