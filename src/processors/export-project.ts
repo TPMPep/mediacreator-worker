@@ -411,6 +411,11 @@ export async function processExportProject(job: Job<ExportJobData>) {
       if (step.action === 'render_audio') {
         const aj = step.audio_job!;
         if (aj.mode !== 'me_stem_package' && (!railwayUrl || !railwayKey)) throw new Error('export-project(audio): Railway URL/key not provided in job payload');
+        // The package path intentionally needs no Railway credentials. Every other
+        // branch is guarded above; normalize once so strict TypeScript retains
+        // that runtime guarantee across the mode-discriminated branch chain.
+        const requiredRailwayUrl = railwayUrl ?? '';
+        const requiredRailwayKey = railwayKey ?? '';
         // Final defense-in-depth: even if a stale producer bypassed preflight,
         // the worker refuses any timed clip that would be truncated by Railway.
         const timedOverruns = aj.clips.filter(c => Number(c.overrun_ms || 0) > 80);
@@ -498,7 +503,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
               stemDurationMs = Math.max(1, cursorMs);
             }
             const bytes = await callMixFinal({
-              railwayUrl, railwayKey,
+              railwayUrl: requiredRailwayUrl, railwayKey: requiredRailwayKey,
               clips: stemClips, durationMs: stemDurationMs,
               loudnessTargetLufs: null, // never normalize stems
               outputFormat,
@@ -529,7 +534,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
             // in extractor or worker RAM as a 700MB+ WAV.
             const mixPath = join(renderDir, 'mix.flac');
             await callMixFinalToFile({
-              railwayUrl, railwayKey, filePath: mixPath,
+              railwayUrl: requiredRailwayUrl, railwayKey: requiredRailwayKey, filePath: mixPath,
               clips: aj.clips.map(c => ({ url: c.url, start_ms: c.start_ms, gain_db: dubGain, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate, scene_placement: c.scene_placement || null })),
               durationMs: aj.duration_ms, meTrackUrl: aj.me_track_url, meGainDb: aj.me_gain_db,
               vocalsTrackUrl: aj.vocals_track_url || null, vocalsGainDb: aj.vocals_gain_db ?? null,
@@ -543,7 +548,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
             await postRenderHeartbeat();
             if (!aj.video_url) throw new Error('video_mux: no source video URL provided');
             const mp4Path = join(renderDir, 'deliverable.mp4');
-            await callMuxVideoToFile({ railwayUrl, railwayKey, videoUrl: aj.video_url, audioUrl: mixSignedUrl, filePath: mp4Path });
+            await callMuxVideoToFile({ railwayUrl: requiredRailwayUrl, railwayKey: requiredRailwayKey, videoUrl: aj.video_url, audioUrl: mixSignedUrl, filePath: mp4Path });
             const key = `${baseKeyPrefix}${suggested_filename}`;
             const uploaded = await putS3File({ ...s3, bucket: s3_bucket }, key, mp4Path, {
               contentType: 'video/mp4', contentDisposition: `attachment; filename="${suggested_filename}"`, timeoutMs: RAILWAY_MIX_TIMEOUT_MS,
@@ -555,7 +560,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
         } else {
           const outputFormat = aj.output_format || 'wav';
           const bytes = await callMixFinal({
-            railwayUrl, railwayKey,
+            railwayUrl: requiredRailwayUrl, railwayKey: requiredRailwayKey,
             clips: aj.clips.map(c => ({ url: c.url, start_ms: c.start_ms, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate, scene_placement: c.scene_placement || null })),
             durationMs: aj.duration_ms,
             meTrackUrl: aj.me_track_url,
