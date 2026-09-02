@@ -319,6 +319,8 @@ export const QUEUE_NAMES = {
   // with user confirmation between them. Isolated concurrency lane prevents
   // bulk FFmpeg analysis from starving voice generation or exports.
   TAIL_NORMALIZATION: 'tail-normalization',
+  // Advisory-only, asynchronous per-segment signal QC launched from Export.
+  PRE_EXPORT_AUDIO_QC: 'pre-export-audio-qc',
   // Internal GLTV public-API test harness (2026-08-24). ADDITIVE TEST
   // INFRASTRUCTURE — it changes nothing about the production API; it CALLS it.
   //
@@ -1569,6 +1571,15 @@ export interface TailNormalizationJobData {
   auth_token: string;
 }
 
+export interface PreExportAudioQCJobData {
+  schema_version: number;
+  project_id: string;
+  run_id: string;
+  user_email: string;
+  request_id: string;
+  auth_token: string;
+}
+
 // ─── Internal GLTV public-API test payload (2026-08-24) ─────────────────────
 //
 // Deliberately MINIMAL. The payload carries a run id and a scoped callback JWT —
@@ -1639,6 +1650,7 @@ export type AnyJobData =
    | SpeakerDiarizationJobData
    | PerformanceCaptureJobData
    | TailNormalizationJobData
+   | PreExportAudioQCJobData
    | GltvApiTestJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
