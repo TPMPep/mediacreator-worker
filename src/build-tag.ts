@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-09-02d-approved-script-acoustic-segmentation';
+export const BUILD_TAG = '2026-09-02e-pre-export-audio-qc';
