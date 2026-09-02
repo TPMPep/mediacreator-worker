@@ -1,6 +1,6 @@
 // =============================================================================
 // MEDIACREATOR BULLMQ WORKER — Entry point.
-// Build: 2026-09-02d-approved-script-acoustic-segmentation
+// Build: 2026-09-02e-pre-export-audio-qc
 // Boots one Worker per queue, wires shared error/log handlers, exposes a
 // minimal /health endpoint for Railway healthchecks.
 // =============================================================================
@@ -125,6 +125,7 @@ import { processSpeakerDiarization } from './processors/speaker-diarization.js';
 // before the job is minted).
 import { processPerformanceCapture } from './processors/performance-capture.js';
 import { processTailNormalization } from './processors/tail-normalization.js';
+import { processPreExportAudioQC } from './processors/pre-export-audio-qc.js';
 // Internal GLTV public-API test harness (2026-08-24). ADDITIVE test
 // infrastructure: it exercises the REAL public endpoint as a real external
 // caller. It exists here because a Base44 function physically cannot call our
@@ -486,6 +487,12 @@ const workers: Worker[] = [
   new Worker(QUEUE_NAMES.TAIL_NORMALIZATION, processTailNormalization, {
     ...baseOpts,
     concurrency: env.CONCURRENCY_TAIL_NORMALIZATION,
+    stalledInterval: 30_000,
+    maxStalledCount: 2,
+  }),
+  new Worker(QUEUE_NAMES.PRE_EXPORT_AUDIO_QC, processPreExportAudioQC, {
+    ...baseOpts,
+    concurrency: env.CONCURRENCY_PRE_EXPORT_AUDIO_QC,
     stalledInterval: 30_000,
     maxStalledCount: 2,
   }),
