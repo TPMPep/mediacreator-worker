@@ -85,6 +85,10 @@ export const QUEUE_NAMES = {
   // of Railway compute) with 30s exponential backoff. Deterministic ffmpeg
   // failures throw UnrecoverableError to skip retry and go straight to DLQ.
   PROXY_GEN: 'proxy-gen',
+  // Lightweight source metadata probe. Runs independently of the CPU-heavy
+  // proxy lane so duration/fps are available for transcription preflight while
+  // the editor proxy is still queued or rendering.
+  MEDIA_PROBE: 'media-probe',
   // Project cascade-delete pipeline (2026-05-15). Single-shot job that
   // deletes all S3 objects + all project-scoped DB rows + the Project row.
   PROJECT_CASCADE: 'project-cascade',
@@ -751,34 +755,27 @@ export interface ProxyGenJobData {
   project_id: string;
   user_email: string;
   request_id: string;
-  /** Signed S3 GET URL Railway uses to read the source media. 6h TTL. */
   source_url: string;
-  /** Project's pinned S3 bucket — Railway writes the two proxy objects here. */
   bucket: string;
-  /** Project's pinned AWS region. */
   region: string;
-  /** Output key for the 720p H.264 video proxy. */
   proxy_video_key: string;
-  /** Output key for the 16 kHz mono FLAC audio proxy. */
   proxy_audio_key: string;
-  /**
-   * Optional credential prefix for multi-region storage (e.g. 'STORAGE_EU_CENTRAL').
-   * Railway reads {prefix}_ACCESS_KEY_ID / {prefix}_SECRET_ACCESS_KEY when
-   * present; falls back to AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY otherwise.
-   */
   credential_secret_prefix?: string;
-  /**
-   * Railway api_key forwarded from the producer. Single source of truth lives
-   * on Base44; worker does NOT hold this in env. Mirrors HLS-ingest design.
-   */
   railway_api_key: string;
-  /**
-   * Railway base URL (no trailing slash, no path). Producer reads this from
-   * a Base44 secret and forwards it so the URL/key pair travels together.
-   */
   railway_url: string;
-  /** Scoped JWT bound to (user, project, project_id, 'proxyGenWorkerStep'). 60 min TTL. */
   auth_token?: string;
+}
+
+export interface MediaProbeJobData {
+  schema_version: number;
+  project_id: string;
+  user_email: string;
+  request_id: string;
+  source_url: string;
+  source_media_sha256?: string;
+  railway_url: string;
+  railway_api_key: string;
+  auth_token: string;
 }
 
 // ─── v2 adaptation payloads ──────────────────────────────────────────
@@ -1633,6 +1630,7 @@ export type AnyJobData =
    | HlsIngestJobData
    | CCFormatRunJobData
    | ProxyGenJobData
+   | MediaProbeJobData
    | ProjectCascadeJobData
    | ExportJobData
    | BackupSnapshotJobData
@@ -1692,19 +1690,11 @@ export const ORCHESTRATOR_JOB_OPTIONS = {
   removeOnFail: { age: 86400 * 7 },
 };
 
-// Proxy-gen: attempts=6. The extractor runs a bounded heavy-lane gate that
-// returns a FAST-503 'proxy_lane_busy' when N concurrent proxy transcodes are
-// already running — EXPECTED backpressure under 100+ concurrent users. A proxy
-// job therefore needs enough retry headroom to wait (via BullMQ backoff, never
-// a held-open HTTP connection) for a slot to free. Exponential backoff (30s
-// base) spaces retries 30s→60s→120s→240s→300s(capped) so a busy lane reliably
-// clears. Crucially, a GENUINE transcode failure (ffmpeg non-zero exit, missing
-// source) throws UnrecoverableError in the processor and skips ALL retries with
-// zero wasted compute — so the extra attempts ONLY ever benefit
-// transient/lane-busy cases, never a deterministic failure. The processor also
-// classifies HTTP 503 as ProxyLaneBusyError (logged as backpressure, not an
-// error) and only flips Project.proxy_status='failed' when ALL attempts are
-// exhausted.
+// Proxy-gen: extractor 503 is expected admission backpressure, not a failed
+// attempt. The processor keeps the FIFO BullMQ job active, heartbeats its lock,
+// and retries the short admission request every ~30s until a heavy lane opens.
+// The attempts below are therefore reserved for genuine transient network/5xx
+// failures; deterministic ffmpeg/source failures remain UnrecoverableError.
 //
 // Retry policy auditor framing (SOC 2 CC7.4 — Subprocessor / Vendor Failure
 // Response): bounded retry on transient/backpressure failures, immediate DLQ on
