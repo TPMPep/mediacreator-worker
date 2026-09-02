@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-08-30a-refinement-input-generation-guard';
+export const BUILD_TAG = '2026-09-02d-approved-script-acoustic-segmentation';
