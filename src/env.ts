@@ -135,6 +135,10 @@ export const env = {
   // the same Railway dyno would each take ~2× wall-clock and risk OOM.
   // Tune up only after Railway is scaled to a multi-replica deployment.
   CONCURRENCY_PROXY_GEN: intEnv('WORKER_CONCURRENCY_PROXY_GEN', 1),
+  // Source metadata probes are short ffprobe calls with no transcode and no
+  // Base44 write fan-out. Their own lane prevents proxy saturation from blocking
+  // transcription readiness for newly uploaded projects.
+  CONCURRENCY_MEDIA_PROBE: intEnv('WORKER_CONCURRENCY_MEDIA_PROBE', 8),
   // Project cascade (lowered 2 → 1 on 2026-05-26 after rate-limit incident).
   // The worker step now uses the audited rate-aware delete pattern
   // (_lib_rateAwareDelete.js) which is SERIAL per cascade at the platform's
