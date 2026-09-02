@@ -156,6 +156,7 @@ export async function alignTranscript(input: {
   languageCode: string;
   words: AlignmentInputWord[];
   signal: AbortSignal;
+  alignmentMode?: 'provider_timed' | 'untimed_script';
 }): Promise<AlignmentResult> {
   if (!env.ALIGNMENT_ENGINE_URL || !env.ALIGNMENT_ENGINE_SECRET) {
     throw new Error('Forced alignment engine is not configured');
@@ -175,6 +176,7 @@ export async function alignTranscript(input: {
         request_id: input.requestId,
         audio_url: input.audioUrl,
         language_code: input.languageCode,
+        alignment_mode: input.alignmentMode || 'provider_timed',
         words: input.words,
       }),
       signal: controller.signal,
