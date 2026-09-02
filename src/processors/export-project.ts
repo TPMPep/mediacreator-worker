@@ -24,6 +24,7 @@ import { env } from '../env.js';
 // 2026-07-07/08). STS session-token aware. See ../s3-signer.ts.
 import { presignS3Url, putS3File, putS3Object, storageFromEnv, type StorageHandle } from '../s3-signer.js';
 import { createSegmentZipWriter } from '../segment-zip-writer.js';
+import { createStemPackageZipWriter } from '../stem-package-zip-writer.js';
 
 const FUNCTION_CALL_TIMEOUT_MS = 150_000; // 2.5 min per tick (pagination + build)
 const HEARTBEAT_MS = 15_000;
@@ -55,7 +56,7 @@ interface PhaseStepResponse {
   // Present only when action='render_audio' — the signed clip list + render
   // params the worker needs to call Railway /mix-final and upload to S3.
   audio_job?: {
-    mode: 'full_mix' | 'per_speaker' | 'per_segment_zip' | 'video_dub_me' | 'video_mux';
+    mode: 'full_mix' | 'per_speaker' | 'per_segment_zip' | 'me_stem_package' | 'video_dub_me' | 'video_mux';
     clips: Array<{ url: string; start_ms: number; speaker_id: string; audio_dur_ms?: number; max_duration_ms?: number | null; playback_rate?: number; overrun_ms?: number; scene_placement?: { id?: string; version?: number; preset_key?: string; recipe_hash?: string; recipe_model_version?: number; recipe?: Record<string, number> } | null; filename?: string; snapshot_id?: string; take_id?: string | null; translation_id?: string; snapshot_at?: string }>;
     duration_ms: number;
     me_track_url: string | null;
@@ -129,6 +130,13 @@ async function callMixFinal(opts: {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function downloadUrlToFile(url: string, filePath: string, label: string) {
+  const response = await fetch(url, { signal: AbortSignal.timeout(RAILWAY_MIX_TIMEOUT_MS) });
+  if (!response.ok || !response.body) throw new Error(`${label} download failed (${response.status})`);
+  await pipeline(Readable.fromWeb(response.body as any), createWriteStream(filePath));
+  const info = await stat(filePath); if (!info.size) throw new Error(`${label} download was empty`);
 }
 
 async function postRailwayToFile(opts: {
@@ -402,9 +410,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
       // phase='finalize_audio' to record the result onto the ExportJob.
       if (step.action === 'render_audio') {
         const aj = step.audio_job!;
-        if (!railwayUrl || !railwayKey) {
-          throw new Error('export-project(audio): Railway URL/key not provided in job payload');
-        }
+        if (aj.mode !== 'me_stem_package' && (!railwayUrl || !railwayKey)) throw new Error('export-project(audio): Railway URL/key not provided in job payload');
         // Final defense-in-depth: even if a stale producer bypassed preflight,
         // the worker refuses any timed clip that would be truncated by Railway.
         const timedOverruns = aj.clips.filter(c => Number(c.overrun_ms || 0) > 80);
@@ -416,11 +422,25 @@ export async function processExportProject(job: Job<ExportJobData>) {
         // Entering the Railway /mix-final render — advance the coarse phase +
         // fire an immediate beat so the editor toast flips to "Rendering mix"
         // without waiting for the next 15s tick. SOC 2 CC7.2.
-        currentPhase = aj.mode === 'per_segment_zip' ? 'packaging_segments' : 'rendering_mix';
+        currentPhase = (aj.mode === 'per_segment_zip' || aj.mode === 'me_stem_package') ? 'packaging_segments' : 'rendering_mix';
         await postRenderHeartbeat();
 
         let audioResult: unknown;
-        if (aj.mode === 'per_segment_zip') {
+        if (aj.mode === 'me_stem_package') {
+          const archive = await createStemPackageZipWriter(export_job_id);
+          const dir = await mkdtemp(join(tmpdir(), `me-package-${export_job_id}-`));
+          try {
+            for (let index = 0; index < aj.clips.length; index++) {
+              const stem = aj.clips[index], filename = stem.filename || `stem_${index + 1}.wav`, sourcePath = join(dir, `stem-${index}`);
+              await downloadUrlToFile(stem.url, sourcePath, filename); await archive.addFile(filename, sourcePath, stem.snapshot_at ? new Date(stem.snapshot_at) : undefined); await rm(sourcePath, { force: true });
+              currentProgressPct = 10 + Math.round(((index + 1) / aj.clips.length) * 75);
+            }
+            const completed = await archive.close(); currentPhase = 'uploading'; await postRenderHeartbeat();
+            const key = `${baseKeyPrefix}${suggested_filename}`;
+            const uploaded = await putS3File({ ...s3, bucket: s3_bucket }, key, completed.path, { contentType: 'application/zip', contentDisposition: `attachment; filename="${suggested_filename}"`, timeoutMs: 30 * 60 * 1000 });
+            audioResult = { s3_key: key, file_size_bytes: uploaded.size, mime_type: 'application/zip', output_sha256: uploaded.sha256 };
+          } finally { await archive.cleanup(); await rm(dir, { recursive: true, force: true }); }
+        } else if (aj.mode === 'per_segment_zip') {
           const outputFormat = aj.segment_output_format || 'wav';
           const contentType = outputFormat === 'mp3' ? 'audio/mpeg' : `audio/${outputFormat}`;
           const archive = await createSegmentZipWriter(export_job_id);
