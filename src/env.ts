@@ -255,6 +255,9 @@ export const env = {
   // Two concurrent runs per replica balance throughput with Railway extractor
   // pressure; each run processes a bounded number of items per tick.
   CONCURRENCY_TAIL_NORMALIZATION: intEnv('WORKER_CONCURRENCY_TAIL_NORMALIZATION', 2),
+  // Advisory QC uses bounded FFmpeg analysis and its own lane so scans cannot
+  // starve voice generation, tail finishing, or deliverable exports.
+  CONCURRENCY_PRE_EXPORT_AUDIO_QC: intEnv('WORKER_CONCURRENCY_PRE_EXPORT_AUDIO_QC', 2),
 
   // Internal GLTV public-API test harness (2026-08-24). Held at 2 — a test run
   // is ONE job that submits a bounded burst of create calls then parks in
