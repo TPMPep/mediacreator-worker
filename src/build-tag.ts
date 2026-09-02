@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-09-02f-me-stem-package';
+export const BUILD_TAG = '2026-09-02h-me-stem-package-types';
