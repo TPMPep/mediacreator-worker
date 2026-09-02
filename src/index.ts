@@ -1,5 +1,6 @@
 // =============================================================================
 // MEDIACREATOR BULLMQ WORKER — Entry point.
+// Build: 2026-09-02d-approved-script-acoustic-segmentation
 // Boots one Worker per queue, wires shared error/log handlers, exposes a
 // minimal /health endpoint for Railway healthchecks.
 // =============================================================================
