@@ -73,7 +73,13 @@ const FINALIZER_TIMEOUT_MS = 90_000;
 // Railway dyno runs at ~4× realtime, so a 60-min source = ~15 min compute.
 // The legacy code held a 4hr ffmpeg ceiling; we hold the HTTP call at 3.5hr
 // to give Railway some headroom for the S3 upload after ffmpeg returns.
-const RAILWAY_CALL_TIMEOUT_MS = 3.5 * 60 * 60 * 1000;
+const RAILWAY_CALL_TIMEOUT_MS = 23 * 60 * 60 * 1000;
+const BACKPRESSURE_RETRY_MS = 30_000;
+const waitForLane = (ms: number, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
+  const onAbort = () => { clearTimeout(timer); reject(new Error('proxy lane wait aborted')); };
+  const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, ms);
+  signal.addEventListener('abort', onAbort, { once: true });
+});
 // Lock heartbeat cadence is owned by runWithLockHeartbeat (base44-client.ts).
 
 interface RailwayProxyResponse {
@@ -217,12 +223,25 @@ export async function processProxyGen(job: Job<ProxyGenJobData>) {
       },
     });
 
-    // ─── 1. Long synchronous call to Railway ───
-    // runWithLockHeartbeat extends the BullMQ lock every 15s AND, on lost lock,
-    // aborts the transcode fetch (via the signal it passes to callRailway).
-    const railwayRes = await runWithLockHeartbeat<RailwayProxyResponse>(job, (signal) =>
-      callRailway(data, ctrl.signal, signal),
-    );
+    // ─── 1. Wait for a heavy lane, then run the synchronous transcode ───
+    // Extractor 503 is admission backpressure, not a failed attempt. Keep this
+    // FIFO BullMQ job alive and retry the short admission request in-place so a
+    // busy 100-user burst queues instead of exhausting six attempts and failing.
+    const railwayRes = await runWithLockHeartbeat<RailwayProxyResponse>(job, async signal => {
+      let laneWaits = 0;
+      while (true) {
+        try {
+          return await callRailway(data, ctrl.signal, signal);
+        } catch (error) {
+          if (!(error instanceof ProxyLaneBusyError)) throw error;
+          laneWaits += 1;
+          if (laneWaits === 1 || laneWaits % 10 === 0) {
+            await logEvent({ function_name: 'bullmq:proxy-gen', level: 'warn', event: 'proxy_gen_waiting_for_lane', message: 'Proxy remains queued for bounded heavy-processing capacity.', context: { project_id, request_id, lane_waits: laneWaits } });
+          }
+          await waitForLane(BACKPRESSURE_RETRY_MS + Math.floor(Math.random() * 5000), signal);
+        }
+      }
+    });
 
     await logEvent({
       function_name: 'bullmq:proxy-gen',
