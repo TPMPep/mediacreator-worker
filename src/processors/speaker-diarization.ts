@@ -88,6 +88,24 @@ export async function processSpeakerDiarization(job:Job<SpeakerDiarizationJobDat
   try{return await runWithLockHeartbeat(job,async signal=>{
     if(!env.PYANNOTE_API_KEY)throw new Error('PYANNOTE_API_KEY is not configured in Railway');
     const prep=await call<any>('prepare',{},signal); if(prep.action==='done')return {ok:true,already_terminal:true};
+    // ── RESUME FINALIZATION — this run already replaced the transcript ─────────
+    // The step told us our own refined rows are LIVE, so the pipeline must NOT run
+    // again: re-running would read a transcript this run is forbidden to read (its
+    // own output), find nothing, and throw 'No active transcript segments found' —
+    // discarding a pass whose forced alignment had already passed its quality gate
+    // and whose only failure was in finalization, which spends nothing.
+    //
+    // The evidence is REPLAYED from the run's persisted checkpoint, so no provider
+    // is called twice and no measurement is re-derived. finalize's cutover is
+    // already idempotent for exactly this case (the staged rows are the live rows),
+    // and it re-runs every reconciliation gate against the rows that actually
+    // shipped — so resuming is strictly a re-verification, never a second cutover.
+    if(prep.action==='resume_finalize'){
+      await logEvent({function_name:'bullmq:speaker-diarization',level:'warn',event:'speaker_diarization_resumed_finalize',message:`Resuming finalization: ${prep.live_own_rows} refined line(s) from this run are already live, so the pipeline was not re-run and no provider was re-billed.`,context:{project_id,run_id,job_run_id,request_id,live_own_rows:prep.live_own_rows,worker_build_tag:BUILD_TAG}});
+      await call('finalize',prep.finalize_body||{},signal);
+      await logEvent({function_name:'bullmq:speaker-diarization',event:'speaker_diarization_completed',duration_ms:Date.now()-started,context:{project_id,run_id,job_run_id,request_id,resumed_finalize:true,output_segments:prep.live_own_rows}});
+      return {ok:true,action:'done',resumed_finalize:true};
+    }
     const auth={Authorization:`Bearer ${env.PYANNOTE_API_KEY}`}; let providerId=prep.run.provider_job_id||'';
     if(!providerId){const expected=Number(prep.run.expected_speakers);const submitted=await provider(`${API}/diarize`,{method:'POST',headers:{...auth,'Content-Type':'application/json'},body:JSON.stringify({url:prep.source_url,model:'precision-2',turnLevelConfidence:true,confidence:true,exclusive:false,transcription:false,...(Number.isInteger(expected)&&expected>0?{numSpeakers:expected}:{minSpeakers:1,maxSpeakers:32})})},signal);providerId=String(submitted.jobId||'');if(!providerId)throw new Error('pyannote returned no jobId');await call('mark_polling',{provider_job_id:providerId},signal);}
     let result:any=null,polls=0; while(Date.now()-started<40*60*1000){result=await provider(`${API}/jobs/${providerId}`,{headers:auth},signal);if(result.status==='succeeded')break;if(!['pending','created','running'].includes(result.status))throw new Error(`pyannote job ${result.status||'failed'}: ${result.output?.error||'provider failure'}`);polls++;await call('heartbeat',{progress_pct:Math.min(75,15+polls*3)},signal);await sleep(5000,signal);} if(result?.status!=='succeeded')throw new Error('speaker diarization exceeded 40 minutes');
