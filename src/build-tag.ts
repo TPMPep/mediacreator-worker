@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-09-02i-media-probe-queue';
+export const BUILD_TAG = '2026-09-03a-timed-text-burn-in';
