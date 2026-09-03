@@ -52,6 +52,29 @@ interface PhaseStepResponse {
     subtitles_url: string;
     source_res: 'original' | 'proxy';
     cue_count: number;
+    // ── AI-Dubbing burn (audio_mode='video_burn_in') only ──────────────────
+    // 'original' → burn straight onto video_url, whose own audio is copied
+    // through untouched by the hardsub pass. 'dub_mix' → render the three-stem
+    // mix and MUX it onto video_url FIRST, then burn onto that result.
+    //
+    // WHY MIX-THEN-BURN AND NOT THE REVERSE: hardsub is the only step that
+    // re-encodes the picture, and /mux-video copies the video stream verbatim
+    // (-c:v copy). Burning first and muxing second would therefore also work,
+    // but muxing first means the picture is encoded EXACTLY ONCE for either
+    // audio choice — one code path, one generation of loss, and the subtitles
+    // are painted over final frames rather than over frames that a later step
+    // still has to carry. The CC burn path is unaffected: it sends no mix.
+    audio_source?: 'dub_mix' | 'original';
+    mix?: {
+      clips: Array<{ url: string; start_ms: number; max_duration_ms?: number | null; playback_rate?: number; scene_placement?: Record<string, unknown> | null }>;
+      duration_ms: number;
+      me_track_url: string | null;
+      vocals_track_url?: string | null;
+      dub_gain_db?: number;
+      me_gain_db?: number;
+      vocals_gain_db?: number | null;
+      loudness_target_lufs?: number | null;
+    } | null;
   };
   // Present only when action='render_audio' — the signed clip list + render
   // params the worker needs to call Railway /mix-final and upload to S3.
@@ -595,22 +618,65 @@ export async function processExportProject(job: Job<ExportJobData>) {
         const bj = step.burn_job!;
         const s3 = buildWorkerS3(s3_region, credential_secret_prefix);
         const key = `dubflow/exports/${project_id}/${export_job_id}/${suggested_filename}`;
-        // Hardsub re-encode — advance the phase so the editor toast shows
-        // "Burning subtitles" for the whole minutes-long encode. SOC 2 CC7.2.
-        currentPhase = 'burning_subtitles';
-        await postRenderHeartbeat();
-        const mp4Bytes = await callBurnSubtitles({
-          railwayUrl, railwayKey, videoUrl: bj.video_url, subtitlesUrl: bj.subtitles_url,
-        });
-        await uploadMp4(s3, s3_bucket, key, mp4Bytes, suggested_filename);
-        await logEvent({
-          function_name: 'bullmq:export-project',
-          event: 'cc_burn_complete',
-          context: { export_job_id, project_id, source_res: bj.source_res, cue_count: bj.cue_count, user_email, request_id },
-        });
+        const burnKeyPrefix = `dubflow/exports/${project_id}/${export_job_id}/`;
+
+        // ── OPTIONAL PRE-STEP: put the finished dub mix onto the picture ────
+        // Only an AI-Dubbing burn with audio_source='dub_mix' carries a mix
+        // block; the CC burn path and an 'original' audio burn skip this
+        // entirely and burn straight onto the source stream.
+        let burnVideoUrl = bj.video_url;
+        let burnByteCount = 0;
+        const burnDir = bj.mix ? await mkdtemp(join(tmpdir(), `burn-${export_job_id}-`)) : null;
+        try {
+          if (bj.mix && burnDir) {
+            currentPhase = 'rendering_mix';
+            await postRenderHeartbeat();
+            const dubGain = bj.mix.dub_gain_db ?? 0;
+            // Disk-backed + lossless-compressed, exactly as video_mux does, so a
+            // feature-length mix never sits in extractor or worker RAM.
+            const mixPath = join(burnDir, 'mix.flac');
+            await callMixFinalToFile({
+              railwayUrl, railwayKey, filePath: mixPath,
+              clips: bj.mix.clips.map(c => ({ url: c.url, start_ms: c.start_ms, gain_db: dubGain, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate, scene_placement: c.scene_placement || null })),
+              durationMs: bj.mix.duration_ms, meTrackUrl: bj.mix.me_track_url, meGainDb: bj.mix.me_gain_db,
+              vocalsTrackUrl: bj.mix.vocals_track_url || null, vocalsGainDb: bj.mix.vocals_gain_db ?? null,
+              loudnessTargetLufs: bj.mix.loudness_target_lufs ?? null,
+            });
+            const mixKey = `${burnKeyPrefix}_burn_mix_intermediate.flac`;
+            await putS3File({ ...s3, bucket: s3_bucket }, mixKey, mixPath, { contentType: 'audio/flac', timeoutMs: RAILWAY_MIX_TIMEOUT_MS });
+            const mixSignedUrl = await presignS3Url({ method: 'GET', storage: { ...s3, bucket: s3_bucket }, key: mixKey, expiresIn: 3600 });
+
+            currentPhase = 'muxing_video';
+            await postRenderHeartbeat();
+            const muxedPath = join(burnDir, 'muxed.mp4');
+            await callMuxVideoToFile({ railwayUrl, railwayKey, videoUrl: bj.video_url, audioUrl: mixSignedUrl, filePath: muxedPath });
+            const muxedKey = `${burnKeyPrefix}_burn_muxed_intermediate.mp4`;
+            await putS3File({ ...s3, bucket: s3_bucket }, muxedKey, muxedPath, { contentType: 'video/mp4', timeoutMs: RAILWAY_MIX_TIMEOUT_MS });
+            // Re-sign generously: the hardsub re-encode that reads this URL is
+            // the longest single step in the whole export.
+            burnVideoUrl = await presignS3Url({ method: 'GET', storage: { ...s3, bucket: s3_bucket }, key: muxedKey, expiresIn: 4 * 3600 });
+          }
+
+          // Hardsub re-encode — advance the phase so the editor toast shows
+          // "Burning subtitles" for the whole minutes-long encode. SOC 2 CC7.2.
+          currentPhase = 'burning_subtitles';
+          await postRenderHeartbeat();
+          const mp4Bytes = await callBurnSubtitles({
+            railwayUrl, railwayKey, videoUrl: burnVideoUrl, subtitlesUrl: bj.subtitles_url,
+          });
+          burnByteCount = mp4Bytes.length;
+          await uploadMp4(s3, s3_bucket, key, mp4Bytes, suggested_filename);
+          await logEvent({
+            function_name: 'bullmq:export-project',
+            event: 'cc_burn_complete',
+            context: { export_job_id, project_id, source_res: bj.source_res, cue_count: bj.cue_count, audio_source: bj.audio_source || 'source_passthrough', user_email, request_id },
+          });
+        } finally {
+          if (burnDir) await rm(burnDir, { recursive: true, force: true });
+        }
         carry = {
           ...(step.carry as object),
-          _burn_result: { s3_key: key, file_size_bytes: mp4Bytes.length, mime_type: 'video/mp4' },
+          _burn_result: { s3_key: key, file_size_bytes: burnByteCount, mime_type: 'video/mp4' },
         };
         continue;
       }
