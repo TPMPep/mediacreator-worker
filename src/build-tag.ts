@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-09-03b-diarization-resume-finalize';
+export const BUILD_TAG = '2026-09-04a-regional-english-locales';
