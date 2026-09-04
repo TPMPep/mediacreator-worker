@@ -41,7 +41,7 @@ export const PROVIDER_DIALECT_TO_CANONICAL: Record<string, string> = {
 };
 
 const CANONICAL_CODES = new Set<string>([
-  'en', 'en-us', 'en-gb', 'en-au', 'es', 'es-419', 'de', 'fr', 'it', 'pt', 'pt-br',
+  'en', 'en-us', 'en-gb', 'en-au', 'en-ca', 'en-in', 'es', 'es-419', 'de', 'fr', 'fr-ca', 'it', 'pt', 'pt-br',
   'ja', 'ko', 'zh', 'zh-tw', 'ar', 'ru', 'nl', 'pl', 'tr', 'sv', 'da', 'fi', 'nb',
   'nn', 'hi', 'ta', 'bn', 'mr', 'te', 'gu', 'kn', 'ml', 'pa', 'ur', 'id', 'vi',
   'th', 'uk', 'cs', 'ro', 'hu', 'el', 'bg', 'ms', 'fil', 'is', 'ca', 'gl', 'eu',
