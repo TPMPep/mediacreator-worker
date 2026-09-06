@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-09-06c-transcription-enterprise-repair';
+export const BUILD_TAG = '2026-09-06d-transcription-enterprise-repair';
