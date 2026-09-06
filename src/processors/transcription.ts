@@ -8,7 +8,7 @@ type Word={text:string;start:number;end:number;confidence?:number|null};
 type Segment={speaker:string;start:number;end:number;text:string;confidence?:number|null;avg_word_confidence?:number|null;word_timings?:Array<{text:string;start_ms:number;end_ms:number;confidence?:number}>;is_music?:boolean;music_source?:string;music_context?:string};
 const COLORS=['blue','purple','green','amber','red','pink','cyan','orange'];
 const sleep=(ms:number,signal:AbortSignal)=>new Promise<void>((resolve,reject)=>{const t=setTimeout(resolve,ms);signal.addEventListener('abort',()=>{clearTimeout(t);reject(new Error('worker lock lost'));},{once:true});});
-const requestSignal=(external?:AbortSignal,timeoutMs=120000)=>external?AbortSignal.any([external,AbortSignal.timeout(timeoutMs)]):AbortSignal.timeout(timeoutMs);
+const requestSignal=(external?:AbortSignal|null,timeoutMs=120000)=>external?AbortSignal.any([external,AbortSignal.timeout(timeoutMs)]):AbortSignal.timeout(timeoutMs);
 async function json(url:string,init:RequestInit={},allow404=false){const r=await fetch(url,{...init,signal:requestSignal(init.signal)});if(allow404&&r.status===404)return null;const text=await r.text();if(!r.ok)throw new Error(`HTTP ${r.status}: ${text.slice(0,300)}`);return JSON.parse(text);}
 // ── Certification-evidence hashing ───────────────────────────────────────────
 // The archived provider result is the durable artifact the GLTV certification
