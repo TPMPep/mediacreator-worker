@@ -126,6 +126,33 @@ export async function processVoiceGen(job: Job<VoiceGenJobData>) {
     return result;
   } catch (err) {
     const e = err as Error;
+    // ── TERMINAL REFUSAL — settled by the producer, NOT retried ──────────────
+    // The producer refused on a condition a retry cannot change (a stale
+    // authored window because this line was retimed after the chunk plan froze
+    // it; or the single-writer claim already held by a live render). It made no
+    // provider call, spent nothing, and already left the row in a truthful,
+    // re-renderable state — so rethrowing would burn the rest of the attempt
+    // ladder replaying identical inputs and stamp `voice_generation_failed` on a
+    // line that was never broken. Recorded as its own event with the producer's
+    // OWN evidence so an auditor can tell a deliberate refusal from a failure.
+    // Recovery is unchanged and already correct: the run's finalizer sees the
+    // line unrendered and a FRESH producer re-derives the current window.
+    const refusal = (e as unknown as { terminal_refusal?: Record<string, unknown> }).terminal_refusal;
+    if (refusal) {
+      await logEvent({
+        function_name: 'bullmq:voice-gen',
+        level: 'warn',
+        event: 'voice_generation_refused_terminal',
+        message: e.message,
+        error_kind: e.name,
+        duration_ms: Date.now() - t0,
+        context: {
+          project_id, segment_id, target_language, attempts: job.attemptsMade + 1,
+          request_id, user_email, refusal,
+        },
+      });
+      return { refused: true, refusal };
+    }
     await logEvent({
       function_name: 'bullmq:voice-gen',
       level: 'error',
