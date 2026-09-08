@@ -72,6 +72,13 @@ export { WorkerStandDownError, parseStandDown } from './stand-down.js';
 export type { StandDownInfo } from './stand-down.js';
 import { parseStandDown, WorkerStandDownError } from './stand-down.js';
 
+// A producer refusal that a retry cannot change (stale authored window, claim
+// already held). Same reasoning and same env-free shape as the stand-down
+// contract above, so there is exactly ONE definition of each.
+export { WorkerTerminalRefusalError, parseTerminalRefusal, TERMINAL_DISPOSITION } from './terminal-refusal.js';
+export type { TerminalRefusalInfo } from './terminal-refusal.js';
+import { parseTerminalRefusal, WorkerTerminalRefusalError } from './terminal-refusal.js';
+
 // =============================================================================
 // PLATFORM GATEWAY 403 RESILIENCE LAYER
 // -----------------------------------------------------------------------------
@@ -243,6 +250,15 @@ export async function invokeBase44Function<T = unknown>(opts: InvokeOpts): Promi
       // and the winning run's work would be racing an argument.
       const standDown = parseStandDown(res.status, body);
       if (standDown) throw new WorkerStandDownError(opts.fn, standDown);
+
+      // TERMINAL REFUSAL — checked here for the SAME reason, and for the same
+      // reason it sits before the retry budgets: the producer has already
+      // settled this, and every retry replays the identical inputs to reach the
+      // identical answer while writing a failure row that misrepresents it.
+      // Fail-closed: only an explicit `disposition: 'terminal'` qualifies (see
+      // ./terminal-refusal), so anything ambiguous still retries as before.
+      const refusal = parseTerminalRefusal(res.status, body);
+      if (refusal) throw new WorkerTerminalRefusalError(opts.fn, refusal);
 
       // Retryable: platform gateway auth rejection. Sleep + retry.
       if (isGatewayAuthRejection(res.status, body) && gatewayAuthAttempts < GATEWAY_AUTH_RETRY_MAX) {
