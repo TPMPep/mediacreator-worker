@@ -262,6 +262,10 @@ export const env = {
   // Advisory QC uses bounded FFmpeg analysis and its own lane so scans cannot
   // starve voice generation, tail finishing, or deliverable exports.
   CONCURRENCY_PRE_EXPORT_AUDIO_QC: intEnv('WORKER_CONCURRENCY_PRE_EXPORT_AUDIO_QC', 2),
+  // Voice drift is I/O-bound platform paging, not CPU work, and each pass is
+  // short. Two is enough to keep a burst of voice saves moving while leaving the
+  // platform read/write budget to the editor those operators are sitting in.
+  CONCURRENCY_VOICE_DRIFT: intEnv('WORKER_CONCURRENCY_VOICE_DRIFT', 2),
 
   // Internal GLTV public-API test harness (2026-08-24). Held at 2 — a test run
   // is ONE job that submits a bounded burst of create calls then parks in
