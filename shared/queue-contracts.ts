@@ -325,6 +325,26 @@ export const QUEUE_NAMES = {
   TAIL_NORMALIZATION: 'tail-normalization',
   // Advisory-only, asynchronous per-segment signal QC launched from Export.
   PRE_EXPORT_AUDIO_QC: 'pre-export-audio-qc',
+  // Voice-drift invalidation (2026-09-10). Marks a speaker's already-rendered
+  // dubs 'stale' after that speaker's voice configuration changed for ONE target
+  // language. Previously executed inline inside saveVoiceAssignment, where its
+  // call volume scaled with PROJECT SIZE while the save itself is a fixed
+  // handful of writes — so a feature-length project rate-limited the very
+  // request that had already passed every gate, and a truncated pass silently
+  // left dubs marked 'ready' whose audio no longer matched the saved voice.
+  //
+  // Single-shot tick-resumable job per VoiceDriftRun. Scope is (project,
+  // speaker, language) by construction: an assignment is stored per target
+  // language and resolved strictly by language_code, so a wider scope would
+  // invalidate work that is still correct. Completeness is established by
+  // OBSERVATION — the pass only matches rows that are still 'ready' with a
+  // differing hash, so a second pass that flips zero is direct evidence that
+  // nothing stale remains marked ready (recorded as VoiceDriftRun.verified).
+  //
+  // Its OWN small concurrency lane so a burst of voice saves can never starve
+  // voice generation or exports. SOC 2 CC7.2 (resumable, watchdog-recovered) /
+  // CC8.1 (attributable, and the completeness claim is recomputable).
+  VOICE_DRIFT: 'voice-drift',
   // Internal GLTV public-API test harness (2026-08-24). ADDITIVE TEST
   // INFRASTRUCTURE — it changes nothing about the production API; it CALLS it.
   //
@@ -1577,6 +1597,21 @@ export interface PreExportAudioQCJobData {
   auth_token: string;
 }
 
+// Voice-drift invalidation (2026-09-10). Deliberately minimal: the run row holds
+// the speaker, the language and the assignment hash the dubs are judged against,
+// so the payload carries no judgement of its own. A forged or replayed job can
+// therefore only re-run a pass that is already idempotent and already scoped.
+// The 12h JWT covers a queued pass on a saturated lane under 100+ user load.
+export interface VoiceDriftJobData {
+  schema_version: number;
+  project_id: string;
+  /** VoiceDriftRun.id — the pass this job advances. */
+  run_id: string;
+  user_email: string;
+  request_id: string;
+  auth_token: string;
+}
+
 // ─── Internal GLTV public-API test payload (2026-08-24) ─────────────────────
 //
 // Deliberately MINIMAL. The payload carries a run id and a scoped callback JWT —
@@ -1649,6 +1684,7 @@ export type AnyJobData =
    | PerformanceCaptureJobData
    | TailNormalizationJobData
    | PreExportAudioQCJobData
+   | VoiceDriftJobData
    | GltvApiTestJobData;
 
 // ─── Default per-queue options (used by both producer and consumer) ──
