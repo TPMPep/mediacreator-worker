@@ -126,6 +126,7 @@ import { processSpeakerDiarization } from './processors/speaker-diarization.js';
 // before the job is minted).
 import { processPerformanceCapture } from './processors/performance-capture.js';
 import { processTailNormalization } from './processors/tail-normalization.js';
+import { processVoiceDrift } from './processors/voice-drift.js';
 import { processPreExportAudioQC } from './processors/pre-export-audio-qc.js';
 // Internal GLTV public-API test harness (2026-08-24). ADDITIVE test
 // infrastructure: it exercises the REAL public endpoint as a real external
@@ -502,6 +503,16 @@ const workers: Worker[] = [
   new Worker(QUEUE_NAMES.PRE_EXPORT_AUDIO_QC, processPreExportAudioQC, {
     ...baseOpts,
     concurrency: env.CONCURRENCY_PRE_EXPORT_AUDIO_QC,
+    stalledInterval: 30_000,
+    maxStalledCount: 2,
+  }),
+  // Voice drift (2026-09-10). Stalled-job reclaim IS enabled: the step is
+  // idempotent and cursor-resumable, and re-running a pass costs only platform
+  // reads — there is no provider spend to double, so faster self-heal is the
+  // right trade here (unlike the GLTV test lane below).
+  new Worker(QUEUE_NAMES.VOICE_DRIFT, processVoiceDrift, {
+    ...baseOpts,
+    concurrency: env.CONCURRENCY_VOICE_DRIFT,
     stalledInterval: 30_000,
     maxStalledCount: 2,
   }),
