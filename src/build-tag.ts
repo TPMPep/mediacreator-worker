@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-09-08a-terminal-refusal-contract';
+export const BUILD_TAG = '2026-09-10a-voice-drift-lane';
