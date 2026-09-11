@@ -43,20 +43,15 @@ export const env = {
   SENTRY_ENVIRONMENT: optional('SENTRY_ENVIRONMENT', 'production'),
   SENTRY_RELEASE: process.env.SENTRY_RELEASE || undefined,
 
-  // Voice-gen concurrency. Held DELIBERATELY at 2 (lowered from 3 on
-  // 2026-05-13 after observed regression: 24-segment v3-clone dub at
-  // concurrency=3 still tripped the platform SDK gateway — every segment
-  // got HTTP 403 "auth_required" + HTTP 429 "Rate limit exceeded" mid-
-  // generateOneSegment, marking the whole run failed silently. Prior
-  // history: concurrency=5 saturated on 2026-05-10 (116-seg dub), lowered
-  // to 3; that protects v2/Flash but not v3-clone runs where each segment
-  // does additional SDK writes (audit hash, cue/stability branches,
-  // identity-shift path probes). At 2 we get ~16 platform calls/sec
-  // sustained — well under the per-app threshold even for v3-clone
-  // density profiles. Throughput trade-off: 116-segment dub goes from
-  // ~8min → ~12min — acceptable for an auditor-defensible posture per
-  // SOC 2 CC7.4 / TPN MS-7.x. Bump back to 3 only after the platform
-  // rate limit is raised or the SDK adopts adaptive backoff.
+  // Voice-gen in-flight concurrency stays at 2 per replica, but START RATE is
+  // the load-bearing app-wide control: index.ts applies BullMQ's global limiter
+  // at one job per 5 seconds. In-flight concurrency alone did not protect the
+  // shared Base44 gateway across four replicas; the old 6 starts/sec limiter
+  // admitted call-dense jobs fast enough to starve interactive editor writes.
+  // Queuing is the deliberate trade-off under a fixed gateway ceiling: bulk dubs
+  // start more slowly, while operator commits remain reliable and auditable.
+  // Raise the global start rate only after a measured concurrency run proves
+  // interactive write headroom, never from provider capacity alone.
   CONCURRENCY_VOICE_GEN: intEnv('WORKER_CONCURRENCY_VOICE_GEN', 2),
   // v2 voice-gen orchestrator concurrency (2026-05-18). The orchestrator
   // dispatches per-segment jobs in bounded ticks — it does NOT itself call
