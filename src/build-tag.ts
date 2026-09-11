@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-09-10a-voice-drift-lane';
+export const BUILD_TAG = '2026-09-11a-interactive-write-headroom';
