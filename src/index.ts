@@ -184,24 +184,20 @@ function getQueue(name: string): Queue {
 
 // ─── Spin up one Worker per queue ────────────────────────────────────
 const workers: Worker[] = [
-  // VOICE_GEN — per-segment ElevenLabs TTS. The `limiter` is the keystone fix
-  // for the 2026-06-02 provider_429 storm: the ElevenLabs concurrency semaphore
-  // in generateOneSegment caps how many calls are IN FLIGHT at once (6), but
-  // NOTHING capped the RATE at which the worker STARTED jobs. At
-  // concurrency=2/replica × 4 replicas the orchestrator's 150-job-per-tick
-  // dispatch let all 8 slots try to start near-simultaneously, hammering
-  // ElevenLabs in a synchronized wave that the provider burst-rate-limited →
-  // 429s → exhausted retries → failed + incomplete segments (the exact reported
-  // symptom). The limiter spreads job STARTS to 6/sec platform-wide, so calls
-  // arrive at ElevenLabs as a steady stream instead of a thundering herd. Same
-  // proven pattern as AIREWRITE_CHUNK (line below). Pairs with the in-function
-  // semaphore (in-flight cap) — start-rate AND concurrency are both now bounded.
-  // SOC 2 CC7.4 — subprocessor burst protection provable from config alone;
-  // revertable in <60s by removing the `limiter` block.
+  // VOICE_GEN — per-segment ElevenLabs TTS. This limiter protects the scarcer
+  // APP-WIDE Base44 data gateway, not only ElevenLabs. The previous 6 starts/sec
+  // allowed a four-replica fleet to keep eight call-dense generateOneSegment
+  // requests active while an operator tried to commit Take Finishing; the render
+  // committed, then an audit/read call lost the shared gateway race and the UI
+  // reported a false failure. One start per 5s is global to this BullMQ queue:
+  // bursts wait in FIFO instead of consuming interactive write headroom. The
+  // trade-off is explicit and correct for a fixed platform ceiling—bulk dubs take
+  // longer to start, but do not corrupt state or starve 100+ concurrent editors.
+  // The in-function ElevenLabs semaphore still owns provider concurrency.
   new Worker(QUEUE_NAMES.VOICE_GEN, processVoiceGen, {
     ...baseOpts,
     concurrency: env.CONCURRENCY_VOICE_GEN,
-    limiter: { max: 6, duration: 1000 },
+    limiter: { max: 1, duration: 5000 },
   }),
   // v2 voice-gen orchestrator (2026-05-18). One ORCHESTRATOR job per
   // voice-gen RUN (not per segment); it dispatches the per-segment
