@@ -27,7 +27,7 @@ export async function processVoiceGen(job: Job<VoiceGenJobData>) {
     // forward it so generateOneSegment bypasses its already-ready idempotency
     // guard. Omitted/false for fresh dubs. SOC 2 CC8.1.
     force,
-    take_id,
+    take_id, activate_take_on_success,
     // Phase 3 Voice Consistency Engine: optional, additive, never throws.
     // When omitted the producer didn't request a consistency posture and
     // generateOneSegment will default to 'NONE' — bit-for-bit identical to
@@ -76,6 +76,7 @@ export async function processVoiceGen(job: Job<VoiceGenJobData>) {
         // operator explicitly requested a re-render. Defaults false for fresh dubs.
         force: !!force,
         take_id: take_id ?? undefined,
+        activate_take_on_success: activate_take_on_success === true,
         // Phase 3 Voice Consistency Engine. Forwarded verbatim. Undefined
         // when the producer didn't set it (the common case — manual segment
         // regen with the toggle OFF, and ALL bulk runs).
