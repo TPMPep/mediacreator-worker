@@ -10,7 +10,7 @@
 // Pattern: identical to hls-ingest.ts. Idempotent.
 // =============================================================================
 
-import type { Job } from 'bullmq';
+import { UnrecoverableError, type Job } from 'bullmq';
 import { createWriteStream } from 'node:fs';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -25,6 +25,7 @@ import { env } from '../env.js';
 import { presignS3Url, putS3File, putS3Object, storageFromEnv, type StorageHandle } from '../s3-signer.js';
 import { createSegmentZipWriter } from '../segment-zip-writer.js';
 import { createStemPackageZipWriter } from '../stem-package-zip-writer.js';
+import { buildRailwayRenderError } from '../export-render-error.js';
 
 const FUNCTION_CALL_TIMEOUT_MS = 150_000; // 2.5 min per tick (pagination + build)
 const HEARTBEAT_MS = 15_000;
@@ -176,7 +177,7 @@ async function postRailwayToFile(opts: {
     });
     if (!response.ok || !response.body) {
       const detail = await response.text().catch(() => '');
-      throw new Error(`${opts.label} failed (${response.status}): ${detail.slice(0, 500)}`);
+      throw buildRailwayRenderError(opts.label, response.status, detail);
     }
     await pipeline(Readable.fromWeb(response.body as any), createWriteStream(opts.filePath));
     const info = await stat(opts.filePath);
@@ -733,7 +734,10 @@ export async function processExportProject(job: Job<ExportJobData>) {
     // BullMQ owns the retry. Keep the audit row running between attempts and
     // terminalize it only when the configured retry budget is exhausted.
     const maxAttempts = Number(job.opts.attempts || 1);
-    const isFinalAttempt = (job.attemptsMade + 1) >= maxAttempts;
+    // A normal FFmpeg exit with a non-zero code is deterministic for this frozen
+    // render plan. BullMQ's UnrecoverableError stops the retry ladder immediately;
+    // timeouts, 429s, lane pressure and unknown 5xx responses still retry.
+    const isFinalAttempt = e instanceof UnrecoverableError || (job.attemptsMade + 1) >= maxAttempts;
     if (isFinalAttempt) {
       try {
         await invokeBase44Function({
