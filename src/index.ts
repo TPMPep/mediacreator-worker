@@ -198,6 +198,10 @@ const workers: Worker[] = [
     ...baseOpts,
     concurrency: env.CONCURRENCY_VOICE_GEN,
     limiter: { max: 1, duration: 5000 },
+    // Keep the proven one-start-per-5s global safety ceiling, but let an idle
+    // worker notice newly-admitted interactive work within ~1s instead of the
+    // BullMQ 5s default. This changes pickup latency, never dispatch volume.
+    drainDelay: 1,
   }),
   // v2 voice-gen orchestrator (2026-05-18). One ORCHESTRATOR job per
   // voice-gen RUN (not per segment); it dispatches the per-segment
