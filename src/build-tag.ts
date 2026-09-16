@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-09-16b-authoritative-take-lifecycle';
+export const BUILD_TAG = '2026-09-16c-export-overrun-advisory';
