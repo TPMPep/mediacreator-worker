@@ -439,12 +439,11 @@ export async function processExportProject(job: Job<ExportJobData>) {
         // that runtime guarantee across the mode-discriminated branch chain.
         const requiredRailwayUrl = railwayUrl ?? '';
         const requiredRailwayKey = railwayKey ?? '';
-        // Final defense-in-depth: even if a stale producer bypassed preflight,
-        // the worker refuses any timed clip that would be truncated by Railway.
-        const timedOverruns = aj.clips.filter(c => Number(c.overrun_ms || 0) > 80);
-        if (timedOverruns.length > 0) {
-          throw new Error(`Timed-audio integrity refusal: ${timedOverruns.length} clip(s) exceed their authored window; render not started.`);
-        }
+        // Timed overruns are disclosed editorial outcomes, not render failures.
+        // max_duration_ms remains authoritative below, so Railway trims each clip
+        // at its authored TC OUT exactly as editor playback does. Refusing here
+        // contradicted the producer/preflight policy and caused deterministic
+        // retry loops before FFmpeg was ever reached.
         const baseKeyPrefix = `dubflow/exports/${project_id}/${export_job_id}/`;
         const s3 = buildWorkerS3(s3_region, credential_secret_prefix);
         // Entering the Railway /mix-final render — advance the coarse phase +
