@@ -432,8 +432,10 @@ export interface VoiceGenJobData {
    * SOC 2 CC8.1 — an explicitly-requested re-render is never silently dropped.
    */
   force?: boolean;
-  /** Reserved VoiceTake id for a non-selected candidate render. */
+  /** Reserved VoiceTake id for a provider render. */
   take_id?: string;
+  /** True only for direct regeneration: successful take becomes the deliverable. */
+  activate_take_on_success?: boolean;
   /**
    * Voice Consistency Engine strategy (Phase 3, 2026-05-25).
    * Optional — when omitted, generateOneSegment defaults to 'NONE' so existing
