@@ -391,6 +391,9 @@ export interface VoiceGenJobData {
   user_email: string;
   request_id: string;
   auth_token?: string;
+  /** Queue admission class. 'high' is reserved for interactive one-line
+   * regeneration; 'normal' is bulk. The orchestrator maps these to explicit
+   * BullMQ priorities 1 and 10 so omitted priority=0 can never invert them. */
   priority_hint?: 'low' | 'normal' | 'high';
   /**
    * Parent JobRun id. generateOneSegment uses this to "tick" completion at the
