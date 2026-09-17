@@ -67,7 +67,7 @@ interface PhaseStepResponse {
     // still has to carry. The CC burn path is unaffected: it sends no mix.
     audio_source?: 'dub_mix' | 'original';
     mix?: {
-      clips: Array<{ url: string; start_ms: number; max_duration_ms?: number | null; playback_rate?: number; scene_placement?: Record<string, unknown> | null }>;
+      clips: Array<{ url: string; start_ms: number; max_duration_ms?: number | null; playback_rate?: number; mix_gain_db?: number; scene_placement?: Record<string, unknown> | null }>;
       duration_ms: number;
       me_track_url: string | null;
       vocals_track_url?: string | null;
@@ -81,7 +81,7 @@ interface PhaseStepResponse {
   // params the worker needs to call Railway /mix-final and upload to S3.
   audio_job?: {
     mode: 'full_mix' | 'per_speaker' | 'per_segment_zip' | 'me_stem_package' | 'video_dub_me' | 'video_mux';
-    clips: Array<{ url: string; start_ms: number; speaker_id: string; audio_dur_ms?: number; max_duration_ms?: number | null; playback_rate?: number; overrun_ms?: number; scene_placement?: { id?: string; version?: number; preset_key?: string; recipe_hash?: string; recipe_model_version?: number; recipe?: Record<string, number> } | null; filename?: string; snapshot_id?: string; take_id?: string | null; translation_id?: string; snapshot_at?: string }>;
+    clips: Array<{ url: string; start_ms: number; speaker_id: string; audio_dur_ms?: number; max_duration_ms?: number | null; playback_rate?: number; overrun_ms?: number; scene_placement?: { id?: string; version?: number; preset_key?: string; recipe_hash?: string; recipe_model_version?: number; recipe?: Record<string, number> } | null; filename?: string; snapshot_id?: string; take_id?: string | null; translation_id?: string; source_segment_id?: string; mix_gain_db?: number; snapshot_at?: string; duration_ms?: number }>;
     duration_ms: number;
     me_track_url: string | null;
     loudness_target_lufs: number | null;
@@ -476,9 +476,13 @@ export async function processExportProject(job: Job<ExportJobData>) {
             for (let index = 0; index < aj.clips.length; index++) {
               const clip = aj.clips[index];
               const filename = clip.filename || `${String(index + 1).padStart(4, '0')}_segment.${outputFormat}`;
-              const bytes = await transcodeSegment({
-                railwayUrl: railwayUrl!, railwayKey: railwayKey!, sourceUrl: clip.url,
-                outputFormat, loudnessTargetLufs: aj.loudness_target_lufs,
+              // Individual files are deliverables too: render each through the
+              // same scene-placement mixer as program mixes and speaker stems.
+              const durationMs = Math.max(1, Number(clip.duration_ms || clip.audio_dur_ms || 1));
+              const bytes = await callMixFinal({
+                railwayUrl: requiredRailwayUrl, railwayKey: requiredRailwayKey,
+                clips: [{ url: clip.url, start_ms: 0, max_duration_ms: durationMs, scene_placement: clip.scene_placement || null }],
+                durationMs, outputFormat, loudnessTargetLufs: aj.loudness_target_lufs,
               });
               const individualKey = `${baseKeyPrefix}segments/${filename}`;
               await putS3Object({ ...s3, bucket: s3_bucket }, individualKey, bytes, {
@@ -558,7 +562,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
             const mixPath = join(renderDir, 'mix.flac');
             await callMixFinalToFile({
               railwayUrl: requiredRailwayUrl, railwayKey: requiredRailwayKey, filePath: mixPath,
-              clips: aj.clips.map(c => ({ url: c.url, start_ms: c.start_ms, gain_db: dubGain, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate, scene_placement: c.scene_placement || null })),
+              clips: aj.clips.map(c => ({ url: c.url, start_ms: c.start_ms, gain_db: dubGain + Number(c.mix_gain_db || 0), max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate, scene_placement: c.scene_placement || null })),
               durationMs: aj.duration_ms, meTrackUrl: aj.me_track_url, meGainDb: aj.me_gain_db,
               vocalsTrackUrl: aj.vocals_track_url || null, vocalsGainDb: aj.vocals_gain_db ?? null,
               loudnessTargetLufs: aj.loudness_target_lufs,
@@ -637,7 +641,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
             const mixPath = join(burnDir, 'mix.flac');
             await callMixFinalToFile({
               railwayUrl, railwayKey, filePath: mixPath,
-              clips: bj.mix.clips.map(c => ({ url: c.url, start_ms: c.start_ms, gain_db: dubGain, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate, scene_placement: c.scene_placement || null })),
+              clips: bj.mix.clips.map(c => ({ url: c.url, start_ms: c.start_ms, gain_db: dubGain + Number(c.mix_gain_db || 0), max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate, scene_placement: c.scene_placement || null })),
               durationMs: bj.mix.duration_ms, meTrackUrl: bj.mix.me_track_url, meGainDb: bj.mix.me_gain_db,
               vocalsTrackUrl: bj.mix.vocals_track_url || null, vocalsGainDb: bj.mix.vocals_gain_db ?? null,
               loudnessTargetLufs: bj.mix.loudness_target_lufs ?? null,
