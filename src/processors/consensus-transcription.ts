@@ -47,6 +47,7 @@ import type { ConsensusTranscriptionJobData } from '../../shared/queue-contracts
 import { invokeBase44Function, logEvent, runWithLockHeartbeat, WorkerLockLostError } from '../base44-client.js';
 import { env } from '../env.js';
 import { buildConsensusAcousticEvidence } from '../consensus-acoustic-evidence.js';
+import { buildPhraseDisagreements } from '../duo-phrase-verification.js';
 
 const FUNCTION_CALL_TIMEOUT_MS = 60_000;
 // Total wall-clock cap for the whole run's tick loop. Phase 1 parks after one
@@ -75,6 +76,7 @@ interface ConsensusStepResponse {
   acoustic_put_url?: string;
   primary_model?: string;
   source_language?: string;
+  expected_speakers?: number | null;
 }
 
 async function fetchJson(url: string, init: RequestInit = {}, allow404 = false): Promise<any> {
@@ -182,7 +184,7 @@ export async function processConsensusTranscription(job: Job<ConsensusTranscript
       const pinnedLanguage = assemblyLanguage(prep.source_language);
       const submitted = await fetchJson('https://api.assemblyai.com/v2/transcript', {
         method: 'POST', headers: { authorization: env.ASSEMBLYAI_API_KEY, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ audio_url: prep.source_url, speaker_labels: true, speech_models: [prep.primary_model || 'universal-3-5-pro'], punctuate: true, ...(pinnedLanguage ? { language_code: pinnedLanguage } : { language_detection: true }) }),
+        body: JSON.stringify({ audio_url: prep.source_url, speaker_labels: true, speech_models: [prep.primary_model || 'universal-3-5-pro'], punctuate: true, ...(prep.expected_speakers ? { speakers_expected: prep.expected_speakers } : {}), ...(pinnedLanguage ? { language_code: pinnedLanguage } : { language_detection: true }) }),
         signal,
       });
       aaiJobId = String(submitted.id || '');
@@ -206,6 +208,7 @@ export async function processConsensusTranscription(job: Job<ConsensusTranscript
         form.append('diarize', 'true');
         form.append('tag_audio_events', 'true');
         form.append('timestamps_granularity', 'word');
+        if (prep.expected_speakers) form.append('num_speakers', String(prep.expected_speakers));
         const response = await fetch('https://api.elevenlabs.io/v1/speech-to-text', { method: 'POST', headers: { 'xi-api-key': env.ELEVENLABS_API_KEY }, body: form, signal });
         const text = await response.text();
         if (!response.ok) throw new Error(`Scribe HTTP ${response.status}: ${text.slice(0, 300)}`);
@@ -240,6 +243,9 @@ export async function processConsensusTranscription(job: Job<ConsensusTranscript
           sourceLanguage: aaiRaw.language_code, signal,
           onProgress: async phase => reportExternalProgress(signal, 'aligning', phase === 'primary_aligned' ? 62 : 70),
         });
+        const primaryPhraseWords = (aaiRaw.words || []).map((word: any) => ({ text: word.text, start_ms: Number(word.start), end_ms: Number(word.end) }));
+        const secondaryPhraseWords = (rawStash.raw?.words || []).filter((word: any) => word.type !== 'spacing' && word.type !== 'audio_event').map((word: any) => ({ text: word.text, start_ms: Math.round(Number(word.start) * 1000), end_ms: Math.round(Number(word.end) * 1000) }));
+        acousticEvidence.phrase_disagreements = buildPhraseDisagreements(primaryPhraseWords, secondaryPhraseWords);
         await putJson(prep.acoustic_put_url!, acousticEvidence);
       }
       acousticVerified = !!acousticEvidence?.verified;
