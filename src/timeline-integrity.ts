@@ -1163,6 +1163,7 @@ export function auditTimelineIntegrity(
   captureRestore?: CaptureRestoreReport,
   acceptance?: FinalAcceptanceReport,
   reconciliation?: UnresolvedReconciliationReport,
+  options: { allowRepairs?: boolean } = {},
 ): IntegrityReport {
   const report: IntegrityReport = {
     policy_version: TIMELINE_INTEGRITY_POLICY_VERSION,
@@ -1292,7 +1293,7 @@ export function auditTimelineIntegrity(
       if (overlapMs > OVERLAP_EPSILON_MS) {
         if (overlapMs > report.worst_same_speaker_overlap_ms) report.worst_same_speaker_overlap_ms = Math.round(overlapMs);
         const boundary = Number(row.start_ms);
-        const repairable = overlapMs <= AUTO_REPAIR_CEILING_MS
+        const repairable = options.allowRepairs !== false && overlapMs <= AUTO_REPAIR_CEILING_MS
           && boundary > Number(previous.start_ms)
           && !wouldEraseAWord(previous, boundary);
         if (repairable) {
@@ -1300,7 +1301,7 @@ export function auditTimelineIntegrity(
             previous._alignment.words = clampWordsTo(previous._alignment.words, boundary);
             previous._alignment.max_provider_shift_ms = recomputeMaxShift(previous._alignment.words);
           }
-          previous.aai_word_timings = clampWordsTo(previous.aai_word_timings, boundary);
+          // The provider capture is immutable; only derived evidence is clamped.
           previous.end_ms = boundary;
           previous.tc_out = formatTimecode(boundary);
           report.same_speaker_overlap_repairs += 1;
