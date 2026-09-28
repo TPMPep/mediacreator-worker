@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-09-27b-final-qc-recovery';
+export const BUILD_TAG = '2026-09-28b-final-qc-docker-readiness';
