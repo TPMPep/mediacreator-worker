@@ -102,6 +102,7 @@ export const QUEUE_NAMES = {
   // Concurrency held at 4 — exports are I/O bound (SDK pagination), not
   // CPU bound, so we can run several in parallel without saturating.
   EXPORT_PROJECT: 'export-project',
+  FINAL_EXPORT_QC: 'final-export-qc',
   // Weekly backup-snapshot pipeline (2026-05-15). Single-shot job. The
   // worker paginates EVERY entity into a single JSON file under
   // dubflow/backups/YYYY-MM-DD/full-backup.json, then prunes old backups
@@ -1048,6 +1049,14 @@ export interface AIRewriteChunkResult {
 //   • BullMQ retains failed jobs for 7 days — every failed export is
 //     queryable from the DLQ panel.
 
+export interface FinalExportQCJobData {
+  schema_version: number;
+  export_job_id: string;
+  project_id: string;
+  request_id: string;
+  user_email: string;
+}
+
 export interface ExportJobData {
   schema_version: number;
   /** Discriminator — selects which entity tree to paginate + which builders to use.
@@ -1673,6 +1682,7 @@ export type AnyJobData =
    | MediaProbeJobData
    | ProjectCascadeJobData
    | ExportJobData
+   | FinalExportQCJobData
    | BackupSnapshotJobData
    | LoadTestFanoutJobData
    | LoadTestCleanupJobData
