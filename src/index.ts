@@ -1,6 +1,6 @@
 // =============================================================================
 // MEDIACREATOR BULLMQ WORKER — Entry point.
-// Build: 2026-09-28b-final-qc-docker-readiness
+// Build: 2026-09-28e-isolated-final-qc-boot
 // Boots one Worker per queue, wires shared error/log handlers, exposes a
 // minimal /health endpoint for Railway healthchecks.
 // =============================================================================
@@ -139,16 +139,16 @@ import { processPreExportAudioQC } from './processors/pre-export-audio-qc.js';
 // This worker holds the ONLY copy of the test bearer credential.
 import { processGltvApiTest } from './processors/gltv-api-test.js';
 
-// Final-file QC runs on this worker and cannot release a deliverable unless
-// both binaries are available. Refuse to start any queue on a broken image so
-// Railway never promotes a healthy-looking deployment that retries a full
-// feature-length render eight times before discovering a missing audio tool.
-for (const binary of ['ffmpeg', 'ffprobe']) {
+// Final-file QC needs both binaries, but a broken QC image must never take
+// unrelated queues (including voice generation) offline. The QC lane remains
+// unregistered until the binaries pass; /health discloses the capability and
+// Base44's export admission gate refuses checked renders before any spend.
+const missingAudioTools = ['ffmpeg', 'ffprobe'].filter(binary => {
   const check = spawnSync(binary, ['-version'], { timeout: 5000, stdio: 'ignore' });
-  if (check.error || check.status !== 0) {
-    throw new Error(`Worker image missing required ${binary} binary; deploy the Dockerfile image before accepting jobs`);
-  }
-}
+  return !!check.error || check.status !== 0;
+});
+const finalQcReady = missingAudioTools.length === 0;
+if (!finalQcReady) console.error(`[worker] final-file QC disabled: missing audio tools ${missingAudioTools.join(', ')}; other queues remain available`);
 
 initSentry();
 
@@ -347,9 +347,9 @@ const workers: Worker[] = [
   new Worker(QUEUE_NAMES.EXPORT_PROJECT, processExportProject, {
     ...baseOpts, concurrency: env.CONCURRENCY_EXPORT_PROJECT,
   }),
-  new Worker(QUEUE_NAMES.FINAL_EXPORT_QC, processFinalExportQC, {
+  ...(finalQcReady ? [new Worker(QUEUE_NAMES.FINAL_EXPORT_QC, processFinalExportQC, {
     ...baseOpts, concurrency: 1, stalledInterval: 30000, maxStalledCount: 2,
-  }),
+  })] : []),
   // Weekly full-DB backup pipeline (2026-05-15). One backup runs at a time
   // — concurrency=1 because the job paginates EVERY entity and would
   // saturate the per-app SDK rate limit if two ran concurrently.
@@ -630,7 +630,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       build_info: BUILD_INFO,
-      final_export_qc: { policy_version: 1, recovery: true },
+      final_export_qc: { policy_version: finalQcReady ? 1 : null, recovery: finalQcReady, missing_audio_tools: missingAudioTools },
       alignment_engine: alignmentEngine,
       s3_creds_present: s3Creds.ok,
       s3_creds_missing: s3Creds.missing,
@@ -1127,6 +1127,11 @@ const server = http.createServer(async (req, res) => {
     if (!Object.values(QUEUE_NAMES).includes(queue as never)) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: `unknown queue: ${queue}` }));
+      return;
+    }
+    if (queue === QUEUE_NAMES.FINAL_EXPORT_QC && !finalQcReady) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'final-file QC unavailable: worker image lacks ffmpeg or ffprobe' }));
       return;
     }
 
