@@ -1,12 +1,13 @@
 // =============================================================================
 // MEDIACREATOR BULLMQ WORKER — Entry point.
-// Build: 2026-09-27b-final-qc-recovery
+// Build: 2026-09-28b-final-qc-docker-readiness
 // Boots one Worker per queue, wires shared error/log handlers, exposes a
 // minimal /health endpoint for Railway healthchecks.
 // =============================================================================
 
 import { Worker, type WorkerOptions } from 'bullmq';
 import http from 'node:http';
+import { spawnSync } from 'node:child_process';
 import { env, assertS3CredsOrWarn } from './env.js';
 import { getRedis, closeRedis } from './redis.js';
 import { initSentry, captureError, flushSentry } from './sentry.js';
@@ -137,6 +138,17 @@ import { processPreExportAudioQC } from './processors/pre-export-audio-qc.js';
 // from this worker is genuinely external, which is the more faithful test.
 // This worker holds the ONLY copy of the test bearer credential.
 import { processGltvApiTest } from './processors/gltv-api-test.js';
+
+// Final-file QC runs on this worker and cannot release a deliverable unless
+// both binaries are available. Refuse to start any queue on a broken image so
+// Railway never promotes a healthy-looking deployment that retries a full
+// feature-length render eight times before discovering a missing audio tool.
+for (const binary of ['ffmpeg', 'ffprobe']) {
+  const check = spawnSync(binary, ['-version'], { timeout: 5000, stdio: 'ignore' });
+  if (check.error || check.status !== 0) {
+    throw new Error(`Worker image missing required ${binary} binary; deploy the Dockerfile image before accepting jobs`);
+  }
+}
 
 initSentry();
 
@@ -876,6 +888,7 @@ const server = http.createServer(async (req, res) => {
         processed_on?: number | null;
         timestamp?: number | null;
         attempts_made?: number | null;
+        attempts_allowed?: number | null;
         lock_present?: boolean | null;
       }> = {};
       // Live-lock probe (2026-06-17 — chunk lock-ghost fix). BullMQ holds a
@@ -921,7 +934,11 @@ const server = http.createServer(async (req, res) => {
           results[id] = {
             state,
             returnvalue: state === 'completed' ? job.returnvalue : undefined,
-            failedReason: state === 'failed' ? job.failedReason : undefined,
+            // A delayed export is between failed attempts: preserve the prior
+            // failure for the authorized editor's retry banner instead of
+            // falsely describing it as a slow, healthy render.
+            failedReason: state === 'failed' || state === 'delayed' ? job.failedReason : undefined,
+            attempts_allowed: job.opts.attempts ?? 1,
             // PROGRESS DISCRIMINATOR (2026-06-02 — wedged-chunk true-ghost fix):
             // processedOn is set the instant a worker actually PICKS UP the job
             // and starts the processor. timestamp is when the job was added to
