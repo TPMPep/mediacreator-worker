@@ -1,6 +1,6 @@
 // =============================================================================
 // MEDIACREATOR BULLMQ WORKER — Entry point.
-// Build: 2026-09-16b-authoritative-take-lifecycle
+// Build: 2026-09-27b-final-qc-recovery
 // Boots one Worker per queue, wires shared error/log handlers, exposes a
 // minimal /health endpoint for Railway healthchecks.
 // =============================================================================
@@ -47,6 +47,7 @@ import { processProjectCascade } from './processors/project-cascade.js';
 // all four module kinds (dub / superscript / adaptation / cc) via a kind
 // discriminator on the job payload.
 import { processExportProject } from './processors/export-project.js';
+import { processFinalExportQC } from './processors/final-export-qc.js';
 // Weekly full-DB backup pipeline (2026-05-15). Replaces the synchronous
 // backupAllEntitiesToS3 function once DB growth pushes it past the 3-min
 // function ceiling.
@@ -334,6 +335,9 @@ const workers: Worker[] = [
   new Worker(QUEUE_NAMES.EXPORT_PROJECT, processExportProject, {
     ...baseOpts, concurrency: env.CONCURRENCY_EXPORT_PROJECT,
   }),
+  new Worker(QUEUE_NAMES.FINAL_EXPORT_QC, processFinalExportQC, {
+    ...baseOpts, concurrency: 1, stalledInterval: 30000, maxStalledCount: 2,
+  }),
   // Weekly full-DB backup pipeline (2026-05-15). One backup runs at a time
   // — concurrency=1 because the job paginates EVERY entity and would
   // saturate the per-app SDK rate limit if two ran concurrently.
@@ -614,6 +618,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: true,
       build_info: BUILD_INFO,
+      final_export_qc: { policy_version: 1, recovery: true },
       alignment_engine: alignmentEngine,
       s3_creds_present: s3Creds.ok,
       s3_creds_missing: s3Creds.missing,
