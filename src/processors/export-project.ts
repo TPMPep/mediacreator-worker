@@ -26,6 +26,9 @@ import { presignS3Url, putS3File, putS3Object, storageFromEnv, type StorageHandl
 import { createSegmentZipWriter } from '../segment-zip-writer.js';
 import { createStemPackageZipWriter } from '../stem-package-zip-writer.js';
 import { buildRailwayRenderError } from '../export-render-error.js';
+import { inspectFinalExport, attachFinalQcPreviews } from '../final-export-audio-qc.js';
+import { createHash } from 'node:crypto';
+import { writeFile } from 'node:fs/promises';
 
 const FUNCTION_CALL_TIMEOUT_MS = 150_000; // 2.5 min per tick (pagination + build)
 const HEARTBEAT_MS = 15_000;
@@ -193,12 +196,13 @@ async function callMixFinalToFile(opts: {
   clips: Array<{ url: string; start_ms: number; gain_db?: number; max_duration_ms?: number | null; playback_rate?: number; scene_placement?: Record<string, unknown> | null }>;
   durationMs: number; meTrackUrl?: string | null; meGainDb?: number;
   vocalsTrackUrl?: string | null; vocalsGainDb?: number | null; loudnessTargetLufs?: number | null;
+  outputFormat?: 'wav' | 'flac' | 'mp3';
 }) {
   const base = opts.railwayUrl.replace(/\/+$/, '');
   return postRailwayToFile({
     url: `${base}/mix-final`, railwayKey: opts.railwayKey, filePath: opts.filePath, label: 'Railway /mix-final',
     body: {
-      clips: opts.clips, duration_ms: opts.durationMs, output_format: 'flac', sample_rate: 48000,
+      clips: opts.clips, duration_ms: opts.durationMs, output_format: opts.outputFormat || 'flac', sample_rate: 48000,
       fade_in_ms: 8, fade_out_ms: 12,
       ...(opts.meTrackUrl ? { me_track: { url: opts.meTrackUrl, gain_db: opts.meGainDb ?? -6 } } : {}),
       ...(opts.vocalsTrackUrl ? { vocals_track: { url: opts.vocalsTrackUrl, gain_db: opts.vocalsGainDb ?? -18 } } : {}),
@@ -338,6 +342,8 @@ async function callBurnSubtitles(opts: {
     clearTimeout(timer);
   }
 }
+
+
 
 function slugifyLabel(s: string) {
   return String(s || 'speaker').replace(/[^a-zA-Z0-9]/g, '_').slice(0, 40);
@@ -580,23 +586,33 @@ export async function processExportProject(job: Job<ExportJobData>) {
             const uploaded = await putS3File({ ...s3, bucket: s3_bucket }, key, mp4Path, {
               contentType: 'video/mp4', contentDisposition: `attachment; filename="${suggested_filename}"`, timeoutMs: RAILWAY_MIX_TIMEOUT_MS,
             });
-            audioResult = { s3_key: key, file_size_bytes: uploaded.size, mime_type: 'video/mp4', output_sha256: uploaded.sha256 };
+            const finalQc = await attachFinalQcPreviews(mp4Path, { ...s3, bucket: s3_bucket }, baseKeyPrefix, await inspectFinalExport(mp4Path));
+            if (finalQc.output_sha256 !== uploaded.sha256) throw new Error('Final QC digest differs from uploaded MP4');
+            audioResult = { s3_key: key, file_size_bytes: uploaded.size, mime_type: 'video/mp4', output_sha256: uploaded.sha256, final_qc: finalQc };
           } finally {
             await rm(renderDir, { recursive: true, force: true });
           }
         } else {
           const outputFormat = aj.output_format || 'wav';
-          const bytes = await callMixFinal({
-            railwayUrl: requiredRailwayUrl, railwayKey: requiredRailwayKey,
-            clips: aj.clips.map(c => ({ url: c.url, start_ms: c.start_ms, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate, scene_placement: c.scene_placement || null })),
-            durationMs: aj.duration_ms,
-            meTrackUrl: aj.me_track_url,
-            loudnessTargetLufs: aj.loudness_target_lufs,
-            outputFormat,
-          });
-          const key = `${baseKeyPrefix}${suggested_filename}`;
-          await uploadAudio(s3, s3_bucket, key, bytes, suggested_filename, outputFormat);
-          audioResult = { s3_key: key, file_size_bytes: bytes.length, mime_type: audioContentType(outputFormat) };
+          // Disk-backed render and streaming upload: a four-hour WAV cannot occupy
+          // a gigabyte of heap per concurrent export while QC decodes it.
+          const qcDir = await mkdtemp(join(tmpdir(), `final-qc-${export_job_id}-`));
+          try {
+            const qcPath = join(qcDir, `program.${outputFormat}`);
+            await callMixFinalToFile({
+              railwayUrl: requiredRailwayUrl, railwayKey: requiredRailwayKey, filePath: qcPath,
+              clips: aj.clips.map(c => ({ url: c.url, start_ms: c.start_ms, max_duration_ms: c.max_duration_ms, playback_rate: c.playback_rate, scene_placement: c.scene_placement || null })),
+              durationMs: aj.duration_ms, meTrackUrl: aj.me_track_url,
+              loudnessTargetLufs: aj.loudness_target_lufs, outputFormat,
+            });
+            const finalQc = await attachFinalQcPreviews(qcPath, { ...s3, bucket: s3_bucket }, baseKeyPrefix, await inspectFinalExport(qcPath));
+            const key = `${baseKeyPrefix}${suggested_filename}`;
+            const uploaded = await putS3File({ ...s3, bucket: s3_bucket }, key, qcPath, {
+              contentType: audioContentType(outputFormat), contentDisposition: `attachment; filename="${suggested_filename}"`, timeoutMs: RAILWAY_MIX_TIMEOUT_MS,
+            });
+            if (finalQc.output_sha256 !== uploaded.sha256) throw new Error('Final QC digest differs from uploaded program');
+            audioResult = { s3_key: key, file_size_bytes: uploaded.size, mime_type: audioContentType(outputFormat), output_sha256: uploaded.sha256, final_qc: finalQc };
+          } finally { await rm(qcDir, { recursive: true, force: true }); }
         }
 
         await logEvent({
@@ -669,7 +685,16 @@ export async function processExportProject(job: Job<ExportJobData>) {
             railwayUrl, railwayKey, videoUrl: burnVideoUrl, subtitlesUrl: bj.subtitles_url,
           });
           burnByteCount = mp4Bytes.length;
-          await uploadMp4(s3, s3_bucket, key, mp4Bytes, suggested_filename);
+          let finalQc = null;
+          if (bj.audio_source === 'dub_mix') {
+            const qcPath = join(burnDir!, 'burn-deliverable.mp4');
+            await writeFile(qcPath, mp4Bytes);
+            finalQc = await attachFinalQcPreviews(qcPath, { ...s3, bucket: s3_bucket }, burnKeyPrefix, await inspectFinalExport(qcPath));
+            }
+            await uploadMp4(s3, s3_bucket, key, mp4Bytes, suggested_filename);
+          if (finalQc) {
+            carry = { ...(step.carry as object), _final_qc: finalQc, _output_sha256: createHash('sha256').update(mp4Bytes).digest('hex') };
+          }
           await logEvent({
             function_name: 'bullmq:export-project',
             event: 'cc_burn_complete',
@@ -679,8 +704,8 @@ export async function processExportProject(job: Job<ExportJobData>) {
           if (burnDir) await rm(burnDir, { recursive: true, force: true });
         }
         carry = {
-          ...(step.carry as object),
-          _burn_result: { s3_key: key, file_size_bytes: burnByteCount, mime_type: 'video/mp4' },
+          ...(carry as object),
+          _burn_result: { s3_key: key, file_size_bytes: burnByteCount, mime_type: 'video/mp4', output_sha256: (carry as { _output_sha256?: string })?._output_sha256, final_qc: (carry as { _final_qc?: unknown })?._final_qc },
         };
         continue;
       }
