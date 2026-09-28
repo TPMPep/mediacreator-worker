@@ -2,7 +2,7 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm install --omit=dev=false
+RUN npm install --include=dev
 COPY tsconfig.json ./
 COPY src ./src
 COPY shared ./shared
@@ -12,7 +12,9 @@ FROM node:20-alpine
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json package-lock.json* ./
-RUN npm install --omit=dev
+RUN npm install --omit=dev && apk add --no-cache ffmpeg \
+    && ffmpeg -version >/dev/null \
+    && ffprobe -version >/dev/null
 COPY --from=builder /app/dist ./dist
 # Non-root user for defense in depth.
 USER node
