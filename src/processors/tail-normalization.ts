@@ -2,7 +2,7 @@ import type { Job } from 'bullmq';
 import type { TailNormalizationJobData } from '../../shared/queue-contracts.js';
 import { invokeBase44Function, logEvent, runWithLockHeartbeat } from '../base44-client.js';
 
-interface Step { action: 'continue' | 'done' | 'failed'; phase?: string; status?: string; }
+interface Step { action: 'continue' | 'done' | 'failed'; phase?: string; status?: string; retry_after_ms?: number; }
 export async function processTailNormalization(job: Job<TailNormalizationJobData>) {
   const started = Date.now();
   const { project_id, run_id, user_email, request_id, auth_token } = job.data;
@@ -19,7 +19,8 @@ export async function processTailNormalization(job: Job<TailNormalizationJobData
         await logEvent({ function_name: 'bullmq:tail-normalization', event: 'tail_normalization_tick', context: { project_id, run_id, user_email, request_id, tick: ticks, action: step.action, phase: step.phase } });
       }
       if (step.action !== 'continue') return { ok: step.action === 'done', status: step.status, ticks };
-      await new Promise(resolve => setTimeout(resolve, 500));
+      const delayMs = Math.max(500, Math.min(2500, Number(step.retry_after_ms || 500)));
+      await new Promise(resolve => setTimeout(resolve, delayMs));
     }
     throw new Error('tail-normalization wall-clock cap exceeded');
   } catch (error) {
