@@ -292,7 +292,9 @@ export const env = {
   // can never point the harness at an arbitrary host.
   PUBLIC_API_BASE_URL: process.env.PUBLIC_API_BASE_URL || 'https://mediacreator.blutools.io',
 
-  ENQUEUE_PORT: intEnv('WORKER_ENQUEUE_PORT', 3000),
+  // Railway health checks probe the injected PORT. Preserve the legacy worker
+  // port only for environments where PORT is not supplied.
+  ENQUEUE_PORT: intEnv('PORT', intEnv('WORKER_ENQUEUE_PORT', 3000)),
   ENQUEUE_SECRET: process.env.WORKER_ENQUEUE_SECRET || '',
 
   // ── S3 credentials (default storage profile) ──────────────────────────
