@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-09-28c-railway-health-port';
+export const BUILD_TAG = '2026-09-28e-isolated-final-qc-boot';
