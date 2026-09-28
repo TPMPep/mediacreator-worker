@@ -96,6 +96,10 @@ export async function processTranslateOrchestrator(job: Job<TranslateOrchestrato
     return result;
   } catch (err) {
     const e = err as Error;
+
+    // ─── AUDIT LOG (best-effort) ──────────────────────────────────────
+    // logEvent itself goes through the same Base44 gateway that may be
+    // the thing failing. We try it but never depend on it landing.
     await logEvent({
       function_name: 'bullmq:translate-orchestrator',
       level: 'error',
@@ -104,7 +108,50 @@ export async function processTranslateOrchestrator(job: Job<TranslateOrchestrato
       error_kind: e.name,
       duration_ms: Date.now() - t0,
       context: { project_id, translation_run_id, user_email, request_id, attempts: job.attemptsMade + 1 },
-    });
+    }).catch(() => {});
+
+    // ─── DIRECT WRITE TO TranslationRun.error_message ──────────────────
+    // Incident 2026-05-18 (French run 6a0b8256...): the orchestrator's
+    // FIRST tick failed inside the platform gateway-auth retry budget.
+    // logEvent ALSO went through that gateway and was itself rejected,
+    // so NO StructuredLog row was ever written. Result: 11 minutes of
+    // "stuck at 0%" with zero diagnostic trail in Base44 — we had to
+    // spelunk Railway logs to find the cause.
+    //
+    // Fix: when the tick fails, ask the Base44 fn to write the failure
+    // reason directly onto the TranslationRun row using the scoped JWT
+    // we already have. We pass a `_record_worker_failure` sentinel; the
+    // Base44 fn checks for it first and writes error_message + status
+    // without performing a tick. This goes through the same gateway —
+    // by the time we hit this catch, the gateway's recovery curve is
+    // usually on the upswing, so the second call typically succeeds.
+    // Even if it also fails, we're no worse off than today; the
+    // watchdog still catches the run in ≤5 min.
+    //
+    // SOC 2 CC7.2: every failure leaves an auditable trail on the
+    // primary entity it concerns, not just in best-effort log surfaces.
+    try {
+      await invokeBase44Function({
+        fn: 'orchestrateTranslationRun',
+        authToken: auth_token,
+        payload: {
+          project_id,
+          translation_run_id,
+          request_id,
+          _record_worker_failure: {
+            message: e.message.slice(0, 400),
+            error_kind: e.name,
+            attempts: job.attemptsMade + 1,
+            failed_at: new Date().toISOString(),
+          },
+        },
+        timeoutMs: 15_000,
+      });
+    } catch (_) {
+      // Already in a failure path — swallow secondary failure.
+      // The watchdog will still catch the stuck run within 5 min.
+    }
+
     throw err;
   } finally {
     heartbeatActive = false;
