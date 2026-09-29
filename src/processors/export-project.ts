@@ -134,8 +134,9 @@ async function callMixFinal(opts: {
     duration_ms: opts.durationMs,
     output_format: opts.outputFormat || 'wav',
     sample_rate: 48000,
-    fade_in_ms: 8,
-    fade_out_ms: 12,
+    render_contract_version: 2,
+    fade_in_ms: 15,
+    fade_out_ms: 15,
     ...(opts.meTrackUrl ? { me_track: { url: opts.meTrackUrl, gain_db: meGain } } : {}),
     ...(opts.vocalsTrackUrl ? { vocals_track: { url: opts.vocalsTrackUrl, gain_db: opts.vocalsGainDb ?? -18 } } : {}),
     ...(opts.loudnessTargetLufs != null ? { loudness_target_lufs: opts.loudnessTargetLufs } : {}),
@@ -153,6 +154,7 @@ async function callMixFinal(opts: {
       const errText = await res.text().catch(() => '');
       throw new Error(`Railway /mix-final failed (${res.status}): ${errText.slice(0, 500)}`);
     }
+    if (Number(res.headers.get('X-Audio-Export-Render-Contract')) !== 2) throw new Error('Deploy the updated audio renderer before exporting editor playback');
     return new Uint8Array(await res.arrayBuffer());
   } finally {
     clearTimeout(timer);
@@ -182,6 +184,7 @@ async function postRailwayToFile(opts: {
       const detail = await response.text().catch(() => '');
       throw buildRailwayRenderError(opts.label, response.status, detail);
     }
+    if (opts.label === 'Railway /mix-final' && Number(response.headers.get('X-Audio-Export-Render-Contract')) !== 2) throw new Error('Deploy the updated audio renderer before exporting editor playback');
     await pipeline(Readable.fromWeb(response.body as any), createWriteStream(opts.filePath));
     const info = await stat(opts.filePath);
     if (info.size === 0) throw new Error(`${opts.label} returned an empty file`);
@@ -203,7 +206,8 @@ async function callMixFinalToFile(opts: {
     url: `${base}/mix-final`, railwayKey: opts.railwayKey, filePath: opts.filePath, label: 'Railway /mix-final',
     body: {
       clips: opts.clips, duration_ms: opts.durationMs, output_format: opts.outputFormat || 'flac', sample_rate: 48000,
-      fade_in_ms: 8, fade_out_ms: 12,
+      render_contract_version: 2,
+      fade_in_ms: 15, fade_out_ms: 15,
       ...(opts.meTrackUrl ? { me_track: { url: opts.meTrackUrl, gain_db: opts.meGainDb ?? -6 } } : {}),
       ...(opts.vocalsTrackUrl ? { vocals_track: { url: opts.vocalsTrackUrl, gain_db: opts.vocalsGainDb ?? -18 } } : {}),
       ...(opts.loudnessTargetLufs != null ? { loudness_target_lufs: opts.loudnessTargetLufs } : {}),
@@ -484,10 +488,19 @@ export async function processExportProject(job: Job<ExportJobData>) {
               const filename = clip.filename || `${String(index + 1).padStart(4, '0')}_segment.${outputFormat}`;
               // Individual files are deliverables too: render each through the
               // same scene-placement mixer as program mixes and speaker stems.
-              const durationMs = Math.max(1, Number(clip.duration_ms || clip.audio_dur_ms || 1));
+              const pace = Number(clip.playback_rate || 1);
+              const contentMs = Number(clip.duration_ms || clip.audio_dur_ms || 0) / pace;
+              if (!(contentMs > 0) || !Number.isFinite(contentMs)) throw new Error('Segment snapshot has no valid playback duration');
+              const r = clip.scene_placement?.recipe;
+              const tailMs = Number(r?.room_mix || 0) > 0
+                ? Number(clip.scene_placement?.recipe_model_version || 1) >= 3
+                  ? Number(r?.pre_delay_ms || 0) + Number(r?.decay_seconds || .35) * 1000 + 80
+                  : Number(r?.echo_delay_ms || 60) * (Number(clip.scene_placement?.recipe_model_version || 1) >= 2 ? 3 : 1)
+                : 0;
+              const durationMs = Math.ceil(contentMs + tailMs);
               const bytes = await callMixFinal({
                 railwayUrl: requiredRailwayUrl, railwayKey: requiredRailwayKey,
-                clips: [{ url: clip.url, start_ms: 0, max_duration_ms: durationMs, scene_placement: clip.scene_placement || null }],
+                clips: [{ url: clip.url, start_ms: 0, playback_rate: pace, scene_placement: clip.scene_placement || null }],
                 durationMs, outputFormat, loudnessTargetLufs: aj.loudness_target_lufs,
               });
               const individualKey = `${baseKeyPrefix}segments/${filename}`;
