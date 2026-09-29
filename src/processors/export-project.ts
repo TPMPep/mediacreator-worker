@@ -586,8 +586,8 @@ export async function processExportProject(job: Job<ExportJobData>) {
             const uploaded = await putS3File({ ...s3, bucket: s3_bucket }, key, mp4Path, {
               contentType: 'video/mp4', contentDisposition: `attachment; filename="${suggested_filename}"`, timeoutMs: RAILWAY_MIX_TIMEOUT_MS,
             });
-            const finalQc = await attachFinalQcPreviews(mp4Path, { ...s3, bucket: s3_bucket }, baseKeyPrefix, await inspectFinalExport(mp4Path));
-            if (finalQc.output_sha256 !== uploaded.sha256) throw new Error('Final QC digest differs from uploaded MP4');
+            const finalQc = (job.data.module_options as any)?.final_audio_qc?.mode === 'unchecked' ? null : await attachFinalQcPreviews(mp4Path, { ...s3, bucket: s3_bucket }, baseKeyPrefix, await inspectFinalExport(mp4Path));
+            if (finalQc && finalQc.output_sha256 !== uploaded.sha256) throw new Error('Final QC digest differs from uploaded MP4');
             audioResult = { s3_key: key, file_size_bytes: uploaded.size, mime_type: 'video/mp4', output_sha256: uploaded.sha256, final_qc: finalQc };
           } finally {
             await rm(renderDir, { recursive: true, force: true });
@@ -605,12 +605,12 @@ export async function processExportProject(job: Job<ExportJobData>) {
               durationMs: aj.duration_ms, meTrackUrl: aj.me_track_url,
               loudnessTargetLufs: aj.loudness_target_lufs, outputFormat,
             });
-            const finalQc = await attachFinalQcPreviews(qcPath, { ...s3, bucket: s3_bucket }, baseKeyPrefix, await inspectFinalExport(qcPath));
+            const finalQc = (job.data.module_options as any)?.final_audio_qc?.mode === 'unchecked' ? null : await attachFinalQcPreviews(qcPath, { ...s3, bucket: s3_bucket }, baseKeyPrefix, await inspectFinalExport(qcPath));
             const key = `${baseKeyPrefix}${suggested_filename}`;
             const uploaded = await putS3File({ ...s3, bucket: s3_bucket }, key, qcPath, {
               contentType: audioContentType(outputFormat), contentDisposition: `attachment; filename="${suggested_filename}"`, timeoutMs: RAILWAY_MIX_TIMEOUT_MS,
             });
-            if (finalQc.output_sha256 !== uploaded.sha256) throw new Error('Final QC digest differs from uploaded program');
+            if (finalQc && finalQc.output_sha256 !== uploaded.sha256) throw new Error('Final QC digest differs from uploaded program');
             audioResult = { s3_key: key, file_size_bytes: uploaded.size, mime_type: audioContentType(outputFormat), output_sha256: uploaded.sha256, final_qc: finalQc };
           } finally { await rm(qcDir, { recursive: true, force: true }); }
         }
@@ -686,8 +686,8 @@ export async function processExportProject(job: Job<ExportJobData>) {
           });
           burnByteCount = mp4Bytes.length;
           let finalQc = null;
-          if (bj.audio_source === 'dub_mix') {
-            const qcPath = join(burnDir!, 'burn-deliverable.mp4');
+          if (bj.audio_source === 'dub_mix' && (job.data.module_options as any)?.final_audio_qc?.mode !== 'unchecked') {
+                       const qcPath = join(burnDir!, 'burn-deliverable.mp4');
             await writeFile(qcPath, mp4Bytes);
             finalQc = await attachFinalQcPreviews(qcPath, { ...s3, bucket: s3_bucket }, burnKeyPrefix, await inspectFinalExport(qcPath));
             }
