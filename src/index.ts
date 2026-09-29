@@ -1,6 +1,6 @@
 // =============================================================================
 // MEDIACREATOR BULLMQ WORKER — Entry point.
-// Build: 2026-09-28e-isolated-final-qc-boot
+// Build: 2026-09-28f-public-ipv4-bind
 // Boots one Worker per queue, wires shared error/log handlers, exposes a
 // minimal /health endpoint for Railway healthchecks.
 // =============================================================================
@@ -1194,8 +1194,8 @@ const server = http.createServer(async (req, res) => {
 
   res.writeHead(404); res.end();
 });
-server.listen(env.ENQUEUE_PORT, () => {
-  console.log(`health endpoint listening on :${env.ENQUEUE_PORT}/health`);
+server.listen(env.ENQUEUE_PORT, '0.0.0.0', () => {
+  console.log(`health endpoint listening on 0.0.0.0:${env.ENQUEUE_PORT}/health`);
 });
 
 // ─── Graceful shutdown ───────────────────────────────────────────────
