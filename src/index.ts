@@ -1,6 +1,6 @@
 // =============================================================================
 // MEDIACREATOR BULLMQ WORKER — Entry point.
-// Build: 2026-09-30c-independent-speaker-detection
+// Build: 2026-09-30d-full-video-duration
 // Boots one Worker per queue, wires shared error/log handlers, exposes a
 // minimal /health endpoint for Railway healthchecks.
 // =============================================================================
