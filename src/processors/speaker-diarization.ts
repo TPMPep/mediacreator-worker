@@ -13,6 +13,7 @@ import { resolveOutputGroups, resolveOutputText, textIsAuthoritative } from '../
 import { approvedTextHash, segmentApprovedScriptWords } from '../approved-script-segmentation.js';
 import { attributeProviderWindow, preserveProviderBaselineBoundaries } from '../speaker-attribution.js';
 import { preserveCommittedRows, providerBaselineEvidence } from '../refinement-baseline.js';
+import { buildPyannoteDiarizationRequest } from '../pyannote-diarization-request.js';
 
 const API = 'https://api.pyannote.ai/v1';
 const COLORS = ['blue','purple','green','amber','red','pink','cyan','orange'];
@@ -94,7 +95,7 @@ export async function processSpeakerDiarization(job:Job<SpeakerDiarizationJobDat
   };
   try{return await runWithLockHeartbeat(job,async signal=>{
     if(!env.PYANNOTE_API_KEY)throw new Error('PYANNOTE_API_KEY is not configured in Railway');
-    const prep=await call<any>('prepare',{},signal); if(prep.action==='done')return {ok:true,already_terminal:true};
+    const prep=await call<any>('prepare',{speaker_count_policy_version:1},signal); if(prep.action==='done')return {ok:true,already_terminal:true};
     // ── RESUME FINALIZATION — this run already replaced the transcript ─────────
     // The step told us our own refined rows are LIVE, so the pipeline must NOT run
     // again: re-running would read a transcript this run is forbidden to read (its
@@ -114,7 +115,12 @@ export async function processSpeakerDiarization(job:Job<SpeakerDiarizationJobDat
       return {ok:true,action:'done',resumed_finalize:true};
     }
     const auth={Authorization:`Bearer ${env.PYANNOTE_API_KEY}`}; let providerId=prep.run.provider_job_id||'';
-    if(!providerId){const expected=Number(prep.run.expected_speakers);if(!Number.isInteger(expected)||expected<1||expected>32)throw new Error('expected_speakers_required: refusing unconstrained speaker refinement');const submitted=await provider(`${API}/diarize`,{method:'POST',headers:{...auth,'Content-Type':'application/json'},body:JSON.stringify({url:prep.source_url,model:'precision-2',turnLevelConfidence:true,confidence:true,exclusive:false,transcription:false,numSpeakers:expected})},signal);providerId=String(submitted.jobId||'');if(!providerId)throw new Error('pyannote returned no jobId');await call('mark_polling',{provider_job_id:providerId},signal);}
+    if(!providerId){
+      const request=buildPyannoteDiarizationRequest(prep.source_url,prep.run.expected_speakers);
+      const submitted=await provider(`${API}/diarize`,{method:'POST',headers:{...auth,'Content-Type':'application/json'},body:JSON.stringify(request)},signal);
+      providerId=String(submitted.jobId||'');if(!providerId)throw new Error('pyannote returned no jobId');
+      await call('mark_polling',{provider_job_id:providerId},signal);
+    }
     let result:any=null,polls=0; while(Date.now()-started<40*60*1000){result=await provider(`${API}/jobs/${providerId}`,{headers:auth},signal);if(result.status==='succeeded')break;if(!['pending','created','running'].includes(result.status))throw new Error(`pyannote job ${result.status||'failed'}: ${result.output?.error||'provider failure'}`);polls++;await call('heartbeat',{progress_pct:Math.min(75,15+polls*3)},signal);await sleep(5000,signal);} if(result?.status!=='succeeded')throw new Error('speaker diarization exceeded 40 minutes');
     const turns:Turn[]=(result.output?.diarization||[]).filter((t:Turn)=>t?.speaker&&Number.isFinite(t.start)&&Number.isFinite(t.end)).sort((a:Turn,b:Turn)=>a.start-b.start);if(!turns.length)throw new Error('pyannote returned no usable turns');await call('mark_reconciling',{},signal);
     const upload=await timedFetch(prep.raw_result_upload_url,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(result)},signal,120000);if(!upload.ok)throw new Error(`raw result archive failed: HTTP ${upload.status}`);
@@ -408,5 +414,5 @@ speaker_unresolved_word_count:g.words.filter(w=>w.speaker_unresolved===true).len
       await logEvent({function_name:'bullmq:speaker-diarization',level:'info',event:'speaker_diarization_stood_down',message:`Stood down: another refinement run owns this project's single-flight claim. No transcript row was touched and no retry was consumed.`,duration_ms:Date.now()-started,context:{project_id,run_id,job_run_id,request_id,user_email,incumbent_run_id:error.incumbentRunId,refused_operation:error.refusedOperation,detail:error.detail.slice(0,300),attempt:job.attemptsMade+1,max_attempts:Number(job.opts.attempts||1)}});
       return {ok:true,stood_down:true,incumbent_run_id:error.incumbentRunId};
     }
-    const message=String((error as Error)?.message||error).slice(0,500),max=Number(job.opts.attempts||1),terminal=job.attemptsMade+1>=max||/not configured|No source|no usable turns|No active transcript|refinement_input_duplicate_rows|staging|Translation started|Forced alignment HTTP 4|word-count mismatch|token mismatch|invalid alignment|Missing provider word|timeline_integrity_evidence_unverified|alignment_language_unresolvable|alignment_language_unsupported|forced alignment is systemically misaligned|forced alignment disagreement is widespread|forced alignment shift/i.test(message);if(terminal)await call('terminal_failure',{terminal_failure:message}).catch(()=>{});await logEvent({function_name:'bullmq:speaker-diarization',level:terminal?'error':'warn',event:terminal?'speaker_diarization_failed':'speaker_diarization_retrying',message,context:{project_id,run_id,job_run_id,request_id,user_email,attempt:job.attemptsMade+1,max_attempts:max}});throw error;}
+    const message=String((error as Error)?.message||error).slice(0,500),max=Number(job.opts.attempts||1),terminal=job.attemptsMade+1>=max||/not configured|No source|no usable turns|No active transcript|refinement_input_duplicate_rows|staging|Translation started|Forced alignment HTTP 4|word-count mismatch|token mismatch|invalid alignment|Missing provider word|timeline_integrity_evidence_unverified|invalid_operator_speaker_count|alignment_language_unresolvable|alignment_language_unsupported|forced alignment is systemically misaligned|forced alignment disagreement is widespread|forced alignment shift/i.test(message);if(terminal)await call('terminal_failure',{terminal_failure:message}).catch(()=>{});await logEvent({function_name:'bullmq:speaker-diarization',level:terminal?'error':'warn',event:terminal?'speaker_diarization_failed':'speaker_diarization_retrying',message,context:{project_id,run_id,job_run_id,request_id,user_email,attempt:job.attemptsMade+1,max_attempts:max}});throw error;}
 }
