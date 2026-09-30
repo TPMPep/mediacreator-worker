@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-09-29a-export-editor-parity';
+export const BUILD_TAG = '2026-09-30c-independent-speaker-detection';
