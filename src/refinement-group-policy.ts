@@ -9,7 +9,7 @@ export function refinementStructureHoldReason(segment: any): string {
   if (textIsAuthoritative(segment)) return 'Operator-authored wording and line structure are preserved.';
   if (segment.source_text_status !== 'machine') return 'Text provenance is unspecified; automatic splitting was withheld.';
   if (segment.source_text_approved === true) return 'Approved wording and line structure are preserved.';
-  if (segment.timing_manual_override_at || segment.rythmo_timings_edited_at || segment.rythmo_word_timings?.length) return 'Operator timing and line structure are preserved.';
+  if (segment.boundary_source === 'authored_preserved' || segment.timing_manual_override_at || segment.rythmo_timings_edited_at || segment.rythmo_word_timings?.length) return 'Operator timing and line structure are preserved.';
   const words = segment.aai_word_timings || [];
   if (!words.length || normalize(joinRefinementWords(words)) !== normalize(segment.source_text)) return 'The captured word stream does not reproduce this line exactly; splitting was withheld to preserve its wording.';
   if (words.some((w: any) => !Number.isFinite(w.start_ms) || !Number.isFinite(w.end_ms) || w.start_ms < 0 || w.end_ms <= w.start_ms)) return 'Invalid provider word windows cannot support a speaker-boundary split.';
