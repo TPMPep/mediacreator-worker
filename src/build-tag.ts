@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-10-01a-native-timing-safe-speaker-splits';
+export const BUILD_TAG = '2026-10-01b-authored-window-cutover-safe';
