@@ -122,9 +122,10 @@ export function resolveOutputText(
 export function resolveOutputGroups<W extends ClusterWord>(
   segment: AuthoritySegment,
   groups: ClusterGroup<W>[],
+  preserveStructureReason = '',
 ): ResolvedGroups<W> {
   const list = Array.isArray(groups) ? groups : [];
-  if (!textIsAuthoritative(segment) || list.length <= 1) {
+  if ((!textIsAuthoritative(segment) && !preserveStructureReason) || list.length <= 1) {
     return { groups: list, collapsed: false, dominant_cluster: list[0]?.cluster ?? null, reason: '' };
   }
 
@@ -152,6 +153,6 @@ export function resolveOutputGroups<W extends ClusterWord>(
     groups: [{ cluster: dominant, words: list.flatMap(group => group.words || []) }],
     collapsed: true,
     dominant_cluster: dominant,
-    reason: `Refinement heard ${speakerCount} different speakers inside this operator-authored line. The line was kept whole rather than divided — splitting it would mean guessing which words belong to which speaker — so its speaker attribution is not proven and needs an operator ruling.`,
+    reason: preserveStructureReason || `Refinement heard ${speakerCount} different speakers inside this operator-authored line. The line was kept whole rather than divided — splitting it would mean guessing which words belong to which speaker — so its speaker attribution is not proven and needs an operator ruling.`,
   };
 }
