@@ -1,22 +1,44 @@
 import type { AlignmentInputWord, AlignmentResult, AlignmentWord } from './alignment-client.js';
+import { assertRefinementPartition } from './refinement-group-policy.js';
 type BaselineEvidence = Omit<AlignmentResult, 'verified' | 'provider' | 'audio_sha256'> & { verified: false; provider: 'transcription_provider'; audio_sha256: null };
 // Preservation is not validation: keep the committed row's text, sequence and
 // editorial timing exactly; retained provider evidence is never a replacement
 // for a later operator edit. This module performs no I/O.
 export function preserveCommittedRows(output: any[], source: any[]) {
-  if (output.length !== source.length) throw new Error('provider_baseline_structure_changed');
-  output.forEach((row, index) => {
-    const original = source[index];
+  const groups = new Map<string, any[]>(source.map((row, index) => [String(row.id ?? index), []]));
+  for (const [index, row] of output.entries()) {
+    const key = String(row._source_segment_id ?? source[index]?.id ?? index);
+    if (!groups.has(key)) throw new Error('provider_baseline_lineage_missing');
+    groups.get(key)!.push(row);
+  }
+  for (const [index, original] of source.entries()) {
+    const children = groups.get(String(original.id ?? index))!;
+    if (!children.length) throw new Error('provider_baseline_structure_changed');
+    if (children.length > 1) {
+      assertRefinementPartition(original, children);
+      // Split boundaries use their own conserved word windows, never the full
+      // parent's window or a newly estimated speaking duration.
+      for (const row of children) {
+        row.start_ms = row.aai_word_timings[0].start_ms;
+        row.end_ms = Math.max(...row.aai_word_timings.map((w: any) => w.end_ms));
+      }
+      continue;
+    }
+    const row = children[0];
     if (row.source_text !== original.source_text) throw new Error('provider_baseline_text_changed');
     row.sequence_index = original.sequence_index;
-    row.start_ms = original.start_ms;
-    row.end_ms = original.end_ms;
+    row.start_ms = original.start_ms; row.end_ms = original.end_ms;
     row.aai_word_timings = original.aai_word_timings || [];
     row.boundary_source = original.boundary_source || '';
     for (const key of ['source_text_approved','source_text_approved_text_hash','source_text_approved_by','source_text_approved_at','rythmo_word_timings','rythmo_timings_source','rythmo_timings_edited_by','rythmo_timings_edited_at','timing_manual_override_by','timing_manual_override_at','timing_manual_override_reason','timing_manual_override_prior_state','timing_manual_override_prior_start_ms','timing_manual_override_prior_end_ms','consensus_run_id','consensus_word_sources']) {
       if (original[key] !== undefined) row[key] = original[key];
     }
-  });
+    if (original.timing_manual_override_at || original.rythmo_timings_edited_at || original.rythmo_word_timings?.length) {
+      row._authored_preserved = true;
+      row._boundary_words = [];
+    }
+  }
+  if (output.length !== source.length) output.forEach((row, index) => { row.sequence_index = index; });
   for (let index=1;index<output.length;index++) {
     const delta=output[index-1].start_ms-output[index].start_ms;
     if(delta>0)for(const row of [output[index-1],output[index]]){row.chronology_conflict=true;row.chronology_conflict_ms=Math.max(row.chronology_conflict_ms||0,delta);}
