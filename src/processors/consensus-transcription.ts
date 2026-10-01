@@ -76,6 +76,8 @@ interface ConsensusStepResponse {
   acoustic_put_url?: string;
   primary_model?: string;
   source_language?: string;
+  language_policy?: { mode: 'single' | 'multilingual_auto' } | null;
+  assemblyai_language_parameters?: { language_code?: string; language_detection?: boolean };
   expected_speakers?: number | null;
 }
 
@@ -182,9 +184,11 @@ export async function processConsensusTranscription(job: Job<ConsensusTranscript
       state = { ...(state || {}), aai_dispatch_state: 'submitting', aai_submit_started_at: new Date().toISOString() };
       await putJson(prep.state_put_url!, state);
       const pinnedLanguage = assemblyLanguage(prep.source_language);
+      const languageParameters = prep.assemblyai_language_parameters || (pinnedLanguage ? { language_code: pinnedLanguage } : { language_detection: true });
+      if (prep.language_policy?.mode === 'multilingual_auto' && (languageParameters.language_code || languageParameters.language_detection !== true)) throw new Error('Mixed-language dispatch contract is invalid; refusing provider spend');
       const submitted = await fetchJson('https://api.assemblyai.com/v2/transcript', {
         method: 'POST', headers: { authorization: env.ASSEMBLYAI_API_KEY, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ audio_url: prep.source_url, speaker_labels: true, speech_models: [prep.primary_model || 'universal-3-5-pro'], punctuate: true, ...(prep.expected_speakers ? { speakers_expected: prep.expected_speakers } : {}), ...(pinnedLanguage ? { language_code: pinnedLanguage } : { language_detection: true }) }),
+        body: JSON.stringify({ audio_url: prep.source_url, speaker_labels: true, speech_models: [prep.primary_model || 'universal-3-5-pro'], punctuate: true, ...(prep.expected_speakers ? { speakers_expected: prep.expected_speakers } : {}), ...languageParameters }),
         signal,
       });
       aaiJobId = String(submitted.id || '');
