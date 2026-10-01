@@ -33,7 +33,7 @@ export function preserveCommittedRows(output: any[], source: any[]) {
     for (const key of ['source_text_approved','source_text_approved_text_hash','source_text_approved_by','source_text_approved_at','rythmo_word_timings','rythmo_timings_source','rythmo_timings_edited_by','rythmo_timings_edited_at','timing_manual_override_by','timing_manual_override_at','timing_manual_override_reason','timing_manual_override_prior_state','timing_manual_override_prior_start_ms','timing_manual_override_prior_end_ms','consensus_run_id','consensus_word_sources']) {
       if (original[key] !== undefined) row[key] = original[key];
     }
-    if (original.timing_manual_override_at || original.rythmo_timings_edited_at || original.rythmo_word_timings?.length) {
+    if (original.boundary_source === 'authored_preserved' || original.timing_manual_override_at || original.rythmo_timings_edited_at || original.rythmo_word_timings?.length) {
       row._authored_preserved = true;
       row._boundary_words = [];
     }
