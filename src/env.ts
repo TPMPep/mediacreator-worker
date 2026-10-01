@@ -3,6 +3,8 @@
 // Fail fast on missing required values; never silently fall back.
 // =============================================================================
 
+import { resolvePublicApiBase } from '../shared/public-api-base.js';
+
 function required(name: string): string {
   const v = process.env[name];
   if (!v) {
@@ -290,7 +292,7 @@ export const env = {
   // base44/shared/public-api-base.ts; parity asserted in CI. The worker
   // validates every brain-supplied endpoint against THIS value, so a directive
   // can never point the harness at an arbitrary host.
-  PUBLIC_API_BASE_URL: process.env.PUBLIC_API_BASE_URL || 'https://mediacreator.blutools.io',
+  PUBLIC_API_BASE_URL: resolvePublicApiBase(process.env.PUBLIC_API_BASE_URL),
 
   // Railway health checks probe the injected PORT. Preserve the legacy worker
   // port only for environments where PORT is not supplied.
