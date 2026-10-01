@@ -4,10 +4,10 @@
   "private": true,
   "description": "Background job worker for MediaCreator. Pulls from Upstash Redis BullMQ queues and invokes Base44 backend functions at a controlled rate.",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "dist/src/index.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
+    "start": "node dist/src/index.js",
     "dev": "tsx watch src/index.ts",
     "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit"
