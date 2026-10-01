@@ -984,6 +984,7 @@ export type IntegrityRow = {
   speaker_id?: string;
   speaker_label?: string;
   is_music?: boolean;
+  _authored_preserved?: boolean;
   aai_word_timings?: IntegrityWord[];
   _alignment?: { status?: string; words?: IntegrityWord[]; max_provider_shift_ms?: number };
   timing_defect?: string;
@@ -1293,7 +1294,7 @@ export function auditTimelineIntegrity(
       if (overlapMs > OVERLAP_EPSILON_MS) {
         if (overlapMs > report.worst_same_speaker_overlap_ms) report.worst_same_speaker_overlap_ms = Math.round(overlapMs);
         const boundary = Number(row.start_ms);
-        const repairable = options.allowRepairs !== false && overlapMs <= AUTO_REPAIR_CEILING_MS
+        const repairable = options.allowRepairs !== false && previous._authored_preserved !== true && row._authored_preserved !== true && overlapMs <= AUTO_REPAIR_CEILING_MS
           && boundary > Number(previous.start_ms)
           && !wouldEraseAWord(previous, boundary);
         if (repairable) {
