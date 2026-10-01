@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-10-01b-authored-window-cutover-safe';
+export const BUILD_TAG = '2026-10-01c-engineering-safety-followup';
