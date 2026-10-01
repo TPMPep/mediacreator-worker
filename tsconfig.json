@@ -5,6 +5,7 @@
     "moduleResolution": "Bundler",
     "lib": ["ES2022"],
     "outDir": "./dist",
+    "noEmitOnError": true,
     "rootDir": "./",
     "strict": true,
     "esModuleInterop": true,
