@@ -784,8 +784,11 @@ export interface ProxyGenJobData {
   source_url: string;
   bucket: string;
   region: string;
-  proxy_video_key: string;
+  // Null when audio_only — audio sources have no picture to transcode.
+  proxy_video_key: string | null;
   proxy_audio_key: string;
+  // Audio-only source: produce ONLY the 16 kHz mono FLAC proxy.
+  audio_only?: boolean;
   credential_secret_prefix?: string;
   railway_api_key: string;
   railway_url: string;
