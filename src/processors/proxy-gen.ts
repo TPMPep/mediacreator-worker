@@ -83,7 +83,7 @@ const waitForLane = (ms: number, signal: AbortSignal) => new Promise<void>((reso
 // Lock heartbeat cadence is owned by runWithLockHeartbeat (base44-client.ts).
 
 interface RailwayProxyResponse {
-  proxy_video_key: string;
+  proxy_video_key: string | null;
   proxy_audio_key: string;
   bytes_video?: number;
   bytes_audio?: number;
@@ -138,6 +138,7 @@ async function callRailway(
         region: data.region,
         proxy_video_key: data.proxy_video_key,
         proxy_audio_key: data.proxy_audio_key,
+        audio_only: data.audio_only === true,
         credential_secret_prefix: data.credential_secret_prefix || '',
       }),
       signal: ctrl.signal,
@@ -180,7 +181,8 @@ async function callRailway(
   }
 
   const json = (await res.json()) as RailwayProxyResponse;
-  if (!json.proxy_video_key || !json.proxy_audio_key) {
+  // Audio-only jobs legitimately return no video key; every job needs audio.
+  if (!json.proxy_audio_key || (data.audio_only !== true && !json.proxy_video_key)) {
     throw new UnrecoverableError(
       `railway /generate-proxy-sync → malformed response: ${JSON.stringify(json).slice(0, 300)}`,
     );
