@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-10-01f-duo-segment-locality';
+export const BUILD_TAG = '2026-10-02a-audio-only-proxy';
