@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-10-02a-audio-only-proxy';
+export const BUILD_TAG = '2026-10-02b-audio-export-picture-length';
