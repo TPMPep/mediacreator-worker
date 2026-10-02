@@ -95,6 +95,9 @@ interface PhaseStepResponse {
     speaker_labels: Record<string, string>;
     clip_count: number;
     speaker_segment_gap_ms?: number | null;
+    // Signed source picture for timed audio deliverables; the render is never
+    // shorter than its measured video-stream length.
+    picture_url?: string | null;
     // ── video_mux mode only ──────────────────────────────────────────────
     // The 3-stem mixing-console recipe + the signed source video to mux onto.
     // dub_gain_db is applied UNIFORMLY to every dubbed clip (the "Dubbed"
@@ -465,6 +468,16 @@ export async function processExportProject(job: Job<ExportJobData>) {
         // that runtime guarantee across the mode-discriminated branch chain.
         const requiredRailwayUrl = railwayUrl ?? '';
         const requiredRailwayKey = railwayKey ?? '';
+        // Audio deliverables for a video project run the full measured picture
+        // length (never the last dub line or a shorter stored duration), so the
+        // file lays back in sync. ffprobe failure fails the export loudly.
+        if (aj.picture_url) {
+          const picture = await probeVideo(aj.picture_url);
+          if (picture.duration_ms > aj.duration_ms) {
+            console.log(`[export-project] audio length ${aj.duration_ms}ms → picture ${picture.duration_ms}ms`);
+            aj.duration_ms = picture.duration_ms;
+          }
+        }
         // Timed overruns are disclosed editorial outcomes, not render failures.
         // max_duration_ms remains authoritative below, so Railway trims each clip
         // at its authored TC OUT exactly as editor playback does. Refusing here
