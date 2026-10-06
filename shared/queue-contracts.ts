@@ -789,6 +789,9 @@ export interface ProxyGenJobData {
   proxy_audio_key: string;
   // Audio-only source: produce ONLY the 16 kHz mono FLAC proxy.
   audio_only?: boolean;
+  // Per-speaker Studio Dub recording: finalize onto that stem (studioStemProxyStep),
+  // never onto the Project.
+  stem_id?: string;
   credential_secret_prefix?: string;
   railway_api_key: string;
   railway_url: string;
