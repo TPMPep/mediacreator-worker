@@ -194,6 +194,9 @@ export async function processProxyGen(job: Job<ProxyGenJobData>) {
   const t0 = Date.now();
   const data = job.data;
   const { project_id, user_email, request_id, auth_token } = data;
+  // Speaker-recording proxies finalize onto their stem row, never the Project.
+  const finalizerFn = data.stem_id ? 'studioStemProxyStep' : 'proxyGenWorkerStep';
+  const stemScope = data.stem_id ? { stem_id: data.stem_id } : {};
 
   if (!auth_token) {
     throw new UnrecoverableError(
@@ -262,10 +265,11 @@ export async function processProxyGen(job: Job<ProxyGenJobData>) {
     // ─── 2. Finalize on Base44 — write proxy_status='ready' + keys ───
     const finalizeRes = await runWithLockHeartbeat<{ ok: boolean }>(job, (signal) =>
       invokeBase44Function<{ ok: boolean }>({
-        fn: 'proxyGenWorkerStep',
+        fn: finalizerFn,
         authToken: auth_token,
         payload: {
           project_id,
+          ...stemScope,
           action: 'complete',
           proxy_video_key: railwayRes.proxy_video_key,
           proxy_audio_key: railwayRes.proxy_audio_key,
@@ -374,10 +378,11 @@ export async function processProxyGen(job: Job<ProxyGenJobData>) {
     if (!willRetry) {
       try {
         await invokeBase44Function({
-          fn: 'proxyGenWorkerStep',
+          fn: finalizerFn,
           authToken: auth_token,
           payload: {
             project_id,
+            ...stemScope,
             action: 'fail',
             error_message: String(e.message || e).slice(0, 500),
           },
