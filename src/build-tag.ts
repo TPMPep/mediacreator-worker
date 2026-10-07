@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-10-06a-studio-stem-proxies';
+export const BUILD_TAG = '2026-10-07a-segment-spoken-language';
