@@ -626,7 +626,8 @@ export interface TranslateChunkJobData {
    * the chunk function makes zero Base44 SDK calls. The orchestrator is
    * the SOLE writer for TranslationRun / TranslationSegment / CostLog.
    */
-  segments: Array<{ source_segment_id: string; source_text: string }>;
+  /** spoken_language: the line's marked language when not the project's primary ('' = primary). */
+  segments: Array<{ source_segment_id: string; source_text: string; spoken_language?: string }>;
   /** Inlined run params — chunk does not need to read TranslationRun. */
   provider: 'deepl' | 'gemini' | 'chatgpt' | 'claude' | 'variant';
   source_language_code: string;
@@ -665,7 +666,7 @@ export interface TranslateChunkResult {
    * can PROVE + REVERSE stale-from-source state. Optional for back-compat with
    * any in-flight pre-deploy job whose returnvalue predates the field.
    */
-  translations: Array<{ source_segment_id: string; translated_text: string; source_text_hash?: string }>;
+  translations: Array<{ source_segment_id: string; translated_text: string; source_text_hash?: string; translated_from_language?: string }>;
   processed_count: number;
   translated_count: number;
   failed_count: number;
