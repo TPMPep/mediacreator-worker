@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-10-08a-approved-script-line-authority';
+export const BUILD_TAG = '2026-10-08b-canonical-zh-hk-yue';
