@@ -455,6 +455,7 @@ export type UnresolvedReconciliationReport = {
   unresolved_cleared_rows: number;
   cleared_by_restore: number;
   cleared_by_corroboration: number;
+  cleared_by_onset_reconstruction?: number;
   cleared_keys: string[];
 };
 
@@ -491,6 +492,7 @@ export function reconcileResolvedUnresolvedWords(
   words: AlignedWord[],
   providerByKey: Map<string, ProviderWindow>,
   acceptance?: FinalAcceptanceReport,
+  options: { onsetReconstructionResolves?: boolean } = {},
 ): { words: AlignedWord[]; report: UnresolvedReconciliationReport } {
   const corroborated = new Set((acceptance?.near_zero_corroborated_keys || []).map(String));
   const report: UnresolvedReconciliationReport = {
@@ -498,6 +500,7 @@ export function reconcileResolvedUnresolvedWords(
     unresolved_cleared_rows: 0,
     cleared_by_restore: 0,
     cleared_by_corroboration: 0,
+    cleared_by_onset_reconstruction: 0,
     cleared_keys: [],
   };
   const rowsTouched = new Set<string>();
@@ -530,11 +533,26 @@ export function reconcileResolvedUnresolvedWords(
       clearance = 'resolved_by_capture_restore';
     } else if (corroborated.has(String(word.key)) && providerDuration !== null && providerDuration > 0) {
       clearance = 'resolved_by_provider_corroboration';
+    } else if (
+      // Untimed approved-script alignment only (no provider timeline exists). The
+      // engine flagged the token as INFLATED because the stream absorbed the
+      // unspoken audio before it; STAGE 1 kept its acoustically placed END and pulled
+      // its onset to a plausible start. That repair is the resolution of exactly this
+      // verdict, so it is withdrawn when the repaired window is a possible utterance.
+      // Disclosed on the word (onset_reconstructed + this reason) and the row lands in
+      // VALIDATED_WITH_OVERRIDE, never VALIDATED. No other verdict is eligible.
+      options.onsetReconstructionResolves === true
+      && word.onset_reconstructed === true
+      && priorReason === 'aligned_window_inflated_beyond_evidence'
+      && windowPlausible(word.text, start, end)
+    ) {
+      clearance = 'resolved_by_onset_reconstruction';
     }
     if (!clearance) return word;
 
     report.unresolved_cleared_words += 1;
     if (clearance === 'resolved_by_capture_restore') report.cleared_by_restore += 1;
+    else if (clearance === 'resolved_by_onset_reconstruction') report.cleared_by_onset_reconstruction = (report.cleared_by_onset_reconstruction || 0) + 1;
     else report.cleared_by_corroboration += 1;
     if (report.cleared_keys.length < 200) report.cleared_keys.push(String(word.key));
     const key = String(word.key);
