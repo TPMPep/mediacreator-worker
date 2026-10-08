@@ -94,6 +94,8 @@ interface RailwayProxyResponse {
   // Machine-measured source duration. The finalizer persists this before
   // launching whole-program preflight sampling.
   source_duration_ms?: number | null;
+  // Start timecode carried by the source video's timecode track (null if none).
+  source_timecode?: string | null;
   // Echo fields are optional but useful for audit cross-correlation.
   project_id?: string;
 }
@@ -278,6 +280,7 @@ export async function processProxyGen(job: Job<ProxyGenJobData>) {
           // Machine-measured source frame rate (best-effort; null if probe failed).
           source_frame_rate: railwayRes.source_frame_rate ?? null,
           source_duration_ms: railwayRes.source_duration_ms ?? null,
+          source_timecode: railwayRes.source_timecode ?? null,
         },
         timeoutMs: FINALIZER_TIMEOUT_MS,
         signal,
