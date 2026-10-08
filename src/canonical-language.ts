@@ -47,7 +47,7 @@ const CANONICAL_CODES = new Set<string>([
   'th', 'uk', 'cs', 'ro', 'hu', 'el', 'bg', 'ms', 'fil', 'is', 'ca', 'gl', 'eu',
   'sk', 'sl', 'hr', 'sr', 'be', 'mk', 'bs', 'et', 'lv', 'lt', 'sq', 'he', 'fa',
   'am', 'sw', 'af', 'so', 'si', 'ne', 'km', 'lo', 'my', 'ka', 'hy', 'az', 'kk',
-  'ky', 'uz', 'tg', 'cy', 'ga', 'mt',
+  'ky', 'uz', 'tg', 'cy', 'ga', 'mt', 'zh-hk', 'yue',
 ]);
 
 /** Mirrors SUPPORTED_LANGUAGES in forced-alignment-engine/app.py EXACTLY. */
