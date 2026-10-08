@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-10-07a-segment-spoken-language';
+export const BUILD_TAG = '2026-10-08a-approved-script-line-authority';
