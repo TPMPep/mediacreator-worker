@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-10-08c-source-timecode';
+export const BUILD_TAG = '2026-10-21a-node24-security';
