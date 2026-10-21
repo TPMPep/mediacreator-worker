@@ -166,6 +166,8 @@ const BUILD_INFO = {
   git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || 'unknown',
   git_branch: process.env.RAILWAY_GIT_BRANCH || 'unknown',
   deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || 'unknown',
+  // Runtime actually executing — proves the security-patched Node is live.
+  node_version: process.version,
   started_at: new Date().toISOString(),
 } as const;
 console.log('[worker] BUILD_INFO', JSON.stringify(BUILD_INFO));
