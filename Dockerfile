@@ -1,5 +1,8 @@
-# MediaCreator BullMQ worker — minimal Node 20 Alpine image.
-FROM node:20-alpine AS builder
+# MediaCreator BullMQ worker — minimal Node 24 LTS Alpine image.
+# Pinned to an exact patched release (Oct 21 2026 Node security release: Brotli
+# RCE, TLS hostname bypasses, Undici). Never float to a bare major tag — the
+# deployed runtime must be provable from this file. Bump deliberately.
+FROM node:24.22.1-alpine AS builder
 WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install --include=dev
@@ -8,7 +11,7 @@ COPY src ./src
 COPY shared ./shared
 RUN npm run build
 
-FROM node:20-alpine
+FROM node:24.22.1-alpine
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json package-lock.json* ./
