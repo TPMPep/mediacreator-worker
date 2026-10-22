@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-10-22b-mono-stereo';
+export const BUILD_TAG = '2026-10-22c-align-retry';
