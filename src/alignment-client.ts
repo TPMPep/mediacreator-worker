@@ -150,14 +150,41 @@ function normalize(value: string): string {
   return value.normalize('NFKD').toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
 }
 
-export async function alignTranscript(input: {
+type AlignInput = {
   requestId: string;
   audioUrl: string;
   languageCode: string;
   words: AlignmentInputWord[];
   signal: AbortSignal;
   alignmentMode?: 'provider_timed' | 'untimed_script';
-}): Promise<AlignmentResult> {
+};
+
+// A brief gateway error from the alignment engine (502/503/504, or a dropped
+// connection) is retried a bounded number of times before it fails the run, so a
+// momentary engine restart cannot throw away an hour of transcription. Anything
+// else (bad input, lineage mismatch, timeout, caller abort) fails immediately.
+const ALIGN_RETRY_DELAYS_MS = [5_000, 20_000, 60_000];
+function isTransientAlignError(error: unknown, signal: AbortSignal): boolean {
+  if (signal.aborted) return false;
+  const message = String((error as Error)?.message || '');
+  if (/Forced alignment HTTP (502|503|504)\b/.test(message)) return true;
+  return error instanceof TypeError; // network failure from fetch
+}
+
+export async function alignTranscript(input: AlignInput): Promise<AlignmentResult> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await alignOnce(input);
+    } catch (error) {
+      if (attempt >= ALIGN_RETRY_DELAYS_MS.length || !isTransientAlignError(error, input.signal)) throw error;
+      console.warn(`[alignment] transient failure (attempt ${attempt + 1}), retrying: ${(error as Error).message}`);
+      await new Promise((resolve) => setTimeout(resolve, ALIGN_RETRY_DELAYS_MS[attempt]));
+      if (input.signal.aborted) throw error;
+    }
+  }
+}
+
+async function alignOnce(input: AlignInput): Promise<AlignmentResult> {
   if (!env.ALIGNMENT_ENGINE_URL || !env.ALIGNMENT_ENGINE_SECRET) {
     throw new Error('Forced alignment engine is not configured');
   }
