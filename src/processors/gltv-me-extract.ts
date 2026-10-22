@@ -49,7 +49,7 @@ function deterministicUuid(seed: string): string {
 type Inspect = { state: 'queued' | 'uploaded' | 'submitted' | 'ready' | 'failed'; source_id?: string | null };
 
 async function uploadSource(job: GltvMEExtractionJobData, signal: AbortSignal) {
-  const fidelity = job.fidelity === 'high' ? { format: 'flac', args: '-vn -ac 2', ext: 'flac' } : { format: 'mp3', args: '-vn -ac 2 -b:a 192k', ext: 'mp3' };
+  const fidelity = job.fidelity === 'high' ? { format: 'wav', args: '-vn -ac 2', ext: 'wav' } : { format: 'mp3', args: '-vn -ac 2 -b:a 192k', ext: 'mp3' };
   const response = await fetch(`${job.railway_url.replace(/\/+$/, '')}/extract-and-upload-lalal`, {
     method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${job.railway_api_key}` }, signal,
     body: JSON.stringify({ source_url: job.source_url, lalal_key: job.lalal_license_key, output_format: fidelity.format, extra_args: fidelity.args, upload_ext: fidelity.ext, filename_base: `gltv_me_${job.dubbing_api_job_id}` }),
