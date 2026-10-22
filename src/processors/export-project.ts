@@ -95,6 +95,8 @@ interface PhaseStepResponse {
     speaker_labels: Record<string, string>;
     clip_count: number;
     speaker_segment_gap_ms?: number | null;
+    // Output channels for per_speaker / per_segment_zip (default stereo).
+    channel_layout?: 'mono' | 'stereo';
     // Signed source picture for timed audio deliverables; the render is never
     // shorter than its measured video-stream length.
     picture_url?: string | null;
@@ -124,6 +126,7 @@ async function callMixFinal(opts: {
   meTrackUrl?: string | null;
   loudnessTargetLufs?: number | null;
   outputFormat?: 'wav' | 'flac' | 'mp3';
+  channels?: 1 | 2;
   // ── 3-stem mixing-console params (video_mux) ──
   // meGainDb overrides the default -6 dB M&E bed. vocalsTrackUrl + vocalsGainDb
   // add the original-dialogue stem. When omitted the call behaves exactly as
@@ -139,6 +142,7 @@ async function callMixFinal(opts: {
     duration_ms: opts.durationMs,
     output_format: opts.outputFormat || 'wav',
     sample_rate: 48000,
+    ...(opts.channels ? { channels: opts.channels } : {}),
     render_contract_version: 2,
     fade_in_ms: 15,
     fade_out_ms: 15,
@@ -530,6 +534,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
                 railwayUrl: requiredRailwayUrl, railwayKey: requiredRailwayKey,
                 clips: [{ url: clip.url, start_ms: 0, playback_rate: pace, scene_placement: clip.scene_placement || null }],
                 durationMs, outputFormat, loudnessTargetLufs: aj.loudness_target_lufs,
+                channels: aj.channel_layout === 'mono' ? 1 : 2,
               });
               const individualKey = `${baseKeyPrefix}segments/${filename}`;
               await putS3Object({ ...s3, bucket: s3_bucket }, individualKey, bytes, {
@@ -581,6 +586,7 @@ export async function processExportProject(job: Job<ExportJobData>) {
               clips: stemClips, durationMs: stemDurationMs,
               loudnessTargetLufs: null, // never normalize stems
               outputFormat,
+              channels: aj.channel_layout === 'mono' ? 1 : 2,
             });
             const gapSuffix = gapMs > 0 ? `_gap${gapMs / 1000}s` : '';
             const filename = `${slugifyLabel(label)}_${target_language_code}${gapSuffix}.${outputFormat}`;
