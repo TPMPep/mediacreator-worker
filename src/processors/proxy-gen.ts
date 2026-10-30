@@ -75,6 +75,7 @@ const FINALIZER_TIMEOUT_MS = 90_000;
 // to give Railway some headroom for the S3 upload after ffmpeg returns.
 const RAILWAY_CALL_TIMEOUT_MS = 23 * 60 * 60 * 1000;
 const BACKPRESSURE_RETRY_MS = 30_000;
+const STATUS_POLL_MS = 10_000;
 const waitForLane = (ms: number, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
   const onAbort = () => { clearTimeout(timer); reject(new Error('proxy lane wait aborted')); };
   const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, ms);
@@ -123,16 +124,21 @@ async function callRailway(
     else lockSignal.addEventListener('abort', onLock, { once: true });
   }
 
-  const url = `${data.railway_url.replace(/\/+$/, '')}/generate-proxy-sync`;
+  // Start the transcode, then poll its status with short requests. A single
+  // long-held request was cut by Railway's edge ("upstream error") on long
+  // sources; every call here returns within seconds. The final status/body is
+  // exactly what the sync route returned, so the handling below is unchanged.
+  const base = data.railway_url.replace(/\/+$/, '');
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${data.railway_api_key}`,
+    'X-Request-Id': data.request_id,
+  };
   let res: Response;
   try {
-    res = await fetch(url, {
+    const start = await fetch(`${base}/generate-proxy-start`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${data.railway_api_key}`,
-        'X-Request-Id': data.request_id,
-      },
+      headers,
       body: JSON.stringify({
         project_id: data.project_id,
         source_url: data.source_url,
@@ -145,6 +151,22 @@ async function callRailway(
       }),
       signal: ctrl.signal,
     });
+    if (start.status !== 202) {
+      res = start; // auth / bad request: handled by the status mapping below
+    } else {
+      const { job_id } = await start.json() as { job_id: string };
+      for (;;) {
+        await waitForLane(STATUS_POLL_MS, ctrl.signal);
+        const poll = await fetch(`${base}/generate-proxy-status`, {
+          method: 'POST', headers, body: JSON.stringify({ job_id }), signal: ctrl.signal,
+        });
+        // 404 = the service restarted and lost the job: transient, retry from the start.
+        if (poll.status === 404) throw new Error('railway proxy job lost (service restarted); retrying');
+        if (!poll.ok) continue; // a single failed status check is not a failed transcode
+        const s = await poll.json() as { state: string; status: number; body: string };
+        if (s.state === 'done') { res = new Response(s.body, { status: s.status || 500 }); break; }
+      }
+    }
   } catch (fetchErr) {
     if (lockLost) throw new WorkerLockLostError('proxy-gen:railway');
     throw fetchErr;
