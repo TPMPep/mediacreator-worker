@@ -44,6 +44,8 @@ const MAX_PHASE_ITERATIONS = 12;
 // extends the BullMQ lock for the duration. 30 min covers the longest expected
 // single mix; per-speaker runs N serial calls but each is bounded by this.
 const RAILWAY_MIX_TIMEOUT_MS = 30 * 60 * 1000;
+// Tries for one file's render request before the whole export attempt fails.
+const MIX_REQUEST_TRIES = 6;
 
 interface PhaseStepResponse {
   action: 'recall_function' | 'done' | 'render_audio' | 'burn_subtitles';
@@ -150,23 +152,35 @@ async function callMixFinal(opts: {
     ...(opts.vocalsTrackUrl ? { vocals_track: { url: opts.vocalsTrackUrl, gain_db: opts.vocalsGainDb ?? -18 } } : {}),
     ...(opts.loudnessTargetLufs != null ? { loudness_target_lufs: opts.loudnessTargetLufs } : {}),
   };
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), RAILWAY_MIX_TIMEOUT_MS);
-  try {
-    const res = await fetch(`${base}/mix-final`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${opts.railwayKey}` },
-      body: JSON.stringify(body),
-      signal: ctrl.signal,
-    });
-    if (!res.ok) {
-      const errText = await res.text().catch(() => '');
-      throw new Error(`Railway /mix-final failed (${res.status}): ${errText.slice(0, 500)}`);
+  // A per-line or per-speaker export makes one request per file. A brief
+  // gateway error, a dropped connection or a full render lane is retried here
+  // for that one file, so it never restarts the whole export from the first line.
+  for (let attempt = 1; ; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), RAILWAY_MIX_TIMEOUT_MS);
+    let failure: string;
+    let waitSeconds = Math.min(5 * 2 ** (attempt - 1), 30);
+    try {
+      const res = await fetch(`${base}/mix-final`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${opts.railwayKey}` },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      }).catch((error) => { if (ctrl.signal.aborted) throw error; return null; });
+      if (res?.ok) {
+        if (Number(res.headers.get('X-Audio-Export-Render-Contract')) !== 2) throw new Error('Deploy the updated audio renderer before exporting editor playback');
+        return new Uint8Array(await res.arrayBuffer());
+      }
+      const errText = res ? await res.text().catch(() => '') : 'connection failed';
+      failure = `Railway /mix-final failed (${res?.status ?? 'network'}): ${errText.slice(0, 500)}`;
+      const transient = !res || [502, 503, 504].includes(res.status);
+      if (!transient || attempt >= MIX_REQUEST_TRIES) throw new Error(failure);
+      waitSeconds = Math.min(Number(res?.headers.get('Retry-After')) || waitSeconds, 60);
+    } finally {
+      clearTimeout(timer);
     }
-    if (Number(res.headers.get('X-Audio-Export-Render-Contract')) !== 2) throw new Error('Deploy the updated audio renderer before exporting editor playback');
-    return new Uint8Array(await res.arrayBuffer());
-  } finally {
-    clearTimeout(timer);
+    console.warn(`[export-project] ${failure}; retrying this file in ${waitSeconds}s (try ${attempt} of ${MIX_REQUEST_TRIES})`);
+    await new Promise((resolve) => setTimeout(resolve, waitSeconds * 1000));
   }
 }
 
