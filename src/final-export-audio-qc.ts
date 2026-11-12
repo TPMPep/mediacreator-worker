@@ -21,7 +21,10 @@ export async function renderFinalQcExcerpt(input: string, output: string, timeMs
 
 // Scan the exact completed file on disk, never an intermediate mix or a browser preview.
 // One streaming decode pass: memory is bounded even for four-hour WAV/MP4 exports.
-export async function inspectFinalExport(path: string) {
+// A finished file further than this from its requested loudness target is held for review.
+const LOUDNESS_TOLERANCE_LU = 2;
+
+export async function inspectFinalExport(path: string, loudnessTargetLufs: number | null = null) {
   const hash = createHash('sha256');
   for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
   const output_sha256 = hash.digest('hex');
@@ -71,7 +74,8 @@ export async function inspectFinalExport(path: string) {
   if (!Number.isFinite(lufs) || !Number.isFinite(dbtp)) throw new Error('Final-file loudness measurement invalid');
   if (longestFlat >= 8) findings.unshift({ code: 'sustained_full_scale', time_ms: flatTimeMs, severity: 'blocked', message: 'Sustained full-scale samples in the rendered audio; delivery refused.' });
   if (dbtp > -1) findings.push({ code: 'true_peak_review', time_ms: 0, severity: 'review', message: `True peak ${dbtp.toFixed(1)} dBTP exceeds the -1 dBTP review ceiling.` });
-  const measurements = { decoded_duration_ms: Math.round(frames / 48), sample_peak_dbfs: samplePeak ? +(20 * Math.log10(samplePeak)).toFixed(2) : null, true_peak_dbtp: dbtp, integrated_lufs: lufs, full_scale_sample_count: saturated, longest_full_scale_run: longestFlat, isolated_impulse_count: impulseCount };
+  if (loudnessTargetLufs != null && Math.abs(lufs - loudnessTargetLufs) > LOUDNESS_TOLERANCE_LU) findings.push({ code: 'loudness_off_target', time_ms: 0, severity: 'review', message: `Integrated loudness ${lufs.toFixed(1)} LUFS is outside the ${loudnessTargetLufs} LUFS (±${LOUDNESS_TOLERANCE_LU} LU) delivery target.` });
+  const measurements = { loudness_target_lufs: loudnessTargetLufs, decoded_duration_ms: Math.round(frames / 48), sample_peak_dbfs: samplePeak ? +(20 * Math.log10(samplePeak)).toFixed(2) : null, true_peak_dbtp: dbtp, integrated_lufs: lufs, full_scale_sample_count: saturated, longest_full_scale_run: longestFlat, isolated_impulse_count: impulseCount };
   return { output_sha256, policy_version: 1, status: findings.some(f => f.severity === 'blocked') ? 'blocked' : findings.length ? 'review' : 'pass', findings, measurements, analyzed_at: new Date().toISOString() };
 }
 
