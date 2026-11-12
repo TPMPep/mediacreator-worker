@@ -1100,7 +1100,7 @@ export interface ExportJobData {
    *  operator's fader levels, normalized. The worker renders the audio via
    *  /mix-final then muxes via /mux-video — one audio code path. */
   audio_mode?: 'full_mix' | 'per_speaker' | 'per_segment_zip' | 'me_stem_package' | 'video_dub_me' | 'video_mux' | 'video_burn_in';
-  /** [audio kind] EBU R128 loudness target (-16 | -23). Null/absent = raw audio.
+  /** [audio kind] EBU R128 loudness target (-16 | -18 | -23). Null/absent = raw audio.
    *  Applies to mixes and each per_segment_zip file; ignored for per_speaker. */
   loudness_target_lufs?: number | null;
   /** [audio kind, video_mux mode] The 3-stem mixing-console fader recipe, pinned
