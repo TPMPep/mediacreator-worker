@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-10-30a-proxy-async';
+export const BUILD_TAG = '2026-11-11a-loudness-18';
