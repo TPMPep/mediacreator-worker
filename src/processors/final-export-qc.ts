@@ -30,7 +30,7 @@ export async function processFinalExportQC(job: Job<FinalExportQCJobData>) {
     if (size < 1 || size !== prep.file_size_bytes) throw new Error('Final-file size changed; recovery refused');
     const qc = await attachFinalQcPreviews(file,
       storageFromEnv({ region: prep.region, bucket: prep.bucket, prefix: prep.credential_secret_prefix, endpoint: prep.endpoint }),
-      `dubflow/exports/${project_id}/${export_job_id}/`, await inspectFinalExport(file));
+      `dubflow/exports/${project_id}/${export_job_id}/`, await inspectFinalExport(file, typeof prep.loudness_target_lufs === 'number' ? prep.loudness_target_lufs : null));
     return await invoke('commit', { qc, s3_key: prep.s3_key, file_size_bytes: size });
   } catch (error) {
     if (job.attemptsMade + 1 >= Number(job.opts.attempts || 1)) {
