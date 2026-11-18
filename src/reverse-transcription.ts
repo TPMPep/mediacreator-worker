@@ -9,9 +9,15 @@ export function reverseDialogueGaps(raw: any, provider: string, projectDuration:
   if (!Number.isFinite(fps) || fps <= 0 || fps > 120) throw new Error('Reverse transcription needs a valid frame rate');
   const words = raw.words.filter((w: any) => provider === 'assemblyai' || w.type === 'word');
   if (provider === 'assemblyai' && !words.length && String(raw.text || '').trim()) throw new Error('Speech was detected without usable word timings');
+  // A provider may time a very short word (a single sung letter) as one instant,
+  // start equal to end. That is still speech at that instant: it is kept as a
+  // point that ends any gap there, never dropped, and counted in the evidence.
+  // A word that ends before it starts is not usable evidence and is refused.
+  let zeroLength = 0;
   const speech: Array<[number, number]> = words.map((w: any) => {
     const scale = provider === 'assemblyai' ? 1 : 1000;
-    if (typeof w.start !== 'number' || typeof w.end !== 'number' || !Number.isFinite(w.start) || !Number.isFinite(w.end) || w.start < 0 || w.end <= w.start || w.end * scale > duration + 250) throw new Error('Invalid speech timing evidence; refusing to invent dialogue-free gaps');
+    if (typeof w.start !== 'number' || typeof w.end !== 'number' || !Number.isFinite(w.start) || !Number.isFinite(w.end) || w.start < 0 || w.end < w.start || w.end * scale > duration + 250) throw new Error('Invalid speech timing evidence; refusing to invent dialogue-free gaps');
+    if (w.end === w.start) zeroLength++;
     return [Math.max(0, Math.floor(w.start * scale)), Math.min(duration, Math.ceil(w.end * scale))];
   });
   speech.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
@@ -30,5 +36,5 @@ export function reverseDialogueGaps(raw: any, provider: string, projectDuration:
   let cursor = 0;
   for (const [start, end] of merged) { add(cursor, start); cursor = Math.max(cursor, end); }
   add(cursor, duration);
-  return { gaps, evidence: { policy_version: REVERSE_POLICY_VERSION, minimum_gap_ms: REVERSE_MIN_GAP_MS, source_word_count: words.length, speech_interval_count: merged.length, gap_count: gaps.length, duration_ms: duration, timing_basis: 'provider_word_union', review_required: true } };
+  return { gaps, evidence: { policy_version: REVERSE_POLICY_VERSION, minimum_gap_ms: REVERSE_MIN_GAP_MS, source_word_count: words.length, zero_length_word_count: zeroLength, speech_interval_count: merged.length, gap_count: gaps.length, duration_ms: duration, timing_basis: 'provider_word_union', review_required: true } };
 }
