@@ -29,4 +29,4 @@
 // spending a refinement run.
 // =============================================================================
 
-export const BUILD_TAG = '2026-11-18a-reverse-instant-words';
+export const BUILD_TAG = '2026-11-19b-translation-context';
