@@ -6,6 +6,7 @@
 import type { Job } from 'bullmq';
 import type { VoiceGenJobData } from '../../shared/queue-contracts.js';
 import { invokeBase44Function, logEvent } from '../base44-client.js';
+import { mintVoiceGenSegmentJWT } from '../voice-gen-auth.js';
 
 export async function processVoiceGen(job: Job<VoiceGenJobData>) {
   const t0 = Date.now();
@@ -14,7 +15,7 @@ export async function processVoiceGen(job: Job<VoiceGenJobData>) {
     voice_settings, voice_mode, is_cloned,
     previous_text, next_text, segment_duration_ms,
     performance_prompt, cue_stability,
-    user_email, request_id, auth_token,
+    user_email, request_id,
     job_run_id,
     // Interactive one-segment completion accelerator. Bulk jobs never receive
     // these fields, so their bounded run-level finalization remains unchanged.
@@ -36,20 +37,16 @@ export async function processVoiceGen(job: Job<VoiceGenJobData>) {
     consistency_strategy,
   } = job.data;
   try {
-    if (!auth_token) {
-      // Fail fast: jobs without a scoped JWT cannot be processed under the
-      // current security model. (Old jobs from the legacy shared-token era
-      // would land here — they should be re-enqueued by the producer.)
-      throw new Error('voice-gen: missing auth_token (re-enqueue required)');
-    }
+    if (!user_email) throw new Error('voice-gen: missing user_email (re-enqueue required)');
     // generateOneSegment expects translation_id + target_language_code (not
     // segment_id + target_language). Map field names here so the queue
     // contract can stay stable while the function signature is unchanged.
-    // The auth_token is forwarded as X-Worker-JWT — it's scoped to (user,
-    // project_id, segment_id, 'generateOneSegment') and expires in 15 min.
+    // X-Worker-JWT is minted here, as this attempt starts — scoped to (user,
+    // project_id, segment_id, 'generateOneSegment'), 15 min. The token the
+    // dispatcher put on the job is not used: it can expire while the line waits.
     const result = await invokeBase44Function({
       fn: 'generateOneSegment',
-      authToken: auth_token,
+      authToken: mintVoiceGenSegmentJWT(user_email, project_id, segment_id),
       payload: {
         project_id,
         translation_id: segment_id,
